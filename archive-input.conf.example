@@ -12,7 +12,8 @@ MIN_STABLE_AGE=5                # min file age (s) before archiving (avoids in-p
 REQUIRE_MOUNT=true              # skip a target whose source is missing/unreadable (unmounted share)
 HASH_CMD="sha256sum"            # content hash command
 DRY_RUN=false                   # true = simulate, copy nothing
-TARGETS_FILE="/home/jerome/archive_folders/targets.tsv"
+# TARGETS_FILE defaults to <script directory>/targets.tsv; set an absolute path to override:
+# TARGETS_FILE="/opt/archive-input/targets.tsv"
 
 # --- Discovery & I/O (minimise disk access) ---
 DISCOVERY_INTERVAL=1800         # seconds between full-tree rediscoveries of input dirs
@@ -26,6 +27,6 @@ LOG_ROTATE_KEEP=7               # number of rotated files kept
 AUDIT_LOG=true                  # write a separate append-only audit log per target
 
 # --- Paths (optional; derived from the script directory if unset) ---
-# STATE_DIR="/home/jerome/archive_folders/state"
-# LOG_DIR="/home/jerome/archive_folders/logs"
-# LOCK_FILE="/home/jerome/archive_folders/run.lock"
+# STATE_DIR="/opt/archive-input/state"
+# LOG_DIR="/opt/archive-input/logs"
+# LOCK_FILE="/opt/archive-input/run.lock"

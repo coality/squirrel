@@ -125,8 +125,10 @@ line(s) for that relative path (or delete the ledger to re-archive everything).
 Run every minute; the script does several internal passes and manages its own
 lock, so nothing is hard-coded in the crontab:
 
+Replace `/opt/archive-input` with your install directory:
+
 ```cron
-* * * * * /home/jerome/archive_folders/archive-input.sh --config /home/jerome/archive_folders/archive-input.conf >> /home/jerome/archive_folders/logs/cron.err 2>&1
+* * * * * /opt/archive-input/archive-input.sh --config /opt/archive-input/archive-input.conf >> /opt/archive-input/logs/cron.err 2>&1
 ```
 
 ## Logs & troubleshooting
