@@ -15,9 +15,11 @@ copies, it never modifies or deletes a source file.
 - **What is collected**: for each `input` directory, the files **directly inside it**
   *and* the files **directly inside its direct sub-directories** (e.g.
   `input/supplier/`). Deeper levels are never scanned — `input/supplier/archive/`
-  is ignored. Sub-directories are enumerated at discovery (`DISCOVERY_INTERVAL` or
-  `--rediscover`). Directories whose name matches `EXCLUDE_DIR_PATTERNS`
-  (case-insensitive globs) are skipped entirely and never descended into.
+  is ignored. Sub-directories are re-checked every cycle (a new one is picked up
+  immediately); new `input` directories themselves are found at discovery
+  (`DISCOVERY_INTERVAL` or `--rediscover`). Directories whose name matches
+  `EXCLUDE_DIR_PATTERNS` (case-insensitive globs) are skipped entirely and never
+  descended into.
 - **Archive once, dedup by hash**:
   - never seen → copied under its own name;
   - same name **and** same content hash → nothing to do;
@@ -70,6 +72,7 @@ full list. Most-used options:
 | `MIN_STABLE_AGE` | `5` | min file age before it is archived |
 | `REQUIRE_MOUNT` | `true` | skip a target whose source is missing/unreadable |
 | `DISCOVERY_INTERVAL` | `1800` | seconds between full-tree rediscoveries |
+| `DISCOVERY_MAXDEPTH` | `0` | cap the discovery walk depth (0 = unlimited) |
 | `USE_DIR_MTIME_SKIP` | `true` | skip directories whose mtime is unchanged |
 | `EXCLUDE_DIR_PATTERNS` | `()` | dir-name globs (case-insensitive) to ignore anywhere, e.g. `('*archived*')` |
 | `HASH_CMD` | `sha256sum` | content hash command |
@@ -101,11 +104,14 @@ projectB     prod   /mnt/nas/projectB/prod      /mnt/nas/archive/projectB/prod  
 Each cron run acquires the lock, then loops for up to `RUN_DURATION` seconds,
 scanning every enabled target once per `SCAN_INTERVAL`. For each target it:
 
-1. finds the `input` directories and their direct sub-directories — the "scan
-   dirs" (cached; full-tree walk only every `DISCOVERY_INTERVAL`, so a brand-new
-   sub-directory is seen at the next rediscovery or via `--rediscover`);
-2. skips scan dirs whose mtime is unchanged, otherwise lists their direct files
-   (each file lands in the mirror under `…/input/…` or `…/input/<subdir>/…`);
+1. locates the `input` directories (cached; full-tree walk only every
+   `DISCOVERY_INTERVAL`, pruned at each input so it never walks their subtrees —
+   a new `input` dir is seen at the next rediscovery or via `--rediscover`);
+2. each cycle, one bulk directory read per `input` returns the input and its
+   direct sub-directories with their mtimes in a single round-trip; unchanged
+   dirs are skipped, the rest have their direct files listed (each file lands in
+   the mirror under `…/input/…` or `…/input/<subdir>/…`). A new sub-directory is
+   picked up on the next cycle;
 3. for each file: skips it if too recent (stability), or already archived
    (per-target ledger); otherwise hashes it and copies new content into the
    mirror (base name, or a timestamped version), appending to the ledger and
@@ -227,8 +233,8 @@ detail. Every operational line carries `run`, `project`, `env`, `cycle` ids.
 
 Event glossary: `START`, `PATHS`, `CONFIG`, `CONFIG_NOT_FOUND`, `TARGET`,
 `TARGETS_LOADED`, `TARGET_DISABLED`, `TARGET_MALFORMED`, `TARGET_DUPLICATE`,
-`TARGET_BEGIN`, `MOUNT_MISSING`, `MOUNT_OK`, `DISCOVERY`, `FOUND_SCAN_DIR`, `EXCLUDED_DIR`,
-`NO_INPUT_DIRS`, `FORCE_REDISCOVER`, `SKIP_DIR_UNCHANGED`, `SKIP_DIR_EXCLUDED`, `DIR_RESCAN`, `SKIP_UNSTABLE`,
+`TARGET_BEGIN`, `MOUNT_MISSING`, `MOUNT_OK`, `DISCOVERY`, `EXCLUDED_DIR`,
+`NO_INPUT_DIRS`, `FORCE_REDISCOVER`, `SKIP_DIR_UNCHANGED`, `DIR_RESCAN`, `SKIP_UNSTABLE`,
 `SKIP_LEDGER`, `SKIP_SAME_HASH`, `COPIED`, `VERSIONED`, `COPY_FAILED`,
 `LEDGER_CORRUPT`, `HEARTBEAT`, `CYCLE_SUMMARY`, `TARGET_SUMMARY`.
 

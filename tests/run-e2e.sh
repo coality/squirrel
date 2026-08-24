@@ -350,22 +350,33 @@ test_subdir_selection() {  # input + direct subdirs only, never deeper
     assert_grep "$(oplog "$d" p e)" 'scan_dirs="2"'
 }
 
-test_new_subdir_rediscovery() {  # new direct subdir picked up at rediscovery
-    title "a new direct subdir is seen only at rediscovery"
+test_new_subdir_immediate() {  # new direct subdir picked up next cycle (no rediscovery)
+    title "a new direct subdir is seen on the next cycle, without rediscovery"
     local d; d=$(new_case)
     mkdir -p "$d/src/input/s1"
     echo f1 > "$d/src/input/s1/f1.txt"
     add_target "$d" p e "$d/src" "$d/arc"
-    write_conf "$d" 'DISCOVERY_INTERVAL=1800'
+    write_conf "$d" 'DISCOVERY_INTERVAL=1800'   # no rediscovery between the two runs
     run "$d"
     assert_file "$d/arc/input/s1/f1.txt" "initial subdir archived"
     mkdir -p "$d/src/input/s2"
     echo f2 > "$d/src/input/s2/f2.txt"
     run "$d"
-    assert_nofile "$d/arc/input/s2/f2.txt" "new subdir not seen within interval"
-    write_conf "$d" 'DISCOVERY_INTERVAL=0'
+    assert_file "$d/arc/input/s2/f2.txt" "new subdir seen immediately (bulk readdir per cycle)"
+}
+
+test_discovery_maxdepth() {  # DISCOVERY_MAXDEPTH caps how deep input dirs are located
+    title "DISCOVERY_MAXDEPTH limits input-dir discovery depth"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/a/b/c/input"       # input at depth 4
+    echo deep > "$d/src/a/b/c/input/f.txt"
+    mkdir -p "$d/src/shallow/input"     # input at depth 2
+    echo ok > "$d/src/shallow/input/g.txt"
+    add_target "$d" p e "$d/src" "$d/arc"
+    write_conf "$d" 'DISCOVERY_MAXDEPTH=3'
     run "$d"
-    assert_file "$d/arc/input/s2/f2.txt" "new subdir archived after rediscovery"
+    assert_file   "$d/arc/shallow/input/g.txt" "shallow input found"
+    assert_nofile "$d/arc/a/b/c/input/f.txt"   "input beyond maxdepth not found"
 }
 
 test_exclude_subdir() {  # EXCLUDE_DIR_PATTERNS ignores a matching subdir
@@ -549,7 +560,8 @@ main() {
     test_weird_names
     test_discovery_cache
     test_subdir_selection
-    test_new_subdir_rediscovery
+    test_new_subdir_immediate
+    test_discovery_maxdepth
     test_exclude_subdir
     test_exclude_case_insensitive
     test_exclude_prune_deep

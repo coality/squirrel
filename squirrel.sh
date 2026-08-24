@@ -52,6 +52,7 @@ REQUIRE_MOUNT=true
 HASH_CMD="sha256sum"
 DRY_RUN=false
 DISCOVERY_INTERVAL=1800
+DISCOVERY_MAXDEPTH=0    # cap the discovery walk depth (0 = unlimited)
 USE_DIR_MTIME_SKIP=true
 LOG_LEVEL="INFO"
 LOG_FORMAT="text"
@@ -422,52 +423,49 @@ load_targets() {
 }
 
 # ---------------------------------------------------------------------------
-# Input-directory cache (per target)
-#   file: STATE_DIR/<key>.inputdirs.tsv  ->  "<enc(dir)>\t<last_settled_mtime>"
+# Discovery (locate input dirs) + per-leaf settled mtimes
+#   STATE_DIR/<key>.inputs.tsv  -> one enc(input_dir) per line (governs rediscovery)
+#   STATE_DIR/<key>.leaves.tsv  -> "<enc(leaf)>\t<settled_mtime>" (per-leaf skip state)
 # ---------------------------------------------------------------------------
 
-# discover_or_load_dirs <key> <src> <idn> <cache>
-# Populates the global DIRS array and DIRLAST map. Rediscovers (full tree walk)
-# only when the cache is missing or older than DISCOVERY_INTERVAL.
-declare -a DIRS=()
+# discover_or_load_dirs <key> <src> <idn> <inputs_cache> <leaves_cache>
+# Populates INPUT_DIRS (the input directories) and DIRLAST (leaf -> settled mtime).
+# The full-tree walk (rediscovery) only LOCATES input dirs: it prunes AT each input
+# (never descends into them) and honours DISCOVERY_MAXDEPTH / EXCLUDE_DIR_PATTERNS,
+# so it does not walk the (large) subtrees. Sub-directories are enumerated cheaply
+# per cycle in scan_target (one bulk readdir per input).
+declare -a INPUT_DIRS=()
 declare -A DIRLAST=()
 discover_or_load_dirs() {
-    local key=$1 src=$2 idn=$3 cache=$4
-    DIRS=(); DIRLAST=()
+    local key=$1 src=$2 idn=$3 inputs_cache=$4 leaves_cache=$5
+    INPUT_DIRS=(); DIRLAST=()
 
+    # Load persisted per-leaf settled mtimes (local disk, cheap).
+    local encleaf lastm
+    if [[ -f $leaves_cache ]]; then
+        while IFS=$'\t' read -r encleaf lastm || [[ -n $encleaf ]]; do
+            [[ -z $encleaf ]] && continue
+            DIRLAST["$(dec "$encleaf")"]=$lastm
+        done < "$leaves_cache"
+    fi
+
+    # Decide whether to re-locate the input dirs (the expensive full-tree walk).
     local need_discovery=0 now cache_mt age reason="cache-fresh"
     now=$(now_epoch)
-    if [[ ! -f $cache ]]; then
-        need_discovery=1; reason="no-cache"
+    if [[ ! -f $inputs_cache ]]; then need_discovery=1; reason="no-cache"
     else
-        cache_mt=$(get_mtime "$cache"); is_uint "$cache_mt" || cache_mt=0
-        age=$(( now - cache_mt ))
-        (( age >= DISCOVERY_INTERVAL )) && { need_discovery=1; reason="cache-stale"; }
+        cache_mt=$(get_mtime "$inputs_cache"); is_uint "$cache_mt" || cache_mt=0
+        age=$(( now - cache_mt )); (( age >= DISCOVERY_INTERVAL )) && { need_discovery=1; reason="cache-stale"; }
     fi
     (( FORCE_REDISCOVER )) && { need_discovery=1; reason="forced"; }
 
-    # Always load whatever the cache currently holds (to preserve settled mtimes).
-    local encdir lastm dir
-    if [[ -f $cache ]]; then
-        while IFS=$'\t' read -r encdir lastm || [[ -n $encdir ]]; do
-            [[ -z $encdir ]] && continue
-            is_uint "$lastm" || lastm=0
-            dir=$(dec "$encdir")
-            DIRLAST["$dir"]=$lastm
-            DIRS+=("$dir")
-        done < "$cache"
-    fi
-
     if (( need_discovery )); then
-        # Scan dirs ("leaves") = each input dir itself PLUS its DIRECT subdirs.
-        # Each leaf is later listed at -maxdepth 1, so we collect files directly
-        # in input and directly in its direct subdirs — never deeper. Directories
-        # whose name matches EXCLUDE_DIR_PATTERNS are pruned (not descended into)
-        # and never scanned.
-        local t0 t1 input_count=0 excluded=0 d sub
+        local t0 t1 d
         t0=$(now_epoch)
         log_tgt DEBUG DISCOVERY_BEGIN src="$(enc "$src")" input_dir_name="$idn" reason="$reason"
-        # Build a find prune expression from the exclude patterns (case-insensitive).
+        # Optional depth cap.
+        local -a dexpr=(); (( DISCOVERY_MAXDEPTH > 0 )) && dexpr=( -maxdepth "$DISCOVERY_MAXDEPTH" )
+        # Prune expression from the exclude patterns (case-insensitive).
         local -a fexpr=() pat; local firstp=1
         for pat in "${EXCLUDE_DIR_PATTERNS[@]:-}"; do
             [[ -z $pat ]] && continue
@@ -475,55 +473,37 @@ discover_or_load_dirs() {
             else fexpr+=( -o -iname "$pat" ); fi
         done
         (( firstp )) || fexpr+=( ')' -prune ')' -o )
-        declare -A _found=()
-        local -a newdirs=()
+        local -a newinputs=()
+        # -print0 -prune: print each input dir and DO NOT descend into it.
         while IFS= read -r -d '' d; do
-            (( input_count++ ))
+            newinputs+=("$d")
             log_tgt DEBUG FOUND_INPUT_DIR dir="$(enc "${d#"$src"/}")"
-            # Leaf: the input dir itself (its direct files).
-            if [[ -z ${_found["$d"]:-} ]]; then
-                _found["$d"]=1; newdirs+=("$d"); [[ -z ${DIRLAST["$d"]:-} ]] && DIRLAST["$d"]=0
-            fi
-            # Leaves: each DIRECT subdirectory of the input dir (its direct files),
-            # skipping directories whose name is excluded.
-            while IFS= read -r -d '' sub; do
-                if is_excluded_dirname "${sub##*/}"; then
-                    (( excluded++ )); log_tgt DEBUG EXCLUDED_DIR dir="$(enc "${sub#"$src"/}")"
-                    continue
-                fi
-                if [[ -z ${_found["$sub"]:-} ]]; then
-                    _found["$sub"]=1; newdirs+=("$sub"); [[ -z ${DIRLAST["$sub"]:-} ]] && DIRLAST["$sub"]=0
-                    log_tgt DEBUG FOUND_SCAN_DIR dir="$(enc "${sub#"$src"/}")"
-                fi
-            done < <(find "$d" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
-        done < <(find "$src" "${fexpr[@]}" -type d -name "$idn" -print0 2>/dev/null)
-        # Drop leaves that disappeared.
-        for dir in "${DIRS[@]:-}"; do
-            [[ -z $dir ]] && continue
-            [[ -z ${_found["$dir"]:-} ]] && unset 'DIRLAST[$dir]'
-        done
-        DIRS=("${newdirs[@]:-}")
+        done < <(find "$src" "${dexpr[@]}" "${fexpr[@]}" -type d -name "$idn" -print0 -prune 2>/dev/null)
+        INPUT_DIRS=("${newinputs[@]:-}")
+        write_inputs_cache "$inputs_cache"
         t1=$(now_epoch)
-        log_tgt INFO DISCOVERY input_dirs="$input_count" scan_dirs="${#newdirs[@]}" \
-            excluded="$excluded" dur_s="$(( t1 - t0 ))" src="$(enc "$src")" \
-            input_dir_name="$idn" reason="$reason"
-        if (( input_count == 0 )); then
+        log_tgt INFO DISCOVERY input_dirs="${#newinputs[@]}" dur_s="$(( t1 - t0 ))" \
+            src="$(enc "$src")" input_dir_name="$idn" reason="$reason"
+        if (( ${#newinputs[@]} == 0 )); then
             log_tgt WARN NO_INPUT_DIRS src="$(enc "$src")" input_dir_name="$idn" \
-                hint="no directory named '$idn' found anywhere under the source"
+                hint="no directory named '$idn' found under the source"
         fi
-        write_dir_cache "$cache"
     else
-        log_tgt DEBUG DISCOVERY_CACHED dirs="${#DIRS[@]}"
+        local encd
+        while IFS= read -r encd || [[ -n $encd ]]; do
+            [[ -z $encd ]] && continue
+            INPUT_DIRS+=("$(dec "$encd")")
+        done < "$inputs_cache"
+        log_tgt DEBUG DISCOVERY_CACHED input_dirs="${#INPUT_DIRS[@]}"
     fi
 }
 
-write_dir_cache() {
-    local cache=$1 dir tmp
-    tmp="$cache.tmp.$$"
-    : > "$tmp" || return 1
-    for dir in "${DIRS[@]:-}"; do
-        [[ -z $dir ]] && continue
-        printf '%s\t%s\n' "$(enc "$dir")" "${DIRLAST["$dir"]:-0}" >> "$tmp"
+write_inputs_cache() {
+    local cache=$1 d tmp="$1.tmp.$$"
+    : > "$tmp" 2>/dev/null || return 1
+    for d in "${INPUT_DIRS[@]:-}"; do
+        [[ -z $d ]] && continue
+        printf '%s\n' "$(enc "$d")" >> "$tmp"
     done
     mv -f -- "$tmp" "$cache"
 }
@@ -664,7 +644,8 @@ scan_target() {
     CUR_OPLOG="$tdir/operations.log"
     CUR_AUDIT="$tdir/audit.log"
     LEDGER_FILE="$STATE_DIR/$key.ledger.tsv"
-    local cache="$STATE_DIR/$key.inputdirs.tsv"
+    local inputs_cache="$STATE_DIR/$key.inputs.tsv"
+    local leaves_cache="$STATE_DIR/$key.leaves.tsv"
 
     log_tgt DEBUG TARGET_BEGIN src="$(enc "$src")" arc="$(enc "$arc")" input_dir_name="$idn"
 
@@ -697,46 +678,54 @@ scan_target() {
         return 0
     fi
 
-    discover_or_load_dirs "$key" "$src" "$idn" "$cache"
+    discover_or_load_dirs "$key" "$src" "$idn" "$inputs_cache" "$leaves_cache"
 
     CYC_SCANNED=0 CYC_COPIED=0 CYC_VERSIONED=0 CYC_SKIPPED=0 CYC_ERRORS=0 CYC_BYTES=0
+    local -A seen=()
+    local input mt leaf base f dir_reads=0 scan_dirs=0 rescanned=0
 
-    local dir dmt cache_dirty=0 dirs_total=0 dirs_rescanned=0
-    for dir in "${DIRS[@]:-}"; do
-        [[ -z $dir ]] && continue
-        [[ -d $dir ]] || continue
-        # Safety net: honour exclusions even for a leaf still present in the cache
-        # (so a newly added pattern takes effect without waiting for rediscovery).
-        if is_excluded_dirname "${dir##*/}"; then
-            log_tgt DEBUG SKIP_DIR_EXCLUDED dir="$(enc "${dir#"$src"/}")"
-            continue
-        fi
-        (( dirs_total++ ))
-        dmt=$(get_mtime "$dir"); is_uint "$dmt" || dmt=0
-
-        if [[ $USE_DIR_MTIME_SKIP == true && ${DIRLAST["$dir"]:-0} == "$dmt" && $dmt != 0 ]]; then
-            log_tgt DEBUG SKIP_DIR_UNCHANGED dir="$(enc "${dir#"$src"/}")" mtime="$dmt"
-            continue
-        fi
-
-        (( dirs_rescanned++ ))
-        log_tgt DEBUG DIR_RESCAN dir="$(enc "${dir#"$src"/}")" mtime="$dmt" last="${DIRLAST["$dir"]:-0}"
-        DIR_UNSETTLED=0
-        local f
-        while IFS= read -r -d '' f; do
-            [[ -f $f ]] || continue
-            process_file "$key" "$src" "$arc" "$f"
-        done < <(find "$dir" -mindepth 1 -maxdepth 1 -type f -print0 2>/dev/null)
-
-        # Mark the directory settled (cache its mtime) only if everything was
-        # finalised; otherwise leave the previous value so it is rescanned.
-        if (( DIR_UNSETTLED == 0 )); then
-            DIRLAST["$dir"]=$dmt
-            cache_dirty=1
-        fi
+    # One bulk readdir per input dir returns the input AND each of its direct
+    # subdirs with their mtime in a single directory read (~1 CIFS round-trip),
+    # instead of one stat per directory. We then scan the input's direct files and
+    # each direct subdir's direct files (never deeper).
+    for input in "${INPUT_DIRS[@]:-}"; do
+        [[ -z $input ]] && continue
+        (( dir_reads++ ))
+        while IFS=$'\t' read -r -d '' mt leaf; do
+            [[ -z $leaf ]] && continue
+            base=${leaf##*/}
+            # Exclude matching sub-directories (never the input dir itself).
+            if [[ $leaf != "$input" ]] && is_excluded_dirname "$base"; then
+                log_tgt DEBUG EXCLUDED_DIR dir="$(enc "${leaf#"$src"/}")"
+                continue
+            fi
+            seen["$leaf"]=1
+            (( scan_dirs++ ))
+            if [[ $USE_DIR_MTIME_SKIP == true && ${DIRLAST["$leaf"]:-} == "$mt" ]]; then
+                log_tgt DEBUG SKIP_DIR_UNCHANGED dir="$(enc "${leaf#"$src"/}")" mtime="$mt"
+                continue
+            fi
+            (( rescanned++ ))
+            log_tgt DEBUG DIR_RESCAN dir="$(enc "${leaf#"$src"/}")" mtime="$mt" last="${DIRLAST["$leaf"]:-}"
+            DIR_UNSETTLED=0
+            while IFS= read -r -d '' f; do
+                [[ -f $f ]] || continue
+                process_file "$key" "$src" "$arc" "$f"
+            done < <(find "$leaf" -mindepth 1 -maxdepth 1 -type f -print0 2>/dev/null)
+            # Settle (cache the mtime) only if everything finalised; otherwise leave
+            # the previous value so the leaf is rescanned next cycle.
+            (( DIR_UNSETTLED == 0 )) && DIRLAST["$leaf"]=$mt
+        done < <(find "$input" -mindepth 0 -maxdepth 1 -type d -printf '%T@\t%p\0' 2>/dev/null)
     done
 
-    (( cache_dirty )) && write_dir_cache "$cache"
+    # Persist settled mtimes for the leaves seen this cycle (drops removed leaves).
+    local tmp="$leaves_cache.tmp.$$" lf
+    if : > "$tmp" 2>/dev/null; then
+        for lf in "${!seen[@]}"; do
+            [[ -n ${DIRLAST["$lf"]:-} ]] && printf '%s\t%s\n' "$(enc "$lf")" "${DIRLAST["$lf"]}" >> "$tmp"
+        done
+        mv -f -- "$tmp" "$leaves_cache"
+    fi
 
     RUN_COPIED[$key]=$(( ${RUN_COPIED[$key]:-0} + CYC_COPIED ))
     RUN_VERSIONED[$key]=$(( ${RUN_VERSIONED[$key]:-0} + CYC_VERSIONED ))
@@ -746,7 +735,7 @@ scan_target() {
 
     # Per-cycle detail is DEBUG (it happens every SCAN_INTERVAL); INFO summaries
     # come from HEARTBEAT and the final TARGET_SUMMARY.
-    log_tgt DEBUG CYCLE_SUMMARY scan_dirs="$dirs_total" rescanned="$dirs_rescanned" \
+    log_tgt DEBUG CYCLE_SUMMARY dir_reads="$dir_reads" scan_dirs="$scan_dirs" rescanned="$rescanned" \
         scanned="$CYC_SCANNED" copied="$CYC_COPIED" versioned="$CYC_VERSIONED" \
         skipped="$CYC_SKIPPED" errors="$CYC_ERRORS" bytes_copied="$CYC_BYTES"
 }
@@ -857,7 +846,8 @@ main() {
         state_dir="$(enc "$STATE_DIR")" log_dir="$(enc "$LOG_DIR")" lock="$(enc "$LOCK_FILE")"
     log_run INFO CONFIG input_dir_name="$INPUT_DIR_NAME" scan_interval="$SCAN_INTERVAL" \
         run_duration="$RUN_DURATION" min_stable_age="$MIN_STABLE_AGE" \
-        discovery_interval="$DISCOVERY_INTERVAL" use_dir_mtime_skip="$USE_DIR_MTIME_SKIP" \
+        discovery_interval="$DISCOVERY_INTERVAL" discovery_maxdepth="$DISCOVERY_MAXDEPTH" \
+        use_dir_mtime_skip="$USE_DIR_MTIME_SKIP" \
         require_mount="$REQUIRE_MOUNT" hash_cmd="$HASH_CMD" dry_run="$DRY_RUN" \
         exclude_patterns="$(enc "${EXCLUDE_DIR_PATTERNS[*]:-}")" \
         log_format="$LOG_FORMAT" log_level="$LOG_LEVEL" console="$LOG_CONSOLE"
