@@ -13,6 +13,11 @@
 #   - Minimal disk I/O: input directory locations are cached and only rediscovered
 #     periodically; unchanged directories (same mtime) are skipped without listing.
 #
+# Diagnostics: when run in a console every log line is mirrored to the terminal
+# (LOG_CONSOLE=auto). `--debug` turns on maximum verbosity, `--once` does a single
+# pass and exits. MOUNT_MISSING logs the exact reason and the deepest existing
+# ancestor so an unmounted share or a wrong path is obvious immediately.
+#
 # Portability: POSIX-ish bash (>=4) plus GNU coreutils / findutils / util-linux,
 # available on every mainstream Linux distribution. No distro-specific paths or
 # tools, no systemd. Tools are resolved through PATH.
@@ -53,6 +58,8 @@ LOG_FORMAT="text"
 LOG_ROTATE_MAX_BYTES=10485760
 LOG_ROTATE_KEEP=7
 AUDIT_LOG=true
+LOG_CONSOLE="auto"      # auto (mirror to terminal when interactive) | always | never
+HEARTBEAT_INTERVAL=60   # seconds between periodic "still alive" summaries (0 = off)
 
 # Resolve the script directory portably (no readlink -f).
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
@@ -68,6 +75,10 @@ CONFIG_FILE="$SCRIPT_DIR/squirrel.conf"
 ACTION="run"           # run | rediscover
 FORCE_REDISCOVER=0     # set per-cycle when a manual rediscovery is requested
 FORCE_MARKER=""        # marker file path, set in main once STATE_DIR is known
+FORCE_DEBUG=0          # --debug: max verbosity + console
+ONCE=0                 # --once: single pass then exit
+CONSOLE_ON=0           # whether log lines are mirrored to the terminal
+CONFIG_STATUS="none"   # none | loaded | missing
 
 # ---------------------------------------------------------------------------
 # Small portable helpers
@@ -136,6 +147,29 @@ hash_file() {
     local p=$1 out
     out=$("$HASH_CMD" -- "$p" 2>/dev/null) || return 1
     printf '%s' "${out%% *}"
+}
+
+# deepest_existing: longest existing prefix of a path (diagnostic for a missing
+# source: shows how far the path resolves before it breaks).
+deepest_existing() {
+    local p=$1
+    [[ -e $p ]] && { printf '%s' "$p"; return; }
+    while [[ $p == */* ]]; do
+        p=${p%/*}; [[ -z $p ]] && p=/
+        [[ -e $p ]] && { printf '%s' "$p"; return; }
+    done
+    printf '/'
+}
+
+# mount_reason: why a source cannot be scanned ("ok" if it can).
+mount_reason() {
+    local s=$1
+    if   [[ ! -e $s ]]; then printf 'path does not exist'
+    elif [[ ! -d $s ]]; then printf 'exists but is not a directory'
+    elif [[ ! -r $s ]]; then printf 'directory not readable (permissions)'
+    elif [[ ! -x $s ]]; then printf 'directory not searchable (need +x to list)'
+    else printf 'ok'
+    fi
 }
 
 # enc / dec: make an arbitrary string safe for a single TSV/log field by
@@ -225,29 +259,28 @@ CUR_AUDIT=""
 RUN_ID=""
 
 # _emit_file <file> <withctx 0|1> <level> <event> [k=v ...]
+# Writes one structured line to the log file, and mirrors it to the terminal
+# (stderr) when CONSOLE_ON is set.
 _emit_file() {
     local file=$1 withctx=$2 level=$3 event=$4
     shift 4
     (( $(_lvlnum "$level") >= LOG_LEVEL_NUM )) || return 0
     rotate_if_needed "$file"
-    local ts kv k v
+    local ts line kv k v
     ts=$(ts_iso)
     if [[ $LOG_FORMAT == json ]]; then
-        local out
-        out="{\"ts\":\"$ts\",\"level\":\"$level\",\"run\":\"$(json_esc "$RUN_ID")\""
+        line="{\"ts\":\"$ts\",\"level\":\"$level\",\"run\":\"$(json_esc "$RUN_ID")\""
         if (( withctx )) && [[ -n $CUR_PROJECT ]]; then
-            out+=",\"project\":\"$(json_esc "$CUR_PROJECT")\",\"env\":\"$(json_esc "$CUR_ENV")\""
-            [[ -n $CUR_CYCLE ]] && out+=",\"cycle\":$CUR_CYCLE"
+            line+=",\"project\":\"$(json_esc "$CUR_PROJECT")\",\"env\":\"$(json_esc "$CUR_ENV")\""
+            [[ -n $CUR_CYCLE ]] && line+=",\"cycle\":$CUR_CYCLE"
         fi
-        out+=",\"event\":\"$event\""
+        line+=",\"event\":\"$event\""
         for kv in "$@"; do
             k=${kv%%=*}; v=${kv#*=}
-            out+=",\"$(json_esc "$k")\":\"$(json_esc "$v")\""
+            line+=",\"$(json_esc "$k")\":\"$(json_esc "$v")\""
         done
-        out+="}"
-        printf '%s\n' "$out" >> "$file"
+        line+="}"
     else
-        local line
         line="$ts $level run=$RUN_ID"
         if (( withctx )) && [[ -n $CUR_PROJECT ]]; then
             line+=" project=$CUR_PROJECT env=$CUR_ENV"
@@ -258,8 +291,10 @@ _emit_file() {
             k=${kv%%=*}; v=${kv#*=}
             line+=" $k=\"$v\""
         done
-        printf '%s\n' "$line" >> "$file"
     fi
+    printf '%s\n' "$line" >> "$file"
+    (( CONSOLE_ON )) && printf '%s\n' "$line" >&2
+    return 0
 }
 
 log_run() { local lvl=$1 ev=$2; shift 2; _emit_file "$RUN_LOG" 0 "$lvl" "$ev" "$@"; }
@@ -312,6 +347,7 @@ ledger_append() {  # key ledger encrel size mtime hash enctgt at
 # ---------------------------------------------------------------------------
 declare -a T_PROJECT=() T_ENV=() T_SRC=() T_ARC=() T_IDN=() T_SCAN=() T_KEY=() T_LAST=()
 declare -A _seen_target=()
+declare -A T_MOUNT_STATE=()   # key -> "ok" | "missing" (for state-change logging)
 
 # load_targets: parse targets.tsv into the T_* arrays. Returns EX_CONFIG on a
 # fatal read error.
@@ -322,7 +358,9 @@ load_targets() {
     fi
     local raw c1 c2 c3 c4 c5 c6 c7 rest
     local project env src arc idn scan enabled key
+    local lineno=0
     while IFS= read -r raw || [[ -n $raw ]]; do
+        (( lineno++ ))
         # Skip blank and comment lines.
         local t; t=$(trim "$raw")
         [[ -z $t ]] && continue
@@ -339,7 +377,7 @@ load_targets() {
         idn=$(trim "${c5:-}");     scan=$(trim "${c6:-}"); enabled=$(trim "${c7:-}")
 
         if [[ -z $project || -z $env || -z $src || -z $arc ]]; then
-            log_run WARN TARGET_MALFORMED line="$(enc "$t")"
+            log_run WARN TARGET_MALFORMED line_no="$lineno" line="$(enc "$t")"
             continue
         fi
         # Resolve optional columns / defaults.
@@ -354,12 +392,13 @@ load_targets() {
 
         key="$(sanitize "$project")__$(sanitize "$env")"
         if [[ -n ${_seen_target[$key]:-} ]]; then
-            log_run ERROR TARGET_DUPLICATE project="$project" env="$env"
+            log_run ERROR TARGET_DUPLICATE project="$project" env="$env" line_no="$lineno"
             continue
         fi
         _seen_target[$key]=1
 
         if [[ $enabled != true ]]; then
+            log_run DEBUG TARGET_DISABLED project="$project" env="$env" enabled="$(enc "$enabled")"
             continue
         fi
         T_PROJECT+=("$project"); T_ENV+=("$env")
@@ -384,16 +423,16 @@ discover_or_load_dirs() {
     local key=$1 src=$2 idn=$3 cache=$4
     DIRS=(); DIRLAST=()
 
-    local need_discovery=0 now cache_mt age
+    local need_discovery=0 now cache_mt age reason="cache-fresh"
     now=$(now_epoch)
     if [[ ! -f $cache ]]; then
-        need_discovery=1
+        need_discovery=1; reason="no-cache"
     else
         cache_mt=$(get_mtime "$cache"); is_uint "$cache_mt" || cache_mt=0
         age=$(( now - cache_mt ))
-        (( age >= DISCOVERY_INTERVAL )) && need_discovery=1
+        (( age >= DISCOVERY_INTERVAL )) && { need_discovery=1; reason="cache-stale"; }
     fi
-    (( FORCE_REDISCOVER )) && need_discovery=1
+    (( FORCE_REDISCOVER )) && { need_discovery=1; reason="forced"; }
 
     # Always load whatever the cache currently holds (to preserve settled mtimes).
     local encdir lastm dir
@@ -410,6 +449,7 @@ discover_or_load_dirs() {
     if (( need_discovery )); then
         local t0 t1 count=0 d
         t0=$(now_epoch)
+        log_tgt DEBUG DISCOVERY_BEGIN src="$(enc "$src")" input_dir_name="$idn" reason="$reason"
         declare -A _found=()
         local -a newdirs=()
         while IFS= read -r -d '' d; do
@@ -417,6 +457,7 @@ discover_or_load_dirs() {
             newdirs+=("$d")
             [[ -z ${DIRLAST["$d"]:-} ]] && DIRLAST["$d"]=0
             (( count++ ))
+            log_tgt DEBUG FOUND_INPUT_DIR dir="$(enc "${d#"$src"/}")"
         done < <(find "$src" -type d -name "$idn" -print0 2>/dev/null)
         # Drop directories that disappeared.
         for dir in "${DIRS[@]:-}"; do
@@ -425,8 +466,15 @@ discover_or_load_dirs() {
         done
         DIRS=("${newdirs[@]:-}")
         t1=$(now_epoch)
-        log_tgt INFO DISCOVERY count="$count" dur_s="$(( t1 - t0 ))"
+        log_tgt INFO DISCOVERY count="$count" dur_s="$(( t1 - t0 ))" \
+            src="$(enc "$src")" input_dir_name="$idn" reason="$reason"
+        if (( count == 0 )); then
+            log_tgt WARN NO_INPUT_DIRS src="$(enc "$src")" input_dir_name="$idn" \
+                hint="no directory named '$idn' found anywhere under the source"
+        fi
         write_dir_cache "$cache"
+    else
+        log_tgt DEBUG DISCOVERY_CACHED dirs="${#DIRS[@]}"
     fi
 }
 
@@ -449,9 +497,9 @@ ANY_COPY_FAILED=0
 declare -A RUN_COPIED=() RUN_VERSIONED=() RUN_SKIPPED=() RUN_ERRORS=() RUN_SCANNED=()
 
 # process_file <key> <src_root> <arc_root> <src_path>
-# Handles one source file. Never writes to the source. Sets the caller's
-# `dir_settled` to 0 (via the DIR_UNSETTLED global) when the file could not be
-# finalised (unstable / error), so the directory is rescanned next cycle.
+# Handles one source file. Never writes to the source. Sets DIR_UNSETTLED=1 when
+# the file could not be finalised (unstable / error), so the directory is
+# rescanned next cycle.
 DIR_UNSETTLED=0
 process_file() {
     local key=$1 src_root=$2 arc_root=$3 src=$4
@@ -475,26 +523,26 @@ process_file() {
 
     now=$(now_epoch); age=$(( now - mtime ))
     if (( age < MIN_STABLE_AGE )); then
-        log_tgt DEBUG SKIP_UNSTABLE relpath="$encrel" age_s="$age"
+        log_tgt DEBUG SKIP_UNSTABLE relpath="$encrel" age_s="$age" min_stable_age="$MIN_STABLE_AGE"
         DIR_UNSETTLED=1
         return 0
     fi
 
     # Already processed this exact (path,size,mtime) -> nothing to do, no re-hash.
     if [[ -n ${LED_SMT["$key$SEP$encrel$SEP$size$SEP$mtime"]:-} ]]; then
-        log_tgt DEBUG SKIP_LEDGER relpath="$encrel"
+        log_tgt DEBUG SKIP_LEDGER relpath="$encrel" size="$size" mtime="$mtime"
         return 0
     fi
 
     h=$(hash_file "$src") || {
-        log_tgt WARN HASH_FAILED relpath="$encrel"
+        log_tgt WARN HASH_FAILED relpath="$encrel" hash_cmd="$HASH_CMD"
         (( CYC_ERRORS++ )); DIR_UNSETTLED=1
         return 0
     }
 
     # Content already archived for this relpath (e.g. file touched, or reverted).
     if [[ -n ${LED_RH["$key$SEP$encrel$SEP$h"]:-} ]]; then
-        log_tgt DEBUG SKIP_SAME_HASH relpath="$encrel"
+        log_tgt DEBUG SKIP_SAME_HASH relpath="$encrel" hash="${h:0:8}…"
         LED_SMT["$key$SEP$encrel$SEP$size$SEP$mtime"]=1
         (( CYC_SKIPPED++ ))
         return 0
@@ -532,7 +580,7 @@ process_file() {
 
     local err rc
     if ! err=$(mkdir -p -- "$dst_dir" 2>&1); then
-        log_tgt ERROR COPY_FAILED relpath="$encrel" rc="1" err="$(enc "$err")"
+        log_tgt ERROR COPY_FAILED stage="mkdir" relpath="$encrel" dst_dir="$(enc "$dst_dir")" rc="1" err="$(enc "$err")"
         (( CYC_ERRORS++ )); ANY_COPY_FAILED=1; DIR_UNSETTLED=1
         return 0
     fi
@@ -540,14 +588,14 @@ process_file() {
     local tmp="$dst.tmp.$$"
     if ! err=$(cp -p -- "$src" "$tmp" 2>&1); then
         rc=$?
-        log_tgt ERROR COPY_FAILED relpath="$encrel" rc="$rc" err="$(enc "$err")"
+        log_tgt ERROR COPY_FAILED stage="cp" relpath="$encrel" dst="$(enc "$dst")" rc="$rc" err="$(enc "$err")"
         rm -f -- "$tmp" 2>/dev/null
         (( CYC_ERRORS++ )); ANY_COPY_FAILED=1; DIR_UNSETTLED=1
         return 0
     fi
     if ! err=$(mv -f -- "$tmp" "$dst" 2>&1); then
         rc=$?
-        log_tgt ERROR COPY_FAILED relpath="$encrel" rc="$rc" err="$(enc "$err")"
+        log_tgt ERROR COPY_FAILED stage="mv" relpath="$encrel" dst="$(enc "$dst")" rc="$rc" err="$(enc "$err")"
         rm -f -- "$tmp" 2>/dev/null
         (( CYC_ERRORS++ )); ANY_COPY_FAILED=1; DIR_UNSETTLED=1
         return 0
@@ -579,17 +627,26 @@ scan_target() {
     LEDGER_FILE="$STATE_DIR/$key.ledger.tsv"
     local cache="$STATE_DIR/$key.inputdirs.tsv"
 
-    log_tgt DEBUG TARGET_BEGIN src="$(enc "$src")" arc="$(enc "$arc")"
+    log_tgt DEBUG TARGET_BEGIN src="$(enc "$src")" arc="$(enc "$arc")" input_dir_name="$idn"
 
-    # Guard: source must exist and be readable (covers an unmounted share).
-    if [[ ! -d $src || ! -r $src ]]; then
-        if [[ $REQUIRE_MOUNT == true ]]; then
-            log_tgt ERROR MOUNT_MISSING src="$(enc "$src")"
-            return 0
-        fi
-        log_tgt WARN MOUNT_MISSING src="$(enc "$src")"
+    # Guard: the source must be an existing, readable, searchable directory.
+    # A precise reason plus the deepest existing ancestor makes an unmounted
+    # share or a wrong path immediately obvious.
+    local mreason; mreason=$(mount_reason "$src")
+    if [[ $mreason != ok ]]; then
+        local prev=${T_MOUNT_STATE[$key]:-} anc; anc=$(deepest_existing "$src")
+        local base_lvl=ERROR; [[ $REQUIRE_MOUNT == true ]] || base_lvl=WARN
+        local lvl=DEBUG; [[ $prev != missing ]] && lvl=$base_lvl   # loud on change, quiet on repeat
+        T_MOUNT_STATE[$key]=missing
+        _emit_file "$CUR_OPLOG" 1 "$lvl" MOUNT_MISSING \
+            "src=$(enc "$src")" "reason=$mreason" "deepest_existing=$(enc "$anc")" \
+            "require_mount=$REQUIRE_MOUNT"
         return 0
     fi
+    if [[ ${T_MOUNT_STATE[$key]:-} == missing ]]; then
+        log_tgt INFO MOUNT_OK src="$(enc "$src")"
+    fi
+    T_MOUNT_STATE[$key]=ok
     ANY_TARGET_OK=1
 
     # Ledger (lazy): refuse the target if the ledger is corrupted.
@@ -605,18 +662,20 @@ scan_target() {
 
     CYC_SCANNED=0 CYC_COPIED=0 CYC_VERSIONED=0 CYC_SKIPPED=0 CYC_ERRORS=0 CYC_BYTES=0
 
-    local dir dmt cache_dirty=0
+    local dir dmt cache_dirty=0 dirs_total=0 dirs_rescanned=0
     for dir in "${DIRS[@]:-}"; do
         [[ -z $dir ]] && continue
         [[ -d $dir ]] || continue
+        (( dirs_total++ ))
         dmt=$(get_mtime "$dir"); is_uint "$dmt" || dmt=0
 
         if [[ $USE_DIR_MTIME_SKIP == true && ${DIRLAST["$dir"]:-0} == "$dmt" && $dmt != 0 ]]; then
-            log_tgt DEBUG SKIP_DIR_UNCHANGED dir="$(enc "${dir#"$src"/}")"
+            log_tgt DEBUG SKIP_DIR_UNCHANGED dir="$(enc "${dir#"$src"/}")" mtime="$dmt"
             continue
         fi
 
-        log_tgt DEBUG DIR_RESCAN dir="$(enc "${dir#"$src"/}")"
+        (( dirs_rescanned++ ))
+        log_tgt DEBUG DIR_RESCAN dir="$(enc "${dir#"$src"/}")" mtime="$dmt" last="${DIRLAST["$dir"]:-0}"
         DIR_UNSETTLED=0
         local f
         while IFS= read -r -d '' f; do
@@ -640,9 +699,11 @@ scan_target() {
     RUN_ERRORS[$key]=$(( ${RUN_ERRORS[$key]:-0} + CYC_ERRORS ))
     RUN_SCANNED[$key]=$(( ${RUN_SCANNED[$key]:-0} + CYC_SCANNED ))
 
-    log_tgt INFO CYCLE_SUMMARY scanned="$CYC_SCANNED" copied="$CYC_COPIED" \
-        versioned="$CYC_VERSIONED" skipped="$CYC_SKIPPED" errors="$CYC_ERRORS" \
-        bytes_copied="$CYC_BYTES"
+    # Per-cycle detail is DEBUG (it happens every SCAN_INTERVAL); INFO summaries
+    # come from HEARTBEAT and the final TARGET_SUMMARY.
+    log_tgt DEBUG CYCLE_SUMMARY input_dirs="$dirs_total" rescanned="$dirs_rescanned" \
+        scanned="$CYC_SCANNED" copied="$CYC_COPIED" versioned="$CYC_VERSIONED" \
+        skipped="$CYC_SKIPPED" errors="$CYC_ERRORS" bytes_copied="$CYC_BYTES"
 }
 
 # ---------------------------------------------------------------------------
@@ -650,16 +711,22 @@ scan_target() {
 # ---------------------------------------------------------------------------
 usage() {
     cat <<'EOF'
-Usage: squirrel.sh [--config FILE] [--rediscover] [--help]
+Usage: squirrel.sh [--config FILE] [--rediscover] [--debug] [--once] [--verbose] [--help]
 
 Copies files from "input" directories on a mounted NAS share into a mirror
 archive tree, exactly once, with content-hash deduplication. Targets are
 described in targets.tsv. See README.md for details.
 
+  --config FILE  Use this configuration file (default: <script dir>/squirrel.conf).
   --rediscover   Request an immediate rediscovery of the input directories:
-                 drops a marker that the running scanner picks up on its next
-                 cycle (a new input directory is then seen without waiting for
-                 DISCOVERY_INTERVAL). Does not start a scan; exits right away.
+                 drops a marker the running scanner picks up next cycle. Exits
+                 right away without scanning.
+  --debug        Maximum verbosity: LOG_LEVEL=DEBUG and mirror every line to the
+                 terminal. Great for finding why nothing is being archived.
+  --once         Do a single scan pass and exit (RUN_DURATION=0), instead of the
+                 continuous loop. Combine with --debug to diagnose quickly.
+  --verbose      Mirror log lines to the terminal (without changing the level).
+  --help         Show this help.
 EOF
 }
 
@@ -669,6 +736,9 @@ parse_args() {
             --config) CONFIG_FILE=$2; shift 2 ;;
             --config=*) CONFIG_FILE=${1#*=}; shift ;;
             --rediscover) ACTION="rediscover"; shift ;;
+            --debug) FORCE_DEBUG=1; shift ;;
+            --once) ONCE=1; shift ;;
+            --verbose|-v) LOG_CONSOLE="always"; shift ;;
             -h|--help) usage; exit $EX_OK ;;
             *) printf 'Unknown argument: %s\n' "$1" >&2; usage >&2; exit $EX_CONFIG ;;
         esac
@@ -676,15 +746,29 @@ parse_args() {
 }
 
 load_config() {
-    if [[ -n $CONFIG_FILE && -f $CONFIG_FILE ]]; then
-        if [[ ! -r $CONFIG_FILE ]]; then
-            printf 'Config file not readable: %s\n' "$CONFIG_FILE" >&2
-            exit $EX_CONFIG
+    CONFIG_STATUS="none"
+    if [[ -n $CONFIG_FILE ]]; then
+        if [[ -f $CONFIG_FILE ]]; then
+            if [[ ! -r $CONFIG_FILE ]]; then
+                printf 'Config file not readable: %s\n' "$CONFIG_FILE" >&2
+                exit $EX_CONFIG
+            fi
+            # shellcheck disable=SC1090
+            source "$CONFIG_FILE"
+            CONFIG_STATUS="loaded"
+        else
+            CONFIG_STATUS="missing"
         fi
-        # shellcheck disable=SC1090
-        source "$CONFIG_FILE"
     fi
+    # CLI overrides applied last so they always win.
+    if (( FORCE_DEBUG )); then LOG_LEVEL="DEBUG"; LOG_CONSOLE="always"; fi
+    if (( ONCE )); then RUN_DURATION=0; fi
     LOG_LEVEL_NUM=$(_lvlnum "$LOG_LEVEL")
+    case ${LOG_CONSOLE,,} in
+        always|1|true|yes|on) CONSOLE_ON=1 ;;
+        never|0|false|no|off) CONSOLE_ON=0 ;;
+        *) [[ -t 2 ]] && CONSOLE_ON=1 || CONSOLE_ON=0 ;;
+    esac
 }
 
 # ---------------------------------------------------------------------------
@@ -720,11 +804,19 @@ main() {
         exit $EX_LOCKED
     fi
 
-    log_run INFO START pid="$$" host="${HOSTNAME:-$(uname -n 2>/dev/null)}"
-    log_run INFO CONFIG targets="$(enc "$TARGETS_FILE")" scan_interval="$SCAN_INTERVAL" \
+    # --- Startup banner (shown on the console when interactive) ---
+    log_run INFO START pid="$$" host="${HOSTNAME:-$(uname -n 2>/dev/null)}" \
+        user="$(id -un 2>/dev/null)" bash="$BASH_VERSION"
+    log_run INFO PATHS script_dir="$(enc "$SCRIPT_DIR")" config="$(enc "$CONFIG_FILE")" \
+        config_status="$CONFIG_STATUS" targets="$(enc "$TARGETS_FILE")" \
+        state_dir="$(enc "$STATE_DIR")" log_dir="$(enc "$LOG_DIR")" lock="$(enc "$LOCK_FILE")"
+    log_run INFO CONFIG input_dir_name="$INPUT_DIR_NAME" scan_interval="$SCAN_INTERVAL" \
         run_duration="$RUN_DURATION" min_stable_age="$MIN_STABLE_AGE" \
-        discovery_interval="$DISCOVERY_INTERVAL" dry_run="$DRY_RUN" \
-        log_format="$LOG_FORMAT" log_level="$LOG_LEVEL"
+        discovery_interval="$DISCOVERY_INTERVAL" use_dir_mtime_skip="$USE_DIR_MTIME_SKIP" \
+        require_mount="$REQUIRE_MOUNT" hash_cmd="$HASH_CMD" dry_run="$DRY_RUN" \
+        log_format="$LOG_FORMAT" log_level="$LOG_LEVEL" console="$LOG_CONSOLE"
+    [[ $CONFIG_STATUS == missing ]] && log_run WARN CONFIG_NOT_FOUND config="$(enc "$CONFIG_FILE")" \
+        hint="config file not found; running with built-in defaults"
 
     if ! load_targets; then
         exit $EX_CONFIG
@@ -732,19 +824,27 @@ main() {
     local ntargets=${#T_KEY[@]}
     log_run INFO TARGETS_LOADED count="$ntargets"
     if (( ntargets == 0 )); then
-        log_run WARN NO_TARGETS
+        log_run WARN NO_TARGETS hint="no enabled target in $TARGETS_FILE (check the 'enabled' column)"
         log_run INFO END
         exit $EX_OK
     fi
 
+    # Log every resolved target so a wrong source/archive path is obvious.
+    local i
+    for (( i = 0; i < ntargets; i++ )); do
+        log_run INFO TARGET project="${T_PROJECT[i]}" env="${T_ENV[i]}" \
+            source="$(enc "${T_SRC[i]}")" archive="$(enc "${T_ARC[i]}")" \
+            input_dir_name="${T_IDN[i]}" scan_interval="${T_SCAN[i]}"
+    done
+
     # Poll granularity = smallest per-target scan interval.
-    local tick=$SCAN_INTERVAL i
+    local tick=$SCAN_INTERVAL
     for (( i = 0; i < ntargets; i++ )); do
         (( T_SCAN[i] < tick )) && tick=${T_SCAN[i]}
     done
     (( tick < 1 )) && tick=1
 
-    local cycle=0 first=1 now
+    local cycle=0 first=1 now last_hb=0
     while (( first || SECONDS < RUN_DURATION )); do
         first=0
         (( cycle++ ))
@@ -767,6 +867,21 @@ main() {
             fi
         done
         CUR_PROJECT="" CUR_ENV="" CUR_CYCLE=""
+
+        # Periodic heartbeat: proves the loop is alive and shows, at a glance,
+        # whether it is archiving or stuck (e.g. every target MOUNT_MISSING).
+        if (( HEARTBEAT_INTERVAL > 0 )) && (( now - last_hb >= HEARTBEAT_INTERVAL )); then
+            last_hb=$now
+            local hb_copied=0 hb_err=0 hb_missing=0 kk
+            for kk in "${T_KEY[@]}"; do
+                hb_copied=$(( hb_copied + ${RUN_COPIED[$kk]:-0} ))
+                hb_err=$(( hb_err + ${RUN_ERRORS[$kk]:-0} ))
+                [[ ${T_MOUNT_STATE[$kk]:-} == missing ]] && (( hb_missing++ ))
+            done
+            log_run INFO HEARTBEAT cycle="$cycle" elapsed_s="$SECONDS" targets="$ntargets" \
+                copied="$hb_copied" errors="$hb_err" mount_missing="$hb_missing"
+        fi
+
         (( SECONDS < RUN_DURATION )) || break
         sleep "$tick"
     done
@@ -788,7 +903,7 @@ main() {
         [[ -d "$LOG_DIR/$k" ]] && log_tgt INFO TARGET_SUMMARY \
             copied="${RUN_COPIED[$k]:-0}" versioned="${RUN_VERSIONED[$k]:-0}" \
             skipped="${RUN_SKIPPED[$k]:-0}" errors="${RUN_ERRORS[$k]:-0}" \
-            scanned="${RUN_SCANNED[$k]:-0}" cycles="$cycle"
+            scanned="${RUN_SCANNED[$k]:-0}" mount="${T_MOUNT_STATE[$k]:-unknown}" cycles="$cycle"
     done
     CUR_PROJECT="" CUR_ENV="" CUR_CYCLE=""
 

@@ -182,18 +182,47 @@ expected and logged only at `DEBUG`.
 
 ## Logs & troubleshooting
 
+**Quick diagnosis** — do a single pass with everything printed to the terminal:
+
+```sh
+./squirrel.sh --config squirrel.conf --debug --once
+```
+
+It prints the resolved paths, the effective configuration, every target's
+`source`/`archive`, and exactly why nothing is being archived. When a source
+cannot be scanned it logs, for example:
+
+```
+event=MOUNT_MISSING src=".../homologation/Avanteam" reason="path does not exist" deepest_existing="/cifs/aldnas" require_mount="true"
+```
+
+- `reason` — what failed: missing / not a directory / not readable / not searchable.
+- `deepest_existing` — how far the path resolves: if it stops at `/cifs`, the
+  share is not mounted; if it resolves deep but the last component is wrong, it is
+  a path typo.
+
+Other useful signals: `NO_INPUT_DIRS` (source is fine but no directory named
+`input` was found under it) and the periodic `HEARTBEAT` (`mount_missing=` shows a
+loop that is stuck rather than archiving).
+
+Log files:
+
 - `logs/<project>__<env>/operations.log` — per-target operational log.
 - `logs/<project>__<env>/audit.log` — per-target append-only archive trail.
-- `logs/_run.log` — orchestration events (`START`, `CONFIG`, `TARGETS_LOADED`,
-  `RUN_SUMMARY`, `END`, `LOCK_BUSY`).
+- `logs/_run.log` — orchestration events (`START`, `PATHS`, `CONFIG`, `TARGET`,
+  `TARGETS_LOADED`, `HEARTBEAT`, `RUN_SUMMARY`, `END`, `LOCK_BUSY`).
 - `logs/cron.err` — raw stderr captured by cron (last-resort safety net).
 
-Every operational line carries `run`, `project`, `env`, `cycle` correlation ids.
+`LOG_CONSOLE=auto` mirrors every line to the terminal when run interactively (set
+`always`/`never` to force it); `LOG_LEVEL=DEBUG` adds per-file and per-directory
+detail. Every operational line carries `run`, `project`, `env`, `cycle` ids.
 
-Event glossary: `TARGET_BEGIN`, `MOUNT_MISSING`, `DISCOVERY`, `FORCE_REDISCOVER`,
-`SKIP_DIR_UNCHANGED`, `DIR_RESCAN`, `SKIP_UNSTABLE`, `SKIP_LEDGER`,
-`SKIP_SAME_HASH`, `COPIED`, `VERSIONED`, `COPY_FAILED`, `LEDGER_CORRUPT`,
-`CYCLE_SUMMARY`, `TARGET_SUMMARY`.
+Event glossary: `START`, `PATHS`, `CONFIG`, `CONFIG_NOT_FOUND`, `TARGET`,
+`TARGETS_LOADED`, `TARGET_DISABLED`, `TARGET_MALFORMED`, `TARGET_DUPLICATE`,
+`TARGET_BEGIN`, `MOUNT_MISSING`, `MOUNT_OK`, `DISCOVERY`, `NO_INPUT_DIRS`,
+`FORCE_REDISCOVER`, `SKIP_DIR_UNCHANGED`, `DIR_RESCAN`, `SKIP_UNSTABLE`,
+`SKIP_LEDGER`, `SKIP_SAME_HASH`, `COPIED`, `VERSIONED`, `COPY_FAILED`,
+`LEDGER_CORRUPT`, `HEARTBEAT`, `CYCLE_SUMMARY`, `TARGET_SUMMARY`.
 
 Exit codes: `0` success · `1` configuration error · `2` no usable target ·
 `3` lock busy (another run is active) · `4` at least one archive copy failed.
