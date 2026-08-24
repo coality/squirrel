@@ -24,6 +24,10 @@ DRY_RUN=false                   # true = simulate, copy nothing
 # --- Discovery & I/O (minimise disk access) ---
 DISCOVERY_INTERVAL=1800         # seconds between full-tree rediscoveries of input dirs
 USE_DIR_MTIME_SKIP=true         # skip a directory whose mtime has not changed (flat drops)
+# Directory-name patterns (case-insensitive globs) to ignore anywhere in the tree.
+# A matching directory is skipped and never descended into. Bash array; empty = off.
+EXCLUDE_DIR_PATTERNS=()
+# EXCLUDE_DIR_PATTERNS=('*archived*' '*archive*' '*.bak')
 
 # --- Logging ---
 LOG_LEVEL="INFO"                # DEBUG | INFO | WARN | ERROR  (DEBUG = maximum detail)

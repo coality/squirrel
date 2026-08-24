@@ -60,6 +60,7 @@ LOG_ROTATE_KEEP=7
 AUDIT_LOG=true
 LOG_CONSOLE="auto"      # auto (mirror to terminal when interactive) | always | never
 HEARTBEAT_INTERVAL=60   # seconds between periodic "still alive" summaries (0 = off)
+EXCLUDE_DIR_PATTERNS=() # case-insensitive glob patterns of directory names to ignore (empty = none)
 
 # Resolve the script directory portably (no readlink -f).
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
@@ -217,6 +218,17 @@ sanitize() {
 
 # is_uint: true if the argument is a non-empty string of digits.
 is_uint() { [[ $1 =~ ^[0-9]+$ ]]; }
+
+# is_excluded_dirname: true if a directory basename matches any EXCLUDE_DIR_PATTERNS
+# entry. Case-insensitive glob (both sides lowercased; RHS unquoted = glob).
+is_excluded_dirname() {
+    local name=${1,,} pat
+    for pat in "${EXCLUDE_DIR_PATTERNS[@]:-}"; do
+        [[ -z $pat ]] && continue
+        [[ $name == ${pat,,} ]] && return 0
+    done
+    return 1
+}
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -449,10 +461,20 @@ discover_or_load_dirs() {
     if (( need_discovery )); then
         # Scan dirs ("leaves") = each input dir itself PLUS its DIRECT subdirs.
         # Each leaf is later listed at -maxdepth 1, so we collect files directly
-        # in input and directly in its direct subdirs — never deeper.
-        local t0 t1 input_count=0 d sub
+        # in input and directly in its direct subdirs — never deeper. Directories
+        # whose name matches EXCLUDE_DIR_PATTERNS are pruned (not descended into)
+        # and never scanned.
+        local t0 t1 input_count=0 excluded=0 d sub
         t0=$(now_epoch)
         log_tgt DEBUG DISCOVERY_BEGIN src="$(enc "$src")" input_dir_name="$idn" reason="$reason"
+        # Build a find prune expression from the exclude patterns (case-insensitive).
+        local -a fexpr=() pat; local firstp=1
+        for pat in "${EXCLUDE_DIR_PATTERNS[@]:-}"; do
+            [[ -z $pat ]] && continue
+            if (( firstp )); then fexpr+=( '(' -type d '(' -iname "$pat" ); firstp=0
+            else fexpr+=( -o -iname "$pat" ); fi
+        done
+        (( firstp )) || fexpr+=( ')' -prune ')' -o )
         declare -A _found=()
         local -a newdirs=()
         while IFS= read -r -d '' d; do
@@ -462,14 +484,19 @@ discover_or_load_dirs() {
             if [[ -z ${_found["$d"]:-} ]]; then
                 _found["$d"]=1; newdirs+=("$d"); [[ -z ${DIRLAST["$d"]:-} ]] && DIRLAST["$d"]=0
             fi
-            # Leaves: each DIRECT subdirectory of the input dir (its direct files).
+            # Leaves: each DIRECT subdirectory of the input dir (its direct files),
+            # skipping directories whose name is excluded.
             while IFS= read -r -d '' sub; do
+                if is_excluded_dirname "${sub##*/}"; then
+                    (( excluded++ )); log_tgt DEBUG EXCLUDED_DIR dir="$(enc "${sub#"$src"/}")"
+                    continue
+                fi
                 if [[ -z ${_found["$sub"]:-} ]]; then
                     _found["$sub"]=1; newdirs+=("$sub"); [[ -z ${DIRLAST["$sub"]:-} ]] && DIRLAST["$sub"]=0
                     log_tgt DEBUG FOUND_SCAN_DIR dir="$(enc "${sub#"$src"/}")"
                 fi
             done < <(find "$d" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
-        done < <(find "$src" -type d -name "$idn" -print0 2>/dev/null)
+        done < <(find "$src" "${fexpr[@]}" -type d -name "$idn" -print0 2>/dev/null)
         # Drop leaves that disappeared.
         for dir in "${DIRS[@]:-}"; do
             [[ -z $dir ]] && continue
@@ -478,7 +505,8 @@ discover_or_load_dirs() {
         DIRS=("${newdirs[@]:-}")
         t1=$(now_epoch)
         log_tgt INFO DISCOVERY input_dirs="$input_count" scan_dirs="${#newdirs[@]}" \
-            dur_s="$(( t1 - t0 ))" src="$(enc "$src")" input_dir_name="$idn" reason="$reason"
+            excluded="$excluded" dur_s="$(( t1 - t0 ))" src="$(enc "$src")" \
+            input_dir_name="$idn" reason="$reason"
         if (( input_count == 0 )); then
             log_tgt WARN NO_INPUT_DIRS src="$(enc "$src")" input_dir_name="$idn" \
                 hint="no directory named '$idn' found anywhere under the source"
@@ -677,6 +705,12 @@ scan_target() {
     for dir in "${DIRS[@]:-}"; do
         [[ -z $dir ]] && continue
         [[ -d $dir ]] || continue
+        # Safety net: honour exclusions even for a leaf still present in the cache
+        # (so a newly added pattern takes effect without waiting for rediscovery).
+        if is_excluded_dirname "${dir##*/}"; then
+            log_tgt DEBUG SKIP_DIR_EXCLUDED dir="$(enc "${dir#"$src"/}")"
+            continue
+        fi
         (( dirs_total++ ))
         dmt=$(get_mtime "$dir"); is_uint "$dmt" || dmt=0
 
@@ -825,6 +859,7 @@ main() {
         run_duration="$RUN_DURATION" min_stable_age="$MIN_STABLE_AGE" \
         discovery_interval="$DISCOVERY_INTERVAL" use_dir_mtime_skip="$USE_DIR_MTIME_SKIP" \
         require_mount="$REQUIRE_MOUNT" hash_cmd="$HASH_CMD" dry_run="$DRY_RUN" \
+        exclude_patterns="$(enc "${EXCLUDE_DIR_PATTERNS[*]:-}")" \
         log_format="$LOG_FORMAT" log_level="$LOG_LEVEL" console="$LOG_CONSOLE"
     [[ $CONFIG_STATUS == missing ]] && log_run WARN CONFIG_NOT_FOUND config="$(enc "$CONFIG_FILE")" \
         hint="config file not found; running with built-in defaults"

@@ -368,6 +368,61 @@ test_new_subdir_rediscovery() {  # new direct subdir picked up at rediscovery
     assert_file "$d/arc/input/s2/f2.txt" "new subdir archived after rediscovery"
 }
 
+test_exclude_subdir() {  # EXCLUDE_DIR_PATTERNS ignores a matching subdir
+    title "EXCLUDE_DIR_PATTERNS ignores a matching subdir"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/input/supplier" "$d/src/input/archived"
+    echo direct > "$d/src/input/direct.txt"
+    echo s      > "$d/src/input/supplier/s.txt"
+    echo a      > "$d/src/input/archived/a.txt"
+    add_target "$d" p e "$d/src" "$d/arc"
+    write_conf "$d" "EXCLUDE_DIR_PATTERNS=('*archived*')"
+    run "$d"
+    assert_file   "$d/arc/input/direct.txt"     "input direct file kept"
+    assert_file   "$d/arc/input/supplier/s.txt" "normal subdir kept"
+    assert_nofile "$d/arc/input/archived/a.txt" "excluded subdir ignored"
+    assert_eq 2 "$(count_files "$d/arc")" "two files"
+    assert_grep "$(oplog "$d" p e)" 'event=EXCLUDED_DIR'
+}
+
+test_exclude_case_insensitive() {  # matching is case-insensitive
+    title "exclusion is case-insensitive"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/input/AvanteamArchive"
+    echo x > "$d/src/input/AvanteamArchive/x.txt"
+    echo y > "$d/src/input/y.txt"
+    add_target "$d" p e "$d/src" "$d/arc"
+    write_conf "$d" "EXCLUDE_DIR_PATTERNS=('*archive*')"
+    run "$d"
+    assert_file   "$d/arc/input/y.txt" "input direct file kept"
+    assert_nofile "$d/arc/input/AvanteamArchive/x.txt" "CamelCase Archive excluded"
+}
+
+test_exclude_prune_deep() {  # excluded dir pruned even if it holds input dirs
+    title "excluded dir is pruned even when it contains input dirs"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/proj/archived/deep/input" "$d/src/proj/live/input"
+    echo h > "$d/src/proj/archived/deep/input/hidden.txt"
+    echo o > "$d/src/proj/live/input/ok.txt"
+    add_target "$d" p e "$d/src" "$d/arc"
+    write_conf "$d" "EXCLUDE_DIR_PATTERNS=('*archived*')"
+    run "$d"
+    assert_file   "$d/arc/proj/live/input/ok.txt" "live input archived"
+    assert_nofile "$d/arc/proj/archived/deep/input/hidden.txt" "input under archived pruned"
+    assert_eq 1 "$(count_files "$d/arc")" "only one file"
+}
+
+test_exclude_default_off() {  # default empty -> nothing excluded
+    title "no patterns -> archived subdir is archived (unchanged default)"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/input/archived"
+    echo a > "$d/src/input/archived/a.txt"
+    add_target "$d" p e "$d/src" "$d/arc"
+    write_conf "$d"
+    run "$d"
+    assert_file "$d/arc/input/archived/a.txt" "archived included when no exclude patterns"
+}
+
 test_force_rediscovery() {  # manual --rediscover
     title "--rediscover picks up a new input dir before DISCOVERY_INTERVAL"
     local d; d=$(new_case)
@@ -495,6 +550,10 @@ main() {
     test_discovery_cache
     test_subdir_selection
     test_new_subdir_rediscovery
+    test_exclude_subdir
+    test_exclude_case_insensitive
+    test_exclude_prune_deep
+    test_exclude_default_off
     test_force_rediscovery
     test_antioubli
     test_dirskip_disabled

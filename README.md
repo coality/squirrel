@@ -16,7 +16,8 @@ copies, it never modifies or deletes a source file.
   *and* the files **directly inside its direct sub-directories** (e.g.
   `input/supplier/`). Deeper levels are never scanned — `input/supplier/archive/`
   is ignored. Sub-directories are enumerated at discovery (`DISCOVERY_INTERVAL` or
-  `--rediscover`).
+  `--rediscover`). Directories whose name matches `EXCLUDE_DIR_PATTERNS`
+  (case-insensitive globs) are skipped entirely and never descended into.
 - **Archive once, dedup by hash**:
   - never seen → copied under its own name;
   - same name **and** same content hash → nothing to do;
@@ -70,6 +71,7 @@ full list. Most-used options:
 | `REQUIRE_MOUNT` | `true` | skip a target whose source is missing/unreadable |
 | `DISCOVERY_INTERVAL` | `1800` | seconds between full-tree rediscoveries |
 | `USE_DIR_MTIME_SKIP` | `true` | skip directories whose mtime is unchanged |
+| `EXCLUDE_DIR_PATTERNS` | `()` | dir-name globs (case-insensitive) to ignore anywhere, e.g. `('*archived*')` |
 | `HASH_CMD` | `sha256sum` | content hash command |
 | `DRY_RUN` | `false` | simulate without writing anything |
 | `LOG_LEVEL` | `INFO` | `DEBUG`/`INFO`/`WARN`/`ERROR` |
@@ -225,8 +227,8 @@ detail. Every operational line carries `run`, `project`, `env`, `cycle` ids.
 
 Event glossary: `START`, `PATHS`, `CONFIG`, `CONFIG_NOT_FOUND`, `TARGET`,
 `TARGETS_LOADED`, `TARGET_DISABLED`, `TARGET_MALFORMED`, `TARGET_DUPLICATE`,
-`TARGET_BEGIN`, `MOUNT_MISSING`, `MOUNT_OK`, `DISCOVERY`, `FOUND_SCAN_DIR`, `NO_INPUT_DIRS`,
-`FORCE_REDISCOVER`, `SKIP_DIR_UNCHANGED`, `DIR_RESCAN`, `SKIP_UNSTABLE`,
+`TARGET_BEGIN`, `MOUNT_MISSING`, `MOUNT_OK`, `DISCOVERY`, `FOUND_SCAN_DIR`, `EXCLUDED_DIR`,
+`NO_INPUT_DIRS`, `FORCE_REDISCOVER`, `SKIP_DIR_UNCHANGED`, `SKIP_DIR_EXCLUDED`, `DIR_RESCAN`, `SKIP_UNSTABLE`,
 `SKIP_LEDGER`, `SKIP_SAME_HASH`, `COPIED`, `VERSIONED`, `COPY_FAILED`,
 `LEDGER_CORRUPT`, `HEARTBEAT`, `CYCLE_SUMMARY`, `TARGET_SUMMARY`.
 
