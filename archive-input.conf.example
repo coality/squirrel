@@ -4,10 +4,15 @@
 
 # --- Defaults applied per target when the column is "-" ---
 INPUT_DIR_NAME="input"          # EXACT name of the scanned directory
-SCAN_INTERVAL=10                # seconds between two internal passes
+SCAN_INTERVAL=2                 # seconds between scan passes (small = better capture;
+                                # idle passes only stat directories, so this stays cheap)
 
 # --- Execution ---
-RUN_DURATION=55                 # max seconds for one cron run (keep < 60)
+# Continuous mode: the script loops for RUN_DURATION seconds, scanning every
+# SCAN_INTERVAL, so there is no per-minute gap. Keep it high; a cron entry every
+# minute just restarts it if it died, and the internal flock guarantees a single
+# instance. See README "Run with cron".
+RUN_DURATION=86400              # ~24h continuous loop, then it recycles (cron restarts it)
 MIN_STABLE_AGE=0                # min file age (s) before archiving; keep 0 if files are written
                                 # atomically (rename/mv into 'input'); raise it only for in-place writes
 REQUIRE_MOUNT=true              # skip a target whose source is missing/unreadable (unmounted share)

@@ -112,24 +112,28 @@ This tool is a passive, read-only poller: it captures a file only while the file
 is still present. Whether every file is archived before an external consumer
 removes it depends on timing:
 
-- The scanner runs continuously (cron every minute, internal passes every
-  `SCAN_INTERVAL` seconds), so a new file is seen within roughly one
-  `SCAN_INTERVAL`.
+- The scanner runs **continuously** (an internal loop every `SCAN_INTERVAL`
+  seconds), so a new file is seen within roughly one `SCAN_INTERVAL` — there is
+  no per-minute gap.
 - If files are written **atomically** (temp then rename/mv into `input`), set
   `MIN_STABLE_AGE=0` so there is no extra delay before archiving.
-- As long as a file stays in `input` longer than one scan interval before the
-  consumer moves it, it is captured — with a wide margin when the consumer runs
-  on a long cycle (e.g. every 30 minutes vs a ~10 s scan).
-- Keep `SCAN_INTERVAL` small; the directory-mtime skip makes idle polling cheap,
-  so frequent scanning shrinks the only residual risk (a file whose entire
-  lifetime is shorter than one scan interval).
+- Capture is reliable as long as a file stays in `input` longer than one
+  `SCAN_INTERVAL` before the consumer moves it. With `SCAN_INTERVAL=2` and a
+  consumer that sweeps every ~30 minutes, even a file dropped a few seconds
+  before a sweep is captured.
+- Idle passes only `stat` each input directory (no listing, no file reads, no
+  tree walk), so scanning every couple of seconds stays cheap even over a NAS.
+- The directory-mtime skip **assumes the NAS updates a directory's modification
+  time when a file is added**. Most SMB/CIFS servers do; verify it on your share,
+  or set `USE_DIR_MTIME_SKIP=false` (lists every directory each pass — a bit more
+  I/O but immune to that assumption).
 - If new `input` directories can appear over time, set `DISCOVERY_INTERVAL` well
-  below the consumer's cycle so a new directory is found before the next sweep;
-  if the set of `input` directories is fixed, `DISCOVERY_INTERVAL` can stay high.
+  below the consumer's cycle; if the set is fixed, it can stay high.
 
-Because `input` is never written to, the tool cannot lock or hold a file: this is
-best-effort capture, not a hard guarantee. A hard guarantee would require the
-archive step to run before the file becomes available to the consumer.
+Because `input` is never written to, the tool cannot hold a file: this is
+best-effort capture. A file whose entire lifetime is shorter than one
+`SCAN_INTERVAL` can still be missed; a hard guarantee would require archiving in
+the critical path (before the consumer can take the file).
 
 ### State
 
@@ -147,14 +151,21 @@ line(s) for that relative path (or delete the ledger to re-archive everything).
 
 ## Run with cron
 
-Run every minute; the script does several internal passes and manages its own
-lock, so nothing is hard-coded in the crontab:
+The scanner runs **continuously** (internal loop scanning every `SCAN_INTERVAL`),
+so there is no gap between minutes. A single cron entry every minute is a
+**watchdog**: if the process ever dies (crash, reboot) the next tick restarts it,
+while the internal `flock` guarantees only one instance runs. No root, no systemd.
 
 Replace `/opt/archive-input` with your install directory:
 
 ```cron
 * * * * * /opt/archive-input/archive-input.sh --config /opt/archive-input/archive-input.conf >> /opt/archive-input/logs/cron.err 2>&1
 ```
+
+With `RUN_DURATION` set high (e.g. 24 h) the loop runs continuously and recycles
+about once a day; the once-a-day restart gap is negligible next to a consumer
+that sweeps every ~30 minutes. The every-minute `LOCK_BUSY` from the watchdog is
+expected and logged only at `DEBUG`.
 
 ## Logs & troubleshooting
 
@@ -173,6 +184,21 @@ Event glossary: `TARGET_BEGIN`, `MOUNT_MISSING`, `DISCOVERY`,
 
 Exit codes: `0` success · `1` configuration error · `2` no usable target ·
 `3` lock busy (another run is active) · `4` at least one archive copy failed.
+
+## Production notes
+
+- **Run it in homologation first.** Point a homolog target at the real NAS mount
+  and watch `logs/` for at least one full consumer cycle before enabling any
+  production target.
+- **Verify the directory-mtime assumption** on your actual share (drop a file,
+  check the parent directory's mtime changed). If in doubt, run with
+  `USE_DIR_MTIME_SKIP=false`.
+- **The archive only grows** — nothing is ever deleted. Monitor archive disk
+  usage; the per-target ledger and `audit.log` grow over time too.
+- **Monitor errors**: alert on `COPY_FAILED`, `MOUNT_MISSING` and `LEDGER_CORRUPT`
+  in the logs, and on `errors=` in `RUN_SUMMARY` / `CYCLE_SUMMARY`.
+- **Permissions**: the cron user needs read access to the NAS mount and write
+  access to each `archive_root`. No root required.
 
 ## Testing
 

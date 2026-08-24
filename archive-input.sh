@@ -690,7 +690,9 @@ main() {
     # Single-instance lock (self-managed; nothing hard-coded in the crontab).
     exec 9> "$LOCK_FILE" || { printf 'Cannot open lock file: %s\n' "$LOCK_FILE" >&2; exit $EX_CONFIG; }
     if ! flock -n 9; then
-        log_run WARN LOCK_BUSY lock="$(enc "$LOCK_FILE")"
+        # Expected every minute in continuous mode (the cron watchdog finds the
+        # loop already running), so log at DEBUG to avoid noise.
+        log_run DEBUG LOCK_BUSY lock="$(enc "$LOCK_FILE")"
         exit $EX_LOCKED
     fi
 
