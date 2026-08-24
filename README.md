@@ -12,6 +12,11 @@ copies, it never modifies or deletes a source file.
   source and archive roots, described in a simple tab-separated `targets.tsv`.
 - **Exact mirror**: a file at `<source>/a/b/input/test.xml` is copied to
   `<archive>/a/b/input/test.xml`.
+- **What is collected**: for each `input` directory, the files **directly inside it**
+  *and* the files **directly inside its direct sub-directories** (e.g.
+  `input/supplier/`). Deeper levels are never scanned — `input/supplier/archive/`
+  is ignored. Sub-directories are enumerated at discovery (`DISCOVERY_INTERVAL` or
+  `--rediscover`).
 - **Archive once, dedup by hash**:
   - never seen → copied under its own name;
   - same name **and** same content hash → nothing to do;
@@ -94,10 +99,11 @@ projectB     prod   /mnt/nas/projectB/prod      /mnt/nas/archive/projectB/prod  
 Each cron run acquires the lock, then loops for up to `RUN_DURATION` seconds,
 scanning every enabled target once per `SCAN_INTERVAL`. For each target it:
 
-1. finds the `input` directories (cached; full-tree walk only every
-   `DISCOVERY_INTERVAL`);
-2. skips directories whose mtime is unchanged, otherwise lists their direct
-   files;
+1. finds the `input` directories and their direct sub-directories — the "scan
+   dirs" (cached; full-tree walk only every `DISCOVERY_INTERVAL`, so a brand-new
+   sub-directory is seen at the next rediscovery or via `--rediscover`);
+2. skips scan dirs whose mtime is unchanged, otherwise lists their direct files
+   (each file lands in the mirror under `…/input/…` or `…/input/<subdir>/…`);
 3. for each file: skips it if too recent (stability), or already archived
    (per-target ledger); otherwise hashes it and copies new content into the
    mirror (base name, or a timestamped version), appending to the ledger and
@@ -219,7 +225,7 @@ detail. Every operational line carries `run`, `project`, `env`, `cycle` ids.
 
 Event glossary: `START`, `PATHS`, `CONFIG`, `CONFIG_NOT_FOUND`, `TARGET`,
 `TARGETS_LOADED`, `TARGET_DISABLED`, `TARGET_MALFORMED`, `TARGET_DUPLICATE`,
-`TARGET_BEGIN`, `MOUNT_MISSING`, `MOUNT_OK`, `DISCOVERY`, `NO_INPUT_DIRS`,
+`TARGET_BEGIN`, `MOUNT_MISSING`, `MOUNT_OK`, `DISCOVERY`, `FOUND_SCAN_DIR`, `NO_INPUT_DIRS`,
 `FORCE_REDISCOVER`, `SKIP_DIR_UNCHANGED`, `DIR_RESCAN`, `SKIP_UNSTABLE`,
 `SKIP_LEDGER`, `SKIP_SAME_HASH`, `COPIED`, `VERSIONED`, `COPY_FAILED`,
 `LEDGER_CORRUPT`, `HEARTBEAT`, `CYCLE_SUMMARY`, `TARGET_SUMMARY`.

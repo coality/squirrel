@@ -447,28 +447,39 @@ discover_or_load_dirs() {
     fi
 
     if (( need_discovery )); then
-        local t0 t1 count=0 d
+        # Scan dirs ("leaves") = each input dir itself PLUS its DIRECT subdirs.
+        # Each leaf is later listed at -maxdepth 1, so we collect files directly
+        # in input and directly in its direct subdirs — never deeper.
+        local t0 t1 input_count=0 d sub
         t0=$(now_epoch)
         log_tgt DEBUG DISCOVERY_BEGIN src="$(enc "$src")" input_dir_name="$idn" reason="$reason"
         declare -A _found=()
         local -a newdirs=()
         while IFS= read -r -d '' d; do
-            _found["$d"]=1
-            newdirs+=("$d")
-            [[ -z ${DIRLAST["$d"]:-} ]] && DIRLAST["$d"]=0
-            (( count++ ))
+            (( input_count++ ))
             log_tgt DEBUG FOUND_INPUT_DIR dir="$(enc "${d#"$src"/}")"
+            # Leaf: the input dir itself (its direct files).
+            if [[ -z ${_found["$d"]:-} ]]; then
+                _found["$d"]=1; newdirs+=("$d"); [[ -z ${DIRLAST["$d"]:-} ]] && DIRLAST["$d"]=0
+            fi
+            # Leaves: each DIRECT subdirectory of the input dir (its direct files).
+            while IFS= read -r -d '' sub; do
+                if [[ -z ${_found["$sub"]:-} ]]; then
+                    _found["$sub"]=1; newdirs+=("$sub"); [[ -z ${DIRLAST["$sub"]:-} ]] && DIRLAST["$sub"]=0
+                    log_tgt DEBUG FOUND_SCAN_DIR dir="$(enc "${sub#"$src"/}")"
+                fi
+            done < <(find "$d" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
         done < <(find "$src" -type d -name "$idn" -print0 2>/dev/null)
-        # Drop directories that disappeared.
+        # Drop leaves that disappeared.
         for dir in "${DIRS[@]:-}"; do
             [[ -z $dir ]] && continue
             [[ -z ${_found["$dir"]:-} ]] && unset 'DIRLAST[$dir]'
         done
         DIRS=("${newdirs[@]:-}")
         t1=$(now_epoch)
-        log_tgt INFO DISCOVERY count="$count" dur_s="$(( t1 - t0 ))" \
-            src="$(enc "$src")" input_dir_name="$idn" reason="$reason"
-        if (( count == 0 )); then
+        log_tgt INFO DISCOVERY input_dirs="$input_count" scan_dirs="${#newdirs[@]}" \
+            dur_s="$(( t1 - t0 ))" src="$(enc "$src")" input_dir_name="$idn" reason="$reason"
+        if (( input_count == 0 )); then
             log_tgt WARN NO_INPUT_DIRS src="$(enc "$src")" input_dir_name="$idn" \
                 hint="no directory named '$idn' found anywhere under the source"
         fi
@@ -701,7 +712,7 @@ scan_target() {
 
     # Per-cycle detail is DEBUG (it happens every SCAN_INTERVAL); INFO summaries
     # come from HEARTBEAT and the final TARGET_SUMMARY.
-    log_tgt DEBUG CYCLE_SUMMARY input_dirs="$dirs_total" rescanned="$dirs_rescanned" \
+    log_tgt DEBUG CYCLE_SUMMARY scan_dirs="$dirs_total" rescanned="$dirs_rescanned" \
         scanned="$CYC_SCANNED" copied="$CYC_COPIED" versioned="$CYC_VERSIONED" \
         skipped="$CYC_SKIPPED" errors="$CYC_ERRORS" bytes_copied="$CYC_BYTES"
 }

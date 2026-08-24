@@ -333,6 +333,41 @@ test_discovery_cache() {  # matrix 23
     assert_file "$d/arc/b/input/b.txt" "discovered after rediscovery"
 }
 
+test_subdir_selection() {  # input + direct subdirs only, never deeper
+    title "collect files in input AND its direct subdirs, never sub-sub-dirs"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/A/input/supplier/archive"
+    echo direct > "$d/src/A/input/direct.txt"
+    echo sub    > "$d/src/A/input/supplier/sub.txt"
+    echo deep   > "$d/src/A/input/supplier/archive/deep.txt"
+    add_target "$d" p e "$d/src" "$d/arc"
+    write_conf "$d"
+    run "$d"
+    assert_file   "$d/arc/A/input/direct.txt"                 "file directly in input"
+    assert_file   "$d/arc/A/input/supplier/sub.txt"           "file in a direct subdir"
+    assert_nofile "$d/arc/A/input/supplier/archive/deep.txt"  "sub-sub-dir ignored"
+    assert_eq 2 "$(count_files "$d/arc")" "exactly two files"
+    assert_grep "$(oplog "$d" p e)" 'scan_dirs="2"'
+}
+
+test_new_subdir_rediscovery() {  # new direct subdir picked up at rediscovery
+    title "a new direct subdir is seen only at rediscovery"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/input/s1"
+    echo f1 > "$d/src/input/s1/f1.txt"
+    add_target "$d" p e "$d/src" "$d/arc"
+    write_conf "$d" 'DISCOVERY_INTERVAL=1800'
+    run "$d"
+    assert_file "$d/arc/input/s1/f1.txt" "initial subdir archived"
+    mkdir -p "$d/src/input/s2"
+    echo f2 > "$d/src/input/s2/f2.txt"
+    run "$d"
+    assert_nofile "$d/arc/input/s2/f2.txt" "new subdir not seen within interval"
+    write_conf "$d" 'DISCOVERY_INTERVAL=0'
+    run "$d"
+    assert_file "$d/arc/input/s2/f2.txt" "new subdir archived after rediscovery"
+}
+
 test_force_rediscovery() {  # manual --rediscover
     title "--rediscover picks up a new input dir before DISCOVERY_INTERVAL"
     local d; d=$(new_case)
@@ -458,6 +493,8 @@ main() {
     test_dry_run
     test_weird_names
     test_discovery_cache
+    test_subdir_selection
+    test_new_subdir_rediscovery
     test_force_rediscovery
     test_antioubli
     test_dirskip_disabled
