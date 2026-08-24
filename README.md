@@ -223,3 +223,7 @@ bash tests/run-e2e.sh
 
 It builds isolated sandboxes, runs the real script against them, and asserts on
 the filesystem, the logs and the exit codes. A non-zero exit means a test failed.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
