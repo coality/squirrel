@@ -193,6 +193,19 @@ dec() {
     printf '%s' "$s"
 }
 
+# enc_r / dec_r: fork-free variants that store the result in REPLY (no command
+# substitution), for hot loops (cache read/write) where $() would fork per line.
+enc_r() {
+    local s=$1
+    s=${s//'%'/%25}; s=${s//$'\t'/%09}; s=${s//$'\n'/%0A}; s=${s//$'\r'/%0D}
+    REPLY=$s
+}
+dec_r() {
+    local s=$1
+    s=${s//%09/$'\t'}; s=${s//%0A/$'\n'}; s=${s//%0D/$'\r'}; s=${s//%25/'%'}
+    REPLY=$s
+}
+
 # json_esc: escape backslash and double quote for JSON string values. enc()
 # has already removed control characters, so this is sufficient.
 json_esc() {
@@ -234,32 +247,20 @@ is_excluded_dirname() {
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
-LOG_LEVEL_NUM=20  # recomputed from LOG_LEVEL after config load
+# Numeric log levels (fork-free lookup).
+declare -A LVLNUM=( [DEBUG]=10 [INFO]=20 [WARN]=30 [ERROR]=40 )
+LOG_LEVEL_NUM=20         # recomputed from LOG_LEVEL after config load
+DEBUG_ON=0              # 1 when LOG_LEVEL is DEBUG (used to gate hot-path debug logs)
+declare -A LOG_BYTES=() # per-file running size, to rotate without a stat per line
 
-_lvlnum() {
-    case $1 in
-        DEBUG) printf '10' ;;
-        INFO)  printf '20' ;;
-        WARN)  printf '30' ;;
-        ERROR) printf '40' ;;
-        *)     printf '20' ;;
-    esac
-}
-
-# rotate_if_needed: size-based rotation of a single log file (no external tool).
-rotate_if_needed() {
-    local f=$1 sz keep i
-    (( LOG_ROTATE_MAX_BYTES > 0 )) || return 0
-    [[ -f $f ]] || return 0
-    sz=$(file_size "$f")
-    is_uint "$sz" || return 0
-    (( sz >= LOG_ROTATE_MAX_BYTES )) || return 0
-    keep=$LOG_ROTATE_KEEP
+# _rotate_file: shift <file> -> <file>.1 .. .N (no size check; the caller decides).
+_rotate_file() {
+    local f=$1 keep=$LOG_ROTATE_KEEP i
     [[ -f "$f.$keep" ]] && rm -f -- "$f.$keep"
     for (( i = keep - 1; i >= 1; i-- )); do
         [[ -f "$f.$i" ]] && mv -f -- "$f.$i" "$f.$((i + 1))"
     done
-    mv -f -- "$f" "$f.1"
+    [[ -f $f ]] && mv -f -- "$f" "$f.1"
     : > "$f"
 }
 
@@ -277,10 +278,14 @@ RUN_ID=""
 _emit_file() {
     local file=$1 withctx=$2 level=$3 event=$4
     shift 4
-    (( $(_lvlnum "$level") >= LOG_LEVEL_NUM )) || return 0
-    rotate_if_needed "$file"
+    (( ${LVLNUM[$level]:-20} >= LOG_LEVEL_NUM )) || return 0
     local ts line kv k v
-    ts=$(ts_iso)
+    # Fork-free timestamp (printf builtin on bash >= 4.2).
+    if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 2) )); then
+        printf -v ts '%(%Y-%m-%dT%H:%M:%S%z)T' -1
+    else
+        ts=$(date +%Y-%m-%dT%H:%M:%S%z)
+    fi
     if [[ $LOG_FORMAT == json ]]; then
         line="{\"ts\":\"$ts\",\"level\":\"$level\",\"run\":\"$(json_esc "$RUN_ID")\""
         if (( withctx )) && [[ -n $CUR_PROJECT ]]; then
@@ -304,6 +309,17 @@ _emit_file() {
             k=${kv%%=*}; v=${kv#*=}
             line+=" $k=\"$v\""
         done
+    fi
+    # Byte-counter rotation: no stat per line. The size is read once per file per
+    # run (first touch), then tracked in memory.
+    if (( LOG_ROTATE_MAX_BYTES > 0 )); then
+        if [[ -z ${LOG_BYTES[$file]+x} ]]; then
+            LOG_BYTES[$file]=$(file_size "$file"); is_uint "${LOG_BYTES[$file]}" || LOG_BYTES[$file]=0
+        fi
+        if (( LOG_BYTES[$file] >= LOG_ROTATE_MAX_BYTES )); then
+            _rotate_file "$file"; LOG_BYTES[$file]=0
+        fi
+        LOG_BYTES[$file]=$(( LOG_BYTES[$file] + ${#line} + 1 ))
     fi
     printf '%s\n' "$line" >> "$file"
     (( CONSOLE_ON )) && printf '%s\n' "$line" >&2
@@ -445,7 +461,7 @@ discover_or_load_dirs() {
     if [[ -f $leaves_cache ]]; then
         while IFS=$'\t' read -r encleaf lastm || [[ -n $encleaf ]]; do
             [[ -z $encleaf ]] && continue
-            DIRLAST["$(dec "$encleaf")"]=$lastm
+            dec_r "$encleaf"; DIRLAST["$REPLY"]=$lastm
         done < "$leaves_cache"
     fi
 
@@ -477,7 +493,7 @@ discover_or_load_dirs() {
         # -print0 -prune: print each input dir and DO NOT descend into it.
         while IFS= read -r -d '' d; do
             newinputs+=("$d")
-            log_tgt DEBUG FOUND_INPUT_DIR dir="$(enc "${d#"$src"/}")"
+            (( DEBUG_ON )) && log_tgt DEBUG FOUND_INPUT_DIR dir="$(enc "${d#"$src"/}")"
         done < <(find "$src" "${dexpr[@]}" "${fexpr[@]}" -type d -name "$idn" -print0 -prune 2>/dev/null)
         INPUT_DIRS=("${newinputs[@]:-}")
         write_inputs_cache "$inputs_cache"
@@ -492,7 +508,7 @@ discover_or_load_dirs() {
         local encd
         while IFS= read -r encd || [[ -n $encd ]]; do
             [[ -z $encd ]] && continue
-            INPUT_DIRS+=("$(dec "$encd")")
+            dec_r "$encd"; INPUT_DIRS+=("$REPLY")
         done < "$inputs_cache"
         log_tgt DEBUG DISCOVERY_CACHED input_dirs="${#INPUT_DIRS[@]}"
     fi
@@ -503,7 +519,7 @@ write_inputs_cache() {
     : > "$tmp" 2>/dev/null || return 1
     for d in "${INPUT_DIRS[@]:-}"; do
         [[ -z $d ]] && continue
-        printf '%s\n' "$(enc "$d")" >> "$tmp"
+        enc_r "$d"; printf '%s\n' "$REPLY" >> "$tmp"
     done
     mv -f -- "$tmp" "$cache"
 }
@@ -540,16 +556,16 @@ process_file() {
 
     (( CYC_SCANNED++ ))
 
-    now=$(now_epoch); age=$(( now - mtime ))
+    printf -v now '%(%s)T' -1 2>/dev/null || now=$(now_epoch); age=$(( now - mtime ))
     if (( age < MIN_STABLE_AGE )); then
-        log_tgt DEBUG SKIP_UNSTABLE relpath="$encrel" age_s="$age" min_stable_age="$MIN_STABLE_AGE"
+        (( DEBUG_ON )) && log_tgt DEBUG SKIP_UNSTABLE relpath="$encrel" age_s="$age" min_stable_age="$MIN_STABLE_AGE"
         DIR_UNSETTLED=1
         return 0
     fi
 
     # Already processed this exact (path,size,mtime) -> nothing to do, no re-hash.
     if [[ -n ${LED_SMT["$key$SEP$encrel$SEP$size$SEP$mtime"]:-} ]]; then
-        log_tgt DEBUG SKIP_LEDGER relpath="$encrel" size="$size" mtime="$mtime"
+        (( DEBUG_ON )) && log_tgt DEBUG SKIP_LEDGER relpath="$encrel" size="$size" mtime="$mtime"
         return 0
     fi
 
@@ -561,7 +577,7 @@ process_file() {
 
     # Content already archived for this relpath (e.g. file touched, or reverted).
     if [[ -n ${LED_RH["$key$SEP$encrel$SEP$h"]:-} ]]; then
-        log_tgt DEBUG SKIP_SAME_HASH relpath="$encrel" hash="${h:0:8}…"
+        (( DEBUG_ON )) && log_tgt DEBUG SKIP_SAME_HASH relpath="$encrel" hash="${h:0:8}…"
         LED_SMT["$key$SEP$encrel$SEP$size$SEP$mtime"]=1
         (( CYC_SKIPPED++ ))
         return 0
@@ -682,7 +698,8 @@ scan_target() {
 
     CYC_SCANNED=0 CYC_COPIED=0 CYC_VERSIONED=0 CYC_SKIPPED=0 CYC_ERRORS=0 CYC_BYTES=0
     local -A seen=()
-    local input mt leaf base f dir_reads=0 scan_dirs=0 rescanned=0
+    local input mt leaf base f dir_reads=0 scan_dirs=0 rescanned=0 cache_dirty=0
+    local t_start; t_start=$(date +%s%N 2>/dev/null)
 
     # One bulk readdir per input dir returns the input AND each of its direct
     # subdirs with their mtime in a single directory read (~1 CIFS round-trip),
@@ -696,17 +713,17 @@ scan_target() {
             base=${leaf##*/}
             # Exclude matching sub-directories (never the input dir itself).
             if [[ $leaf != "$input" ]] && is_excluded_dirname "$base"; then
-                log_tgt DEBUG EXCLUDED_DIR dir="$(enc "${leaf#"$src"/}")"
+                (( DEBUG_ON )) && log_tgt DEBUG EXCLUDED_DIR dir="$(enc "${leaf#"$src"/}")"
                 continue
             fi
             seen["$leaf"]=1
             (( scan_dirs++ ))
             if [[ $USE_DIR_MTIME_SKIP == true && ${DIRLAST["$leaf"]:-} == "$mt" ]]; then
-                log_tgt DEBUG SKIP_DIR_UNCHANGED dir="$(enc "${leaf#"$src"/}")" mtime="$mt"
+                (( DEBUG_ON )) && log_tgt DEBUG SKIP_DIR_UNCHANGED dir="$(enc "${leaf#"$src"/}")" mtime="$mt"
                 continue
             fi
             (( rescanned++ ))
-            log_tgt DEBUG DIR_RESCAN dir="$(enc "${leaf#"$src"/}")" mtime="$mt" last="${DIRLAST["$leaf"]:-}"
+            (( DEBUG_ON )) && log_tgt DEBUG DIR_RESCAN dir="$(enc "${leaf#"$src"/}")" mtime="$mt" last="${DIRLAST["$leaf"]:-}"
             DIR_UNSETTLED=0
             while IFS= read -r -d '' f; do
                 [[ -f $f ]] || continue
@@ -714,15 +731,17 @@ scan_target() {
             done < <(find "$leaf" -mindepth 1 -maxdepth 1 -type f -print0 2>/dev/null)
             # Settle (cache the mtime) only if everything finalised; otherwise leave
             # the previous value so the leaf is rescanned next cycle.
-            (( DIR_UNSETTLED == 0 )) && DIRLAST["$leaf"]=$mt
+            if (( DIR_UNSETTLED == 0 )); then DIRLAST["$leaf"]=$mt; cache_dirty=1; fi
         done < <(find "$input" -mindepth 0 -maxdepth 1 -type d -printf '%T@\t%p\0' 2>/dev/null)
     done
 
-    # Persist settled mtimes for the leaves seen this cycle (drops removed leaves).
+    # Persist settled mtimes for the leaves seen this cycle (only when something
+    # changed; this also drops leaves that disappeared).
     local tmp="$leaves_cache.tmp.$$" lf
-    if : > "$tmp" 2>/dev/null; then
+    if (( cache_dirty )) && : > "$tmp" 2>/dev/null; then
         for lf in "${!seen[@]}"; do
-            [[ -n ${DIRLAST["$lf"]:-} ]] && printf '%s\t%s\n' "$(enc "$lf")" "${DIRLAST["$lf"]}" >> "$tmp"
+            [[ -n ${DIRLAST["$lf"]:-} ]] || continue
+            enc_r "$lf"; printf '%s\t%s\n' "$REPLY" "${DIRLAST["$lf"]}" >> "$tmp"
         done
         mv -f -- "$tmp" "$leaves_cache"
     fi
@@ -735,9 +754,11 @@ scan_target() {
 
     # Per-cycle detail is DEBUG (it happens every SCAN_INTERVAL); INFO summaries
     # come from HEARTBEAT and the final TARGET_SUMMARY.
+    local t_end dur_ms=0; t_end=$(date +%s%N 2>/dev/null)
+    [[ $t_start =~ ^[0-9]+$ && $t_end =~ ^[0-9]+$ ]] && dur_ms=$(( (t_end - t_start) / 1000000 ))
     log_tgt DEBUG CYCLE_SUMMARY dir_reads="$dir_reads" scan_dirs="$scan_dirs" rescanned="$rescanned" \
         scanned="$CYC_SCANNED" copied="$CYC_COPIED" versioned="$CYC_VERSIONED" \
-        skipped="$CYC_SKIPPED" errors="$CYC_ERRORS" bytes_copied="$CYC_BYTES"
+        skipped="$CYC_SKIPPED" errors="$CYC_ERRORS" bytes_copied="$CYC_BYTES" dur_ms="$dur_ms"
 }
 
 # ---------------------------------------------------------------------------
@@ -797,7 +818,8 @@ load_config() {
     # CLI overrides applied last so they always win.
     if (( FORCE_DEBUG )); then LOG_LEVEL="DEBUG"; LOG_CONSOLE="always"; fi
     if (( ONCE )); then RUN_DURATION=0; fi
-    LOG_LEVEL_NUM=$(_lvlnum "$LOG_LEVEL")
+    LOG_LEVEL_NUM=${LVLNUM[$LOG_LEVEL]:-20}
+    (( LOG_LEVEL_NUM <= 10 )) && DEBUG_ON=1 || DEBUG_ON=0
     case ${LOG_CONSOLE,,} in
         always|1|true|yes|on) CONSOLE_ON=1 ;;
         never|0|false|no|off) CONSOLE_ON=0 ;;
