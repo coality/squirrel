@@ -45,7 +45,8 @@ already exist (mounting the share is out of scope).
 ```sh
 cp archive-input.conf.example archive-input.conf
 cp targets.tsv.example targets.tsv
-# edit both to match your environment
+mkdir -p logs state          # created on first run too, but the cron line below writes to logs/
+# edit archive-input.conf and targets.tsv to match your environment
 ```
 
 ## Configuration
