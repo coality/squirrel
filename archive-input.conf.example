@@ -1,0 +1,31 @@
+# archive-input.conf — global defaults, sourced by archive-input.sh
+# Copy this file to archive-input.conf and adjust. Values here are the defaults
+# applied to a target whenever its column in targets.tsv is empty or "-".
+
+# --- Defaults applied per target when the column is "-" ---
+INPUT_DIR_NAME="input"          # EXACT name of the scanned directory
+SCAN_INTERVAL=10                # seconds between two internal passes
+
+# --- Execution ---
+RUN_DURATION=55                 # max seconds for one cron run (keep < 60)
+MIN_STABLE_AGE=5                # min file age (s) before archiving (avoids in-progress writes)
+REQUIRE_MOUNT=true              # skip a target whose source is missing/unreadable (unmounted share)
+HASH_CMD="sha256sum"            # content hash command
+DRY_RUN=false                   # true = simulate, copy nothing
+TARGETS_FILE="/home/jerome/archive_folders/targets.tsv"
+
+# --- Discovery & I/O (minimise disk access) ---
+DISCOVERY_INTERVAL=1800         # seconds between full-tree rediscoveries of input dirs
+USE_DIR_MTIME_SKIP=true         # skip a directory whose mtime has not changed (flat drops)
+
+# --- Logging ---
+LOG_LEVEL="INFO"                # DEBUG | INFO | WARN | ERROR
+LOG_FORMAT="text"               # text (key=value) | json (JSON lines)
+LOG_ROTATE_MAX_BYTES=10485760   # rotate a log past 10 MB (0 = never)
+LOG_ROTATE_KEEP=7               # number of rotated files kept
+AUDIT_LOG=true                  # write a separate append-only audit log per target
+
+# --- Paths (optional; derived from the script directory if unset) ---
+# STATE_DIR="/home/jerome/archive_folders/state"
+# LOG_DIR="/home/jerome/archive_folders/logs"
+# LOCK_FILE="/home/jerome/archive_folders/run.lock"

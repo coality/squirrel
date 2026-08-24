@@ -1,0 +1,13 @@
+# Runtime state and logs (never versioned)
+logs/
+state/
+run.lock
+
+# Real configuration (only the *.example files are versioned)
+archive-input.conf
+targets.tsv
+*.local.conf
+
+# Test scratch
+tests/tmp/
+*.tmp

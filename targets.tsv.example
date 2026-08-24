@@ -1,0 +1,10 @@
+# targets.tsv — one line per (project, environment) to monitor.
+# TAB-separated. Use "-" (or leave empty) to inherit the global default from
+# archive-input.conf. Lines starting with # and blank lines are ignored.
+# Columns: project<TAB>env<TAB>source_root<TAB>archive_root<TAB>input_dir_name<TAB>scan_interval<TAB>enabled
+# Required: project, env, source_root, archive_root. Optional: input_dir_name, scan_interval, enabled (default true).
+# NOTE: fields are tab-separated so that source_root / archive_root may contain spaces.
+projectA	prod	/mnt/nas/projectA/prod	/mnt/nas/archive/projectA/prod	input	10	true
+projectA	homol	/mnt/nas/projectA/homol	/mnt/nas/archive/projectA/homol	input	10	true
+projectB	prod	/mnt/nas/projectB/prod	/mnt/nas/archive/projectB/prod	-	-	true
+projectB	homol	/mnt/nas/projectB/homol	/mnt/nas/archive/projectB/homol	-	-	false
