@@ -8,7 +8,8 @@ SCAN_INTERVAL=10                # seconds between two internal passes
 
 # --- Execution ---
 RUN_DURATION=55                 # max seconds for one cron run (keep < 60)
-MIN_STABLE_AGE=5                # min file age (s) before archiving (avoids in-progress writes)
+MIN_STABLE_AGE=0                # min file age (s) before archiving; keep 0 if files are written
+                                # atomically (rename/mv into 'input'); raise it only for in-place writes
 REQUIRE_MOUNT=true              # skip a target whose source is missing/unreadable (unmounted share)
 HASH_CMD="sha256sum"            # content hash command
 DRY_RUN=false                   # true = simulate, copy nothing

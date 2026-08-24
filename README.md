@@ -106,6 +106,31 @@ scanning every enabled target once per `SCAN_INTERVAL`. For each target it:
 Copies are atomic (`cp` to a temporary name, then `mv`), so an interrupted run
 never leaves a partial archive file. The source is never written to.
 
+### Capture reliability
+
+This tool is a passive, read-only poller: it captures a file only while the file
+is still present. Whether every file is archived before an external consumer
+removes it depends on timing:
+
+- The scanner runs continuously (cron every minute, internal passes every
+  `SCAN_INTERVAL` seconds), so a new file is seen within roughly one
+  `SCAN_INTERVAL`.
+- If files are written **atomically** (temp then rename/mv into `input`), set
+  `MIN_STABLE_AGE=0` so there is no extra delay before archiving.
+- As long as a file stays in `input` longer than one scan interval before the
+  consumer moves it, it is captured — with a wide margin when the consumer runs
+  on a long cycle (e.g. every 30 minutes vs a ~10 s scan).
+- Keep `SCAN_INTERVAL` small; the directory-mtime skip makes idle polling cheap,
+  so frequent scanning shrinks the only residual risk (a file whose entire
+  lifetime is shorter than one scan interval).
+- If new `input` directories can appear over time, set `DISCOVERY_INTERVAL` well
+  below the consumer's cycle so a new directory is found before the next sweep;
+  if the set of `input` directories is fixed, `DISCOVERY_INTERVAL` can stay high.
+
+Because `input` is never written to, the tool cannot lock or hold a file: this is
+best-effort capture, not a hard guarantee. A hard guarantee would require the
+archive step to run before the file becomes available to the consumer.
+
 ### State
 
 Per target, under `state/`:
