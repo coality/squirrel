@@ -149,6 +149,19 @@ If an archived file is deleted by hand, the ledger still considers it archived
 and will not re-copy it. To force re-archiving, remove the matching ledger
 line(s) for that relative path (or delete the ledger to re-archive everything).
 
+### Forcing rediscovery
+
+Input directory locations are only refreshed every `DISCOVERY_INTERVAL`. To pick
+up a newly created `input` directory immediately (without waiting), run:
+
+```sh
+./archive-input.sh --rediscover --config archive-input.conf
+```
+
+This drops a marker that the running scanner detects on its next cycle and then
+does a full-tree rediscovery for every target. It does not start a scan and exits
+right away, so it is safe to run while the scanner is active.
+
 ## Run with cron
 
 The scanner runs **continuously** (internal loop scanning every `SCAN_INTERVAL`),
@@ -177,7 +190,7 @@ expected and logged only at `DEBUG`.
 
 Every operational line carries `run`, `project`, `env`, `cycle` correlation ids.
 
-Event glossary: `TARGET_BEGIN`, `MOUNT_MISSING`, `DISCOVERY`,
+Event glossary: `TARGET_BEGIN`, `MOUNT_MISSING`, `DISCOVERY`, `FORCE_REDISCOVER`,
 `SKIP_DIR_UNCHANGED`, `DIR_RESCAN`, `SKIP_UNSTABLE`, `SKIP_LEDGER`,
 `SKIP_SAME_HASH`, `COPIED`, `VERSIONED`, `COPY_FAILED`, `LEDGER_CORRUPT`,
 `CYCLE_SUMMARY`, `TARGET_SUMMARY`.

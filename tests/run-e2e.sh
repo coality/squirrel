@@ -333,6 +333,29 @@ test_discovery_cache() {  # matrix 23
     assert_file "$d/arc/b/input/b.txt" "discovered after rediscovery"
 }
 
+test_force_rediscovery() {  # manual --rediscover
+    title "--rediscover picks up a new input dir before DISCOVERY_INTERVAL"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/a/input"
+    echo a > "$d/src/a/input/a.txt"
+    add_target "$d" p e "$d/src" "$d/arc"
+    write_conf "$d" 'DISCOVERY_INTERVAL=1800'
+    run "$d"
+    assert_file "$d/arc/a/input/a.txt" "initial archive"
+    mkdir -p "$d/src/b/input"
+    echo b > "$d/src/b/input/b.txt"
+    run "$d"
+    assert_nofile "$d/arc/b/input/b.txt" "new dir not yet discovered"
+    # request manual rediscovery
+    bash "$SCRIPT" --rediscover --config "$d/conf"; local rc=$?
+    assert_exit "$rc" 0 "--rediscover exits ok"
+    assert_file "$d/state/.force-rediscover" "marker created"
+    run "$d"
+    assert_file "$d/arc/b/input/b.txt" "discovered after --rediscover"
+    assert_nofile "$d/state/.force-rediscover" "marker consumed"
+    assert_grep "$d/logs/_run.log" 'event=FORCE_REDISCOVER'
+}
+
 test_antioubli() {  # matrix 25
     title "directory left unsettled while a file is unstable"
     local d; d=$(new_case)
@@ -435,6 +458,7 @@ main() {
     test_dry_run
     test_weird_names
     test_discovery_cache
+    test_force_rediscovery
     test_antioubli
     test_dirskip_disabled
     test_ledger_corrupt

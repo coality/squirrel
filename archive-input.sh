@@ -65,6 +65,10 @@ LOCK_FILE="$SCRIPT_DIR/run.lock"
 
 CONFIG_FILE="$SCRIPT_DIR/archive-input.conf"
 
+ACTION="run"           # run | rediscover
+FORCE_REDISCOVER=0     # set per-cycle when a manual rediscovery is requested
+FORCE_MARKER=""        # marker file path, set in main once STATE_DIR is known
+
 # ---------------------------------------------------------------------------
 # Small portable helpers
 # ---------------------------------------------------------------------------
@@ -389,6 +393,7 @@ discover_or_load_dirs() {
         age=$(( now - cache_mt ))
         (( age >= DISCOVERY_INTERVAL )) && need_discovery=1
     fi
+    (( FORCE_REDISCOVER )) && need_discovery=1
 
     # Always load whatever the cache currently holds (to preserve settled mtimes).
     local encdir lastm dir
@@ -645,11 +650,16 @@ scan_target() {
 # ---------------------------------------------------------------------------
 usage() {
     cat <<'EOF'
-Usage: archive-input.sh [--config FILE] [--help]
+Usage: archive-input.sh [--config FILE] [--rediscover] [--help]
 
 Copies files from "input" directories on a mounted NAS share into a mirror
 archive tree, exactly once, with content-hash deduplication. Targets are
 described in targets.tsv. See README.md for details.
+
+  --rediscover   Request an immediate rediscovery of the input directories:
+                 drops a marker that the running scanner picks up on its next
+                 cycle (a new input directory is then seen without waiting for
+                 DISCOVERY_INTERVAL). Does not start a scan; exits right away.
 EOF
 }
 
@@ -658,6 +668,7 @@ parse_args() {
         case $1 in
             --config) CONFIG_FILE=$2; shift 2 ;;
             --config=*) CONFIG_FILE=${1#*=}; shift ;;
+            --rediscover) ACTION="rediscover"; shift ;;
             -h|--help) usage; exit $EX_OK ;;
             *) printf 'Unknown argument: %s\n' "$1" >&2; usage >&2; exit $EX_CONFIG ;;
         esac
@@ -686,6 +697,19 @@ main() {
     mkdir -p -- "$STATE_DIR" "$LOG_DIR" 2>/dev/null
     RUN_LOG="$LOG_DIR/_run.log"
     RUN_ID="$(printf '%s' "$(ts_compact)")-$$"
+    FORCE_MARKER="$STATE_DIR/.force-rediscover"
+
+    # --rediscover: just drop the marker and exit; the running scanner (or the
+    # next cron run) forces a full-tree rediscovery on its next cycle.
+    if [[ $ACTION == rediscover ]]; then
+        if : > "$FORCE_MARKER" 2>/dev/null; then
+            log_run INFO FORCE_REDISCOVER_REQUESTED marker="$(enc "$FORCE_MARKER")"
+            printf 'Rediscovery requested; it will be applied on the next scan cycle.\n'
+            exit $EX_OK
+        fi
+        printf 'Cannot create marker file: %s\n' "$FORCE_MARKER" >&2
+        exit $EX_CONFIG
+    fi
 
     # Single-instance lock (self-managed; nothing hard-coded in the crontab).
     exec 9> "$LOCK_FILE" || { printf 'Cannot open lock file: %s\n' "$LOCK_FILE" >&2; exit $EX_CONFIG; }
@@ -725,6 +749,16 @@ main() {
         first=0
         (( cycle++ ))
         CUR_CYCLE=$cycle
+        # Manual rediscovery request (marker dropped by `--rediscover`): force a
+        # full-tree rediscovery for every target this cycle.
+        if [[ -e $FORCE_MARKER ]]; then
+            FORCE_REDISCOVER=1
+            rm -f -- "$FORCE_MARKER" 2>/dev/null
+            for (( i = 0; i < ntargets; i++ )); do T_LAST[i]=0; done
+            log_run INFO FORCE_REDISCOVER cycle="$cycle"
+        else
+            FORCE_REDISCOVER=0
+        fi
         now=$(now_epoch)
         for (( i = 0; i < ntargets; i++ )); do
             if (( now - T_LAST[i] >= T_SCAN[i] )); then
