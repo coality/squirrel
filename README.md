@@ -1,4 +1,4 @@
-# archive-input
+# squirrel
 
 Copy files dropped into `input` directories on a mounted NAS share into a mirror
 archive tree — **exactly once**, with content-hash deduplication. Driven by cron.
@@ -43,17 +43,17 @@ already exist (mounting the share is out of scope).
 ## Install
 
 ```sh
-cp archive-input.conf.example archive-input.conf
+cp squirrel.conf.example squirrel.conf
 cp targets.tsv.example targets.tsv
 mkdir -p logs state          # created on first run too, but the cron line below writes to logs/
-# edit archive-input.conf and targets.tsv to match your environment
+# edit squirrel.conf and targets.tsv to match your environment
 ```
 
 ## Configuration
 
-### `archive-input.conf`
+### `squirrel.conf`
 
-Global defaults, sourced by the script. See `archive-input.conf.example` for the
+Global defaults, sourced by the script. See `squirrel.conf.example` for the
 full list. Most-used options:
 
 | Option | Default | Meaning |
@@ -155,7 +155,7 @@ Input directory locations are only refreshed every `DISCOVERY_INTERVAL`. To pick
 up a newly created `input` directory immediately (without waiting), run:
 
 ```sh
-./archive-input.sh --rediscover --config archive-input.conf
+./squirrel.sh --rediscover --config squirrel.conf
 ```
 
 This drops a marker that the running scanner detects on its next cycle and then
@@ -169,10 +169,10 @@ so there is no gap between minutes. A single cron entry every minute is a
 **watchdog**: if the process ever dies (crash, reboot) the next tick restarts it,
 while the internal `flock` guarantees only one instance runs. No root, no systemd.
 
-Replace `/opt/archive-input` with your install directory:
+Replace `/opt/squirrel` with your install directory:
 
 ```cron
-* * * * * /opt/archive-input/archive-input.sh --config /opt/archive-input/archive-input.conf >> /opt/archive-input/logs/cron.err 2>&1
+* * * * * /opt/squirrel/squirrel.sh --config /opt/squirrel/squirrel.conf >> /opt/squirrel/logs/cron.err 2>&1
 ```
 
 With `RUN_DURATION` set high (e.g. 24 h) the loop runs continuously and recycles

@@ -1,5 +1,5 @@
-# archive-input.conf — global defaults, sourced by archive-input.sh
-# Copy this file to archive-input.conf and adjust. Values here are the defaults
+# squirrel.conf — global defaults, sourced by squirrel.sh
+# Copy this file to squirrel.conf and adjust. Values here are the defaults
 # applied to a target whenever its column in targets.tsv is empty or "-".
 
 # --- Defaults applied per target when the column is "-" ---
@@ -19,7 +19,7 @@ REQUIRE_MOUNT=true              # skip a target whose source is missing/unreadab
 HASH_CMD="sha256sum"            # content hash command
 DRY_RUN=false                   # true = simulate, copy nothing
 # TARGETS_FILE defaults to <script directory>/targets.tsv; set an absolute path to override:
-# TARGETS_FILE="/opt/archive-input/targets.tsv"
+# TARGETS_FILE="/opt/squirrel/targets.tsv"
 
 # --- Discovery & I/O (minimise disk access) ---
 DISCOVERY_INTERVAL=1800         # seconds between full-tree rediscoveries of input dirs
@@ -33,6 +33,6 @@ LOG_ROTATE_KEEP=7               # number of rotated files kept
 AUDIT_LOG=true                  # write a separate append-only audit log per target
 
 # --- Paths (optional; derived from the script directory if unset) ---
-# STATE_DIR="/opt/archive-input/state"
-# LOG_DIR="/opt/archive-input/logs"
-# LOCK_FILE="/opt/archive-input/run.lock"
+# STATE_DIR="/opt/squirrel/state"
+# LOG_DIR="/opt/squirrel/logs"
+# LOCK_FILE="/opt/squirrel/run.lock"

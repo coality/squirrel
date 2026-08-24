@@ -1,6 +1,6 @@
 # targets.tsv — one line per (project, environment) to monitor.
 # TAB-separated. Use "-" (or leave empty) to inherit the global default from
-# archive-input.conf. Lines starting with # and blank lines are ignored.
+# squirrel.conf. Lines starting with # and blank lines are ignored.
 # Columns: project<TAB>env<TAB>source_root<TAB>archive_root<TAB>input_dir_name<TAB>scan_interval<TAB>enabled
 # Required: project, env, source_root, archive_root. Optional: input_dir_name, scan_interval, enabled (default true).
 # NOTE: fields are tab-separated so that source_root / archive_root may contain spaces.

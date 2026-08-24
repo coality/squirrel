@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# End-to-end test suite for archive-input.sh — pure bash, no external deps.
+# End-to-end test suite for squirrel.sh — pure bash, no external deps.
 # Each test builds an isolated sandbox, runs the real script against it, and
 # asserts on the filesystem, the logs and the exit code. Exits non-zero if any
 # assertion fails.
@@ -9,12 +9,12 @@ set -uo pipefail
 
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 ROOT=$(CDPATH= cd -- "$HERE/.." && pwd -P)
-SCRIPT="$ROOT/archive-input.sh"
+SCRIPT="$ROOT/squirrel.sh"
 
 # shellcheck source=tests/lib/assert.sh
 source "$HERE/lib/assert.sh"
 
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/archive-input-e2e.XXXXXX")
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/squirrel-e2e.XXXXXX")
 cleanup() { chmod -R u+rwX "$WORK" 2>/dev/null; rm -rf "$WORK"; }
 trap cleanup EXIT
 

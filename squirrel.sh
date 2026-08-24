@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# archive-input.sh — copy files dropped into "input" directories on a mounted NAS
+# squirrel.sh — copy files dropped into "input" directories on a mounted NAS
 # share into a mirror archive tree, exactly once, with content-hash deduplication.
 #
 # Design invariants and behaviour are documented in README.md. Key points:
@@ -63,7 +63,7 @@ STATE_DIR="$SCRIPT_DIR/state"
 LOG_DIR="$SCRIPT_DIR/logs"
 LOCK_FILE="$SCRIPT_DIR/run.lock"
 
-CONFIG_FILE="$SCRIPT_DIR/archive-input.conf"
+CONFIG_FILE="$SCRIPT_DIR/squirrel.conf"
 
 ACTION="run"           # run | rediscover
 FORCE_REDISCOVER=0     # set per-cycle when a manual rediscovery is requested
@@ -650,7 +650,7 @@ scan_target() {
 # ---------------------------------------------------------------------------
 usage() {
     cat <<'EOF'
-Usage: archive-input.sh [--config FILE] [--rediscover] [--help]
+Usage: squirrel.sh [--config FILE] [--rediscover] [--help]
 
 Copies files from "input" directories on a mounted NAS share into a mirror
 archive tree, exactly once, with content-hash deduplication. Targets are
