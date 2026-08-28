@@ -547,12 +547,22 @@ discover_or_load_dirs() {
             else fexpr+=( -o -iname "$pat" ); fi
         done
         (( firstp )) || fexpr+=( ')' -prune ')' -o )
+        # Match ANY of the configured input dir names (exact, case-sensitive).
+        # $idn is a whitespace/comma-separated list, e.g. "input Input input_".
+        local -a nexpr=() idnames=(); local nm firstn=1
+        read -ra idnames <<< "${idn//,/ }"
+        for nm in "${idnames[@]}"; do
+            [[ -z $nm ]] && continue
+            if (( firstn )); then nexpr+=( '(' -name "$nm" ); firstn=0
+            else nexpr+=( -o -name "$nm" ); fi
+        done
+        if (( firstn )); then nexpr=( -name "$idn" ); else nexpr+=( ')' ); fi
         local -a newinputs=()
         # -print0 -prune: print each input dir and DO NOT descend into it.
         while IFS= read -r -d '' d; do
             newinputs+=("$d")
             (( DEBUG_ON )) && log_tgt DEBUG FOUND_INPUT_DIR dir="$(enc "${d#"$src"/}")"
-        done < <(find "$src" "${dexpr[@]}" "${fexpr[@]}" -type d -name "$idn" -print0 -prune 2>/dev/null)
+        done < <(find "$src" "${dexpr[@]}" "${fexpr[@]}" -type d "${nexpr[@]}" -print0 -prune 2>/dev/null)
         INPUT_DIRS=("${newinputs[@]:-}")
         write_inputs_cache "$inputs_cache"
         t1=$(now_epoch)
@@ -560,7 +570,7 @@ discover_or_load_dirs() {
             src="$(enc "$src")" input_dir_name="$idn" reason="$reason"
         if (( ${#newinputs[@]} == 0 )); then
             log_tgt WARN NO_INPUT_DIRS src="$(enc "$src")" input_dir_name="$idn" \
-                hint="no directory named '$idn' found under the source"
+                hint="no directory named '$idn' (any of the listed names) found under the source"
         fi
     else
         local encd

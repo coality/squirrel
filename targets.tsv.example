@@ -3,6 +3,7 @@
 # squirrel.conf. Lines starting with # and blank lines are ignored.
 # Columns: project<TAB>env<TAB>source_root<TAB>archive_root<TAB>input_dir_name<TAB>scan_interval<TAB>enabled
 # Required: project, env, source_root, archive_root. Optional: input_dir_name, scan_interval, enabled (default true).
+# input_dir_name may list several exact names (space/comma-separated, case-sensitive, no globs), e.g. "input Input input_".
 # NOTE: fields are tab-separated so that source_root / archive_root may contain spaces.
 projectA	prod	/mnt/nas/projectA/prod	/mnt/nas/archive/projectA/prod	input	10	true
 projectA	homol	/mnt/nas/projectA/homol	/mnt/nas/archive/projectA/homol	input	10	true

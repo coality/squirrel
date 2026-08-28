@@ -3,7 +3,10 @@
 # applied to a target whenever its column in targets.tsv is empty or "-".
 
 # --- Defaults applied per target when the column is "-" ---
-INPUT_DIR_NAME="input"          # EXACT name of the scanned directory
+INPUT_DIR_NAME="input"          # EXACT name(s) of the scanned directory. Several exact,
+                                # case-sensitive names allowed, separated by spaces or
+                                # commas, e.g. "input Input input_" (no globs). 'input'
+                                # alone does NOT match 'Input' — list each variant.
 SCAN_INTERVAL=2                 # seconds between scan passes (small = better capture;
                                 # idle passes only stat directories, so this stays cheap)
 

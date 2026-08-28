@@ -536,6 +536,50 @@ test_resilience_unreadable_file() {  # matrix 22 (resilience)
     assert_exit "$rc" 0 "run did not crash"
 }
 
+test_multiple_input_names() {  # INPUT_DIR_NAME accepts several exact names
+    title "input_dir_name lists several exact, case-sensitive names"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/a/input" "$d/src/b/Input" "$d/src/c/input_" "$d/src/d/output"
+    echo 1 > "$d/src/a/input/x.txt"
+    echo 2 > "$d/src/b/Input/y.txt"
+    echo 3 > "$d/src/c/input_/z.txt"
+    echo 4 > "$d/src/d/output/w.txt"
+    add_target "$d" p e "$d/src" "$d/arc" "input Input input_"
+    write_conf "$d"
+    run "$d"
+    assert_file   "$d/arc/a/input/x.txt"  "lowercase input matched"
+    assert_file   "$d/arc/b/Input/y.txt"  "CamelCase Input matched"
+    assert_file   "$d/arc/c/input_/z.txt" "input_ matched"
+    assert_nofile "$d/arc/d/output/w.txt" "unlisted name not matched"
+    assert_eq 3 "$(count_files "$d/arc")" "exactly three files"
+}
+
+test_input_name_comma_separated() {  # comma is also a valid separator
+    title "input_dir_name accepts comma-separated names"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/a/input" "$d/src/b/Input"
+    echo 1 > "$d/src/a/input/x.txt"
+    echo 2 > "$d/src/b/Input/y.txt"
+    add_target "$d" p e "$d/src" "$d/arc" "input,Input"
+    write_conf "$d"
+    run "$d"
+    assert_eq 2 "$(count_files "$d/arc")" "both matched via comma list"
+}
+
+test_input_name_case_sensitive() {  # a single name stays case-sensitive
+    title "a single input name is case-sensitive (input != Input)"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/a/input" "$d/src/b/Input"
+    echo 1 > "$d/src/a/input/x.txt"
+    echo 2 > "$d/src/b/Input/y.txt"
+    add_target "$d" p e "$d/src" "$d/arc" "input"
+    write_conf "$d"
+    run "$d"
+    assert_file   "$d/arc/a/input/x.txt" "lowercase matched"
+    assert_nofile "$d/arc/b/Input/y.txt" "different case not matched"
+    assert_eq 1 "$(count_files "$d/arc")" "only one file"
+}
+
 test_extra_dir_basic() {  # EXTRA_DIRS: fixed source -> precise destination, depth
     title "EXTRA_DIRS: fixed source archived to a precise destination (depth=1)"
     local d; d=$(new_case)
@@ -665,6 +709,9 @@ main() {
     test_ledger_corrupt
     test_duplicate_target
     test_resilience_unreadable_file
+    test_multiple_input_names
+    test_input_name_comma_separated
+    test_input_name_case_sensitive
     test_extra_dir_basic
     test_extra_dir_depth0
     test_extra_dir_unlimited

@@ -69,7 +69,7 @@ full list. Most-used options:
 
 | Option | Default | Meaning |
 |---|---|---|
-| `INPUT_DIR_NAME` | `input` | exact name of the scanned directory |
+| `INPUT_DIR_NAME` | `input` | exact name(s) of the scanned directory; several allowed, space/comma-separated (case-sensitive, no globs), e.g. `"input Input input_"` |
 | `SCAN_INTERVAL` | `10` | seconds between internal passes |
 | `RUN_DURATION` | `55` | max seconds per cron run (keep < 60) |
 | `MIN_STABLE_AGE` | `5` | min file age before it is archived |
@@ -100,6 +100,9 @@ projectB     prod   /mnt/nas/projectB/prod      /mnt/nas/archive/projectB/prod  
 
 - Required columns: `project`, `env`, `source_root`, `archive_root`.
 - Optional (inherit the default if `-`): `input_dir_name`, `scan_interval`, `enabled`.
+  `input_dir_name` may list **several exact names** (space- or comma-separated,
+  case-sensitive, no globs), e.g. `input Input input_` — a directory is scanned
+  if its name matches any of them.
 - `project`/`env` also name the per-target state and logs, and appear as
   correlation fields in every log line.
 
