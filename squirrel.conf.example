@@ -31,6 +31,34 @@ USE_DIR_MTIME_SKIP=true         # skip a directory whose mtime has not changed
 EXCLUDE_DIR_PATTERNS=()
 # EXCLUDE_DIR_PATTERNS=('*archived*' '*archive*' '*.bak')
 
+# --- Extra directories: specific source -> specific destination rules ---
+# Besides the automatic discovery of "input" directories (driven by targets.tsv),
+# you can archive one or more SPECIFIC directories to a SPECIFIC destination, with
+# no discovery at all. Each rule is one array element, TAB-separated (like
+# targets.tsv, so paths may contain spaces):
+#
+#     label <TAB> source <TAB> destination <TAB> depth
+#
+#   - label        identity of the rule; its ledger and logs live under
+#                  "<label>__extra" (state/<label>__extra.ledger.tsv,
+#                  logs/<label>__extra/). Must be unique.
+#   - source       the exact directory to archive (a fixed path; no "input" lookup).
+#   - destination  where its content is mirrored: <source>/sub/f -> <destination>/sub/f.
+#   - depth        0  = only files directly in <source>;
+#                  N  = also N sub-levels deep (1 = like the input scanner);
+#                  -1 = the whole subtree (aliases: unlimited, inf, all).
+#                  Empty or "-" defaults to 1.
+#
+# The same engine applies: hash dedup, timestamped versioning, MIN_STABLE_AGE
+# stability, EXCLUDE_DIR_PATTERNS, DRY_RUN, per-rule logging and audit trail.
+# Bash array; empty = no extra directories. Tip: write real TABs, or use $'...\t...'.
+EXTRA_DIRS=()
+# EXTRA_DIRS=(
+#   $'reports\t/mnt/nas/app/reports\t/mnt/nas/archive/reports\t2'
+#   $'daily\t/mnt/nas/daily out\t/mnt/nas/archive/daily\t0'
+#   $'everything\t/mnt/nas/app/exports\t/mnt/nas/archive/exports\tunlimited'
+# )
+
 # --- Logging ---
 LOG_LEVEL="INFO"                # DEBUG | INFO | WARN | ERROR  (DEBUG = maximum detail)
 LOG_FORMAT="text"               # text (key=value) | json (JSON lines)

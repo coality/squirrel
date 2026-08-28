@@ -12,6 +12,9 @@ copies, it never modifies or deletes a source file.
   source and archive roots, described in a simple tab-separated `targets.tsv`.
 - **Exact mirror**: a file at `<source>/a/b/input/test.xml` is copied to
   `<archive>/a/b/input/test.xml`.
+- **Extra directories**: besides the discovered `input` trees, archive one or
+  more **specific directories to specific destinations** (no discovery, per-rule
+  depth) via `EXTRA_DIRS` — see [Extra directories](#extra-directories-specific-source--destination).
 - **What is collected**: for each `input` directory, the files **directly inside it**
   *and* the files **directly inside its direct sub-directories** (e.g.
   `input/supplier/`). Deeper levels are never scanned — `input/supplier/archive/`
@@ -75,6 +78,7 @@ full list. Most-used options:
 | `DISCOVERY_MAXDEPTH` | `0` | cap the discovery walk depth (0 = unlimited) |
 | `USE_DIR_MTIME_SKIP` | `true` | skip directories whose mtime is unchanged |
 | `EXCLUDE_DIR_PATTERNS` | `()` | dir-name globs (case-insensitive) to ignore anywhere, e.g. `('*archived*')` |
+| `EXTRA_DIRS` | `()` | explicit `label⇥source⇥destination⇥depth` rules (see [Extra directories](#extra-directories-specific-source--destination)) |
 | `HASH_CMD` | `sha256sum` | content hash command |
 | `DRY_RUN` | `false` | simulate without writing anything |
 | `LOG_LEVEL` | `INFO` | `DEBUG`/`INFO`/`WARN`/`ERROR` |
@@ -98,6 +102,41 @@ projectB     prod   /mnt/nas/projectB/prod      /mnt/nas/archive/projectB/prod  
 - Optional (inherit the default if `-`): `input_dir_name`, `scan_interval`, `enabled`.
 - `project`/`env` also name the per-target state and logs, and appear as
   correlation fields in every log line.
+
+### Extra directories (specific source → destination)
+
+`targets.tsv` describes trees to *scan* for `input` directories. When you instead
+want to archive **one specific directory to one specific place** — with no
+discovery — declare it in `EXTRA_DIRS` in `squirrel.conf`. Each rule is a
+tab-separated array element (paths may contain spaces):
+
+```
+label ⇥ source ⇥ destination ⇥ depth
+```
+
+```sh
+EXTRA_DIRS=(
+  $'reports\t/mnt/nas/app/reports\t/mnt/nas/archive/reports\t2'
+  $'daily\t/mnt/nas/daily out\t/mnt/nas/archive/daily\t0'
+  $'exports\t/mnt/nas/app/exports\t/mnt/nas/archive/exports\tunlimited'
+)
+```
+
+- **`label`** — the rule's identity. Its ledger and logs live under
+  `<label>__extra` (`state/<label>__extra.ledger.tsv`, `logs/<label>__extra/`),
+  exactly like a `(project, env)` target. Must be unique.
+- **`source`** — the exact directory to archive (a fixed path; no `input` lookup).
+- **`destination`** — where content is mirrored: `<source>/sub/f` →
+  `<destination>/sub/f`.
+- **`depth`** — how deep to go: `0` = only files directly in `source`; `N` = also
+  `N` sub-levels deep (`1` matches the `input` scanner); `-1` (or `unlimited` /
+  `inf` / `all`) = the whole subtree. Empty or `-` defaults to `1`.
+
+Extra directories go through the **same engine** as targets — content-hash
+deduplication, timestamped versioning, `MIN_STABLE_AGE` stability,
+`EXCLUDE_DIR_PATTERNS`, `DRY_RUN`, per-rule operations/audit logs and the mount
+guard — and appear in `HEARTBEAT` / `RUN_SUMMARY` alongside regular targets. They
+are **additive**: they run whether or not `targets.tsv` has any enabled target.
 
 ## How it works
 
@@ -233,6 +272,7 @@ detail. Every operational line carries `run`, `project`, `env`, `cycle` ids.
 
 Event glossary: `START`, `PATHS`, `CONFIG`, `CONFIG_NOT_FOUND`, `TARGET`,
 `TARGETS_LOADED`, `TARGET_DISABLED`, `TARGET_MALFORMED`, `TARGET_DUPLICATE`,
+`EXTRA_MALFORMED`, `EXTRA_BAD_DEPTH`, `EXTRA_DUPLICATE`,
 `TARGET_BEGIN`, `MOUNT_MISSING`, `MOUNT_OK`, `DISCOVERY`, `EXCLUDED_DIR`,
 `NO_INPUT_DIRS`, `FORCE_REDISCOVER`, `SKIP_DIR_UNCHANGED`, `DIR_RESCAN`, `SKIP_UNSTABLE`,
 `SKIP_LEDGER`, `SKIP_SAME_HASH`, `COPIED`, `VERSIONED`, `COPY_FAILED`,

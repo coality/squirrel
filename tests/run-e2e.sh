@@ -536,6 +536,99 @@ test_resilience_unreadable_file() {  # matrix 22 (resilience)
     assert_exit "$rc" 0 "run did not crash"
 }
 
+test_extra_dir_basic() {  # EXTRA_DIRS: fixed source -> precise destination, depth
+    title "EXTRA_DIRS: fixed source archived to a precise destination (depth=1)"
+    local d; d=$(new_case)
+    mkdir -p "$d/special/sub/deep"
+    echo a > "$d/special/a.txt"
+    echo b > "$d/special/sub/b.txt"
+    echo c > "$d/special/sub/deep/c.txt"
+    write_conf "$d" "EXTRA_DIRS=( \$'reports\t$d/special\t$d/arcR\t1' )"
+    run "$d"
+    assert_file   "$d/arcR/a.txt"          "direct file to the precise destination"
+    assert_file   "$d/arcR/sub/b.txt"      "level-1 subdir file mirrored under dest"
+    assert_nofile "$d/arcR/sub/deep/c.txt" "level-2 beyond depth=1 ignored"
+    assert_eq 2 "$(count_files "$d/arcR")" "exactly two files"
+    assert_grep "$(oplog "$d" reports extra)" 'event=COPIED'
+    assert_grep "$(ledger "$d" reports extra)" 'a.txt'
+    assert_grep "$d/logs/_run.log" 'mode="fixed"'
+}
+
+test_extra_dir_depth0() {  # depth=0 -> only files directly in the source
+    title "EXTRA_DIRS depth=0 archives only the source's direct files"
+    local d; d=$(new_case)
+    mkdir -p "$d/special/sub"
+    echo a > "$d/special/a.txt"
+    echo b > "$d/special/sub/b.txt"
+    write_conf "$d" "EXTRA_DIRS=( \$'reports\t$d/special\t$d/arcR\t0' )"
+    run "$d"
+    assert_file   "$d/arcR/a.txt"     "direct file archived"
+    assert_nofile "$d/arcR/sub/b.txt" "subdir ignored at depth=0"
+    assert_eq 1 "$(count_files "$d/arcR")" "exactly one file"
+}
+
+test_extra_dir_unlimited() {  # depth=unlimited -> the whole subtree
+    title "EXTRA_DIRS depth=unlimited archives the whole subtree"
+    local d; d=$(new_case)
+    mkdir -p "$d/special/sub/deep"
+    echo a > "$d/special/a.txt"
+    echo b > "$d/special/sub/b.txt"
+    echo c > "$d/special/sub/deep/c.txt"
+    write_conf "$d" "EXTRA_DIRS=( \$'reports\t$d/special\t$d/arcR\tunlimited' )"
+    run "$d"
+    assert_file "$d/arcR/a.txt"          "direct file"
+    assert_file "$d/arcR/sub/b.txt"      "level-1 file"
+    assert_file "$d/arcR/sub/deep/c.txt" "deep file archived (unlimited)"
+    assert_eq 3 "$(count_files "$d/arcR")" "all three files"
+}
+
+test_extra_dir_coexist_isolation() {  # a normal target and an extra rule, isolated
+    title "EXTRA_DIRS coexists with a normal target, ledgers isolated"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/input" "$d/special"
+    echo t > "$d/src/input/t.txt"
+    echo x > "$d/special/x.txt"
+    add_target "$d" proj prod "$d/src" "$d/arc"
+    write_conf "$d" "EXTRA_DIRS=( \$'reports\t$d/special\t$d/arcR\t0' )"
+    run "$d"
+    assert_file "$d/arc/input/t.txt" "normal target still mirrors input"
+    assert_file "$d/arcR/x.txt"      "extra rule archives to its destination"
+    assert_nogrep "$(ledger "$d" reports extra)" 't.txt'  "extra ledger has no target file"
+    assert_nogrep "$(ledger "$d" proj prod)"     'x.txt'  "target ledger has no extra file"
+    assert_grep "$d/logs/_run.log" 'input="1" extra="1"'
+}
+
+test_extra_dir_idempotent_and_exclude() {  # dedup on re-run + EXCLUDE_DIR_PATTERNS honoured
+    title "EXTRA_DIRS is idempotent and honours EXCLUDE_DIR_PATTERNS"
+    local d; d=$(new_case)
+    mkdir -p "$d/special/keep" "$d/special/archived"
+    echo a > "$d/special/a.txt"
+    echo k > "$d/special/keep/k.txt"
+    echo z > "$d/special/archived/z.txt"
+    write_conf "$d" "EXTRA_DIRS=( \$'reports\t$d/special\t$d/arcR\t1' )" "EXCLUDE_DIR_PATTERNS=('*archived*')"
+    run "$d"
+    assert_file   "$d/arcR/a.txt"            "direct file"
+    assert_file   "$d/arcR/keep/k.txt"       "normal subdir kept"
+    assert_nofile "$d/arcR/archived/z.txt"   "excluded subdir pruned"
+    assert_eq 2 "$(count_files "$d/arcR")" "two files"
+    : > "$(oplog "$d" reports extra)"
+    run "$d"
+    assert_eq 2 "$(count_files "$d/arcR")" "no re-copy on second run"
+    assert_nogrep "$(oplog "$d" reports extra)" 'event=COPIED' "idempotent second run"
+}
+
+test_extra_dir_malformed() {  # missing source/destination -> rule rejected
+    title "EXTRA_DIRS malformed rule (missing fields) is rejected"
+    local d; d=$(new_case)
+    mkdir -p "$d/special"; echo a > "$d/special/a.txt"
+    # A single field: label only, no source and no destination.
+    write_conf "$d" "EXTRA_DIRS=( 'reports' )"
+    run "$d"; local rc=$?
+    assert_grep "$d/logs/_run.log" 'event=EXTRA_MALFORMED'
+    assert_nofile "$d/arcR/a.txt" "nothing archived from a malformed rule"
+    assert_exit "$rc" 0 "run exits cleanly"
+}
+
 # ---------------------------------------------------------------------------
 # Run all
 # ---------------------------------------------------------------------------
@@ -572,6 +665,12 @@ main() {
     test_ledger_corrupt
     test_duplicate_target
     test_resilience_unreadable_file
+    test_extra_dir_basic
+    test_extra_dir_depth0
+    test_extra_dir_unlimited
+    test_extra_dir_coexist_isolation
+    test_extra_dir_idempotent_and_exclude
+    test_extra_dir_malformed
 
     printf '\n=========================================\n'
     printf 'Results: %d passed, %d failed\n' "$ASSERT_PASS" "$ASSERT_FAIL"

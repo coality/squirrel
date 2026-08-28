@@ -62,6 +62,7 @@ AUDIT_LOG=true
 LOG_CONSOLE="auto"      # auto (mirror to terminal when interactive) | always | never
 HEARTBEAT_INTERVAL=60   # seconds between periodic "still alive" summaries (0 = off)
 EXCLUDE_DIR_PATTERNS=() # case-insensitive glob patterns of directory names to ignore (empty = none)
+EXTRA_DIRS=()          # explicit "label<TAB>source<TAB>destination<TAB>depth" rules (see squirrel.conf.example)
 
 # Resolve the script directory portably (no readlink -f).
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
@@ -375,6 +376,7 @@ ledger_append() {  # key ledger encrel size mtime hash enctgt at
 # Targets
 # ---------------------------------------------------------------------------
 declare -a T_PROJECT=() T_ENV=() T_SRC=() T_ARC=() T_IDN=() T_SCAN=() T_KEY=() T_LAST=()
+declare -a T_MODE=() T_DEPTH=()   # per-target: mode "input"|"fixed"; depth (fixed only, -1=unlimited)
 declare -A _seen_target=()
 declare -A T_MOUNT_STATE=()   # key -> "ok" | "missing" (for state-change logging)
 
@@ -434,7 +436,56 @@ load_targets() {
         T_SRC+=("$src");         T_ARC+=("$arc")
         T_IDN+=("$idn");         T_SCAN+=("$scan")
         T_KEY+=("$key");         T_LAST+=(0)
+        T_MODE+=("input");       T_DEPTH+=("-")
     done < "$TARGETS_FILE"
+    return 0
+}
+
+# load_extra_dirs: append the EXTRA_DIRS rules as "fixed" targets. Each rule
+# (label<TAB>source<TAB>destination<TAB>depth) archives one specific source
+# directory to one specific destination — no "input" discovery, a mirror rooted
+# at <destination>: <source>/sub/f -> <destination>/sub/f. Its <label> is its
+# identity: the per-rule ledger and logs live under "<label>__extra", exactly
+# like a (project, env) target, so dedup/versioning/logging are all reused.
+#   depth: 0 = files directly in <source> only; N = N sub-levels deep;
+#          -1 / "unlimited" = the whole subtree. Empty/"-" defaults to 1.
+load_extra_dirs() {
+    local entry label src dst depth key san n=0
+    for entry in "${EXTRA_DIRS[@]:-}"; do
+        [[ -z $entry ]] && continue
+        (( n++ ))
+        IFS=$'\t' read -r label src dst depth <<< "$entry"
+        label=$(trim "${label:-}"); src=$(trim "${src:-}")
+        dst=$(trim "${dst:-}");     depth=$(trim "${depth:-}")
+        # Trailing slashes would break the relative-path computation.
+        while [[ $src == */ ]]; do src=${src%/}; done
+        while [[ $dst == */ ]]; do dst=${dst%/}; done
+        if [[ -z $label || -z $src || -z $dst ]]; then
+            log_run WARN EXTRA_MALFORMED index="$n" entry="$(enc "$entry")" \
+                hint="expected label<TAB>source<TAB>destination<TAB>depth"
+            continue
+        fi
+        case ${depth,,} in
+            ''|-) depth=1 ;;
+            unlimited|inf|all|-1) depth=-1 ;;
+            *) if ! is_uint "$depth"; then
+                   log_run WARN EXTRA_BAD_DEPTH label="$(enc "$label")" depth="$(enc "$depth")" \
+                       hint="depth must be 0, a positive integer, or -1/unlimited; using 1"
+                   depth=1
+               fi ;;
+        esac
+        san=$(sanitize "$label"); key="${san}__extra"
+        if [[ -n ${_seen_target[$key]:-} ]]; then
+            log_run ERROR EXTRA_DUPLICATE label="$(enc "$label")" key="$key" index="$n"
+            continue
+        fi
+        _seen_target[$key]=1
+        T_PROJECT+=("$label"); T_ENV+=("extra")
+        T_SRC+=("$src");       T_ARC+=("$dst")
+        T_IDN+=("");           T_SCAN+=("$SCAN_INTERVAL")
+        T_KEY+=("$key");       T_LAST+=(0)
+        T_MODE+=("fixed");     T_DEPTH+=("$depth")
+    done
     return 0
 }
 
@@ -452,18 +503,25 @@ load_targets() {
 # per cycle in scan_target (one bulk readdir per input).
 declare -a INPUT_DIRS=()
 declare -A DIRLAST=()
+
+# load_leaves_cache <leaves_cache>: (re)populate DIRLAST from the per-leaf settled
+# mtime cache on local disk (cheap). Shared by input discovery and fixed scanning.
+load_leaves_cache() {
+    local leaves_cache=$1 encleaf lastm
+    DIRLAST=()
+    [[ -f $leaves_cache ]] || return 0
+    while IFS=$'\t' read -r encleaf lastm || [[ -n $encleaf ]]; do
+        [[ -z $encleaf ]] && continue
+        dec_r "$encleaf"; DIRLAST["$REPLY"]=$lastm
+    done < "$leaves_cache"
+}
+
 discover_or_load_dirs() {
     local key=$1 src=$2 idn=$3 inputs_cache=$4 leaves_cache=$5
-    INPUT_DIRS=(); DIRLAST=()
+    INPUT_DIRS=()
 
     # Load persisted per-leaf settled mtimes (local disk, cheap).
-    local encleaf lastm
-    if [[ -f $leaves_cache ]]; then
-        while IFS=$'\t' read -r encleaf lastm || [[ -n $encleaf ]]; do
-            [[ -z $encleaf ]] && continue
-            dec_r "$encleaf"; DIRLAST["$REPLY"]=$lastm
-        done < "$leaves_cache"
-    fi
+    load_leaves_cache "$leaves_cache"
 
     # Decide whether to re-locate the input dirs (the expensive full-tree walk).
     local need_discovery=0 now cache_mt age reason="cache-fresh"
@@ -644,6 +702,38 @@ process_file() {
     (( CYC_BYTES += size ))
 }
 
+# scan_one_dir <leaf> <mt> <src_root> <arc_root> <key> <root_dir>
+# Process one directory: honour EXCLUDE_DIR_PATTERNS (never the <root_dir> itself),
+# skip it when its mtime is unchanged, otherwise archive each file directly inside
+# it (never deeper — recursion comes from the caller enumerating the dirs). Relative
+# paths are computed against <src_root> and mirrored under <arc_root>. Uses the
+# caller's locals (seen / scan_dirs / rescanned / cache_dirty) by dynamic scope.
+scan_one_dir() {
+    local leaf=$1 mt=$2 src_root=$3 arc_root=$4 key=$5 root_dir=$6
+    local base=${leaf##*/} f
+    if [[ $leaf != "$root_dir" ]] && is_excluded_dirname "$base"; then
+        (( DEBUG_ON )) && log_tgt DEBUG EXCLUDED_DIR dir="$(enc "${leaf#"$src_root"/}")"
+        return 0
+    fi
+    seen["$leaf"]=1
+    (( scan_dirs++ ))
+    if [[ $USE_DIR_MTIME_SKIP == true && ${DIRLAST["$leaf"]:-} == "$mt" ]]; then
+        (( DEBUG_ON )) && log_tgt DEBUG SKIP_DIR_UNCHANGED dir="$(enc "${leaf#"$src_root"/}")" mtime="$mt"
+        return 0
+    fi
+    (( rescanned++ ))
+    (( DEBUG_ON )) && log_tgt DEBUG DIR_RESCAN dir="$(enc "${leaf#"$src_root"/}")" mtime="$mt" last="${DIRLAST["$leaf"]:-}"
+    DIR_UNSETTLED=0
+    while IFS= read -r -d '' f; do
+        [[ -f $f ]] || continue
+        process_file "$key" "$src_root" "$arc_root" "$f"
+    done < <(find "$leaf" -mindepth 1 -maxdepth 1 -type f -print0 2>/dev/null)
+    # Settle (cache the mtime) only if everything finalised; otherwise leave the
+    # previous value so the leaf is rescanned next cycle.
+    if (( DIR_UNSETTLED == 0 )); then DIRLAST["$leaf"]=$mt; cache_dirty=1; fi
+    return 0
+}
+
 # ---------------------------------------------------------------------------
 # scan_target <idx>: one cycle over a single target.
 # ---------------------------------------------------------------------------
@@ -654,6 +744,7 @@ scan_target() {
     CUR_PROJECT=${T_PROJECT[$idx]}
     CUR_ENV=${T_ENV[$idx]}
     local src=${T_SRC[$idx]} arc=${T_ARC[$idx]} idn=${T_IDN[$idx]} key=${T_KEY[$idx]}
+    local mode=${T_MODE[$idx]} depth=${T_DEPTH[$idx]}
 
     local tdir="$LOG_DIR/$key"
     mkdir -p -- "$tdir" 2>/dev/null
@@ -663,7 +754,8 @@ scan_target() {
     local inputs_cache="$STATE_DIR/$key.inputs.tsv"
     local leaves_cache="$STATE_DIR/$key.leaves.tsv"
 
-    log_tgt DEBUG TARGET_BEGIN src="$(enc "$src")" arc="$(enc "$arc")" input_dir_name="$idn"
+    log_tgt DEBUG TARGET_BEGIN mode="$mode" src="$(enc "$src")" arc="$(enc "$arc")" \
+        input_dir_name="$idn" depth="$depth"
 
     # Guard: the source must be an existing, readable, searchable directory.
     # A precise reason plus the deepest existing ancestor makes an unmounted
@@ -694,46 +786,49 @@ scan_target() {
         return 0
     fi
 
-    discover_or_load_dirs "$key" "$src" "$idn" "$inputs_cache" "$leaves_cache"
+    if [[ $mode == fixed ]]; then
+        load_leaves_cache "$leaves_cache"
+    else
+        discover_or_load_dirs "$key" "$src" "$idn" "$inputs_cache" "$leaves_cache"
+    fi
 
     CYC_SCANNED=0 CYC_COPIED=0 CYC_VERSIONED=0 CYC_SKIPPED=0 CYC_ERRORS=0 CYC_BYTES=0
     local -A seen=()
-    local input mt leaf base f dir_reads=0 scan_dirs=0 rescanned=0 cache_dirty=0
+    local input mt leaf dir_reads=0 scan_dirs=0 rescanned=0 cache_dirty=0
     local t_start; t_start=$(date +%s%N 2>/dev/null)
 
-    # One bulk readdir per input dir returns the input AND each of its direct
-    # subdirs with their mtime in a single directory read (~1 CIFS round-trip),
-    # instead of one stat per directory. We then scan the input's direct files and
-    # each direct subdir's direct files (never deeper).
-    for input in "${INPUT_DIRS[@]:-}"; do
-        [[ -z $input ]] && continue
+    if [[ $mode == fixed ]]; then
+        # Explicit rule: one bulk readdir of the fixed source down to <depth>
+        # sub-levels returns every directory to scan with its mtime in a single
+        # walk. Excluded dirs are pruned (never descended). Files mirror under the
+        # destination: <src>/sub/f -> <arc>/sub/f. depth -1 = the whole subtree.
         (( dir_reads++ ))
+        local -a dexpr=(); (( depth >= 0 )) && dexpr=( -maxdepth "$depth" )
+        local -a fexpr=() pat; local firstp=1
+        for pat in "${EXCLUDE_DIR_PATTERNS[@]:-}"; do
+            [[ -z $pat ]] && continue
+            if (( firstp )); then fexpr+=( '(' -type d '(' -iname "$pat" ); firstp=0
+            else fexpr+=( -o -iname "$pat" ); fi
+        done
+        (( firstp )) || fexpr+=( ')' -prune ')' -o )
         while IFS=$'\t' read -r -d '' mt leaf; do
             [[ -z $leaf ]] && continue
-            base=${leaf##*/}
-            # Exclude matching sub-directories (never the input dir itself).
-            if [[ $leaf != "$input" ]] && is_excluded_dirname "$base"; then
-                (( DEBUG_ON )) && log_tgt DEBUG EXCLUDED_DIR dir="$(enc "${leaf#"$src"/}")"
-                continue
-            fi
-            seen["$leaf"]=1
-            (( scan_dirs++ ))
-            if [[ $USE_DIR_MTIME_SKIP == true && ${DIRLAST["$leaf"]:-} == "$mt" ]]; then
-                (( DEBUG_ON )) && log_tgt DEBUG SKIP_DIR_UNCHANGED dir="$(enc "${leaf#"$src"/}")" mtime="$mt"
-                continue
-            fi
-            (( rescanned++ ))
-            (( DEBUG_ON )) && log_tgt DEBUG DIR_RESCAN dir="$(enc "${leaf#"$src"/}")" mtime="$mt" last="${DIRLAST["$leaf"]:-}"
-            DIR_UNSETTLED=0
-            while IFS= read -r -d '' f; do
-                [[ -f $f ]] || continue
-                process_file "$key" "$src" "$arc" "$f"
-            done < <(find "$leaf" -mindepth 1 -maxdepth 1 -type f -print0 2>/dev/null)
-            # Settle (cache the mtime) only if everything finalised; otherwise leave
-            # the previous value so the leaf is rescanned next cycle.
-            if (( DIR_UNSETTLED == 0 )); then DIRLAST["$leaf"]=$mt; cache_dirty=1; fi
-        done < <(find "$input" -mindepth 0 -maxdepth 1 -type d -printf '%T@\t%p\0' 2>/dev/null)
-    done
+            scan_one_dir "$leaf" "$mt" "$src" "$arc" "$key" "$src"
+        done < <(find "$src" -mindepth 0 "${dexpr[@]}" "${fexpr[@]}" -type d -printf '%T@\t%p\0' 2>/dev/null)
+    else
+        # One bulk readdir per input dir returns the input AND each of its direct
+        # subdirs with their mtime in a single directory read (~1 CIFS round-trip),
+        # instead of one stat per directory. We then scan the input's direct files and
+        # each direct subdir's direct files (never deeper).
+        for input in "${INPUT_DIRS[@]:-}"; do
+            [[ -z $input ]] && continue
+            (( dir_reads++ ))
+            while IFS=$'\t' read -r -d '' mt leaf; do
+                [[ -z $leaf ]] && continue
+                scan_one_dir "$leaf" "$mt" "$src" "$arc" "$key" "$input"
+            done < <(find "$input" -mindepth 0 -maxdepth 1 -type d -printf '%T@\t%p\0' 2>/dev/null)
+        done
+    fi
 
     # Persist settled mtimes for the leaves seen this cycle (only when something
     # changed; this also drops leaves that disappeared).
@@ -871,7 +966,7 @@ main() {
         discovery_interval="$DISCOVERY_INTERVAL" discovery_maxdepth="$DISCOVERY_MAXDEPTH" \
         use_dir_mtime_skip="$USE_DIR_MTIME_SKIP" \
         require_mount="$REQUIRE_MOUNT" hash_cmd="$HASH_CMD" dry_run="$DRY_RUN" \
-        exclude_patterns="$(enc "${EXCLUDE_DIR_PATTERNS[*]:-}")" \
+        exclude_patterns="$(enc "${EXCLUDE_DIR_PATTERNS[*]:-}")" extra_dirs="${#EXTRA_DIRS[@]}" \
         log_format="$LOG_FORMAT" log_level="$LOG_LEVEL" console="$LOG_CONSOLE"
     [[ $CONFIG_STATUS == missing ]] && log_run WARN CONFIG_NOT_FOUND config="$(enc "$CONFIG_FILE")" \
         hint="config file not found; running with built-in defaults"
@@ -879,20 +974,23 @@ main() {
     if ! load_targets; then
         exit $EX_CONFIG
     fi
-    local ntargets=${#T_KEY[@]}
-    log_run INFO TARGETS_LOADED count="$ntargets"
+    load_extra_dirs   # append EXTRA_DIRS rules as "fixed" targets
+    local ntargets=${#T_KEY[@]} i n_input=0 n_fixed=0
+    for (( i = 0; i < ntargets; i++ )); do
+        if [[ ${T_MODE[i]} == fixed ]]; then (( n_fixed++ )); else (( n_input++ )); fi
+    done
+    log_run INFO TARGETS_LOADED count="$ntargets" input="$n_input" extra="$n_fixed"
     if (( ntargets == 0 )); then
-        log_run WARN NO_TARGETS hint="no enabled target in $TARGETS_FILE (check the 'enabled' column)"
+        log_run WARN NO_TARGETS hint="no enabled target in $TARGETS_FILE and no EXTRA_DIRS rule"
         log_run INFO END
         exit $EX_OK
     fi
 
     # Log every resolved target so a wrong source/archive path is obvious.
-    local i
     for (( i = 0; i < ntargets; i++ )); do
-        log_run INFO TARGET project="${T_PROJECT[i]}" env="${T_ENV[i]}" \
+        log_run INFO TARGET project="${T_PROJECT[i]}" env="${T_ENV[i]}" mode="${T_MODE[i]}" \
             source="$(enc "${T_SRC[i]}")" archive="$(enc "${T_ARC[i]}")" \
-            input_dir_name="${T_IDN[i]}" scan_interval="${T_SCAN[i]}"
+            input_dir_name="${T_IDN[i]}" depth="${T_DEPTH[i]}" scan_interval="${T_SCAN[i]}"
     done
 
     # Poll granularity = smallest per-target scan interval.
