@@ -182,66 +182,77 @@ EXCLUDE_DIR_PATTERNS =
 # EXCLUDE_DIR_PATTERNS = "~*, *.tmp, *en_cours*"
 
 # ===========================================================================
-# CSV report, for BI tools
+# Report, for BI tools
 # ===========================================================================
-# When set, every file that actually moved appends one row to
-#   <REPORT_DIR>/file-deploy-<YYYY-MM-DD>.csv
-# One file per day, header written when the file is created. Point Power BI (or
-# anything else) at the DIRECTORY and let it append the lot:
-#   Get Data > Folder > <REPORT_DIR> > Combine & Transform
+# Same shape as file-dispatch's, deliberately: the two reports are meant to be
+# read side by side, with the same first eight columns and the same vocabulary.
+#
+#   <REPORT_DIR>/report.state    the authority. Never open it.
+#   <REPORT_DIR>/report.csv      published from the state -- this is what you read
+#
+# Two files on purpose. A spreadsheet holding report.csv open on a share blocks
+# the rename that publishes it, so publishing is allowed to fail while the state
+# is not: nothing is lost, and the next run republishes by itself.
+#
+# ONE ROW PER FILE, not per success. The row opens the first time the file is
+# seen and closes when it is delivered, so a file that is stuck -- unreadable,
+# blocked by a conflict, still being written -- is visible with its status and
+# its retry count instead of being absent from the dataset.
+#
+# In Power BI: Get Data > Folder > <REPORT_DIR> > Combine & Transform, then
+# filter on *.csv so report.state is left alone.
 #
 # Nothing is written during a rehearsal: --dry-run stays inert.
 #
-# A row that cannot be written (share unmounted, disk full, file read-only) is
-# queued in STATE_DIR/report-spool.jsonl and replayed on the next cycle that can
-# reach REPORT_DIR -- it is never dropped, because by then the file has already
-# been drained and nothing else could reconstruct the row. It keeps its original
-# deployed_at, so a late flush lands in the day it belongs to.
-#
-# Columns
-#   run_id            correlates a row with the run that produced it (see logs)
-#   deployed_at       when the move completed, ISO-8601 with timezone
-#   instance          the INSTANCE_ID of the configuration that produced it
-#   outcome           DEPLOYED | DEPLOYED_OVERWRITE | DEPLOYED_VERSION
-#                     | DEPLOYED_IDENTICAL | DEPLOY_SKIPPED
-#   file_name         base name only
-#   relpath           path relative to the roots; identical on both sides, so it
-#                     is the natural key to join source and destination
+# Columns -- the first eight are file-dispatch's, unchanged
+#   filename          base name
+#   first_seen        when the file was first seen (with milliseconds: it is
+#                     half of the row's key)
+#   file_date         the file's own mtime
+#   destination       where it was deployed; empty when the deploy was skipped
+#   moved_at          when it was delivered; empty while it is not
+#   status            success | pending | failed  -- what a dashboard filters on
+#   retries           runs it took before succeeding
+#   reason            why it is not done, when it is not
+# ...then what only a move can say
+#   relpath           path relative to the roots, identical on both sides: the
+#                     natural key to join source and destination
+#   instance          the INSTANCE_ID that produced the row
+#   run_id, host      which run, on which machine
+#   outcome           the deployment verdict: DEPLOYED | DEPLOYED_OVERWRITE
+#                     | DEPLOYED_VERSION | DEPLOYED_IDENTICAL | DEPLOY_SKIPPED,
+#                     or the event that blocked it. Refines `status`.
 #   source_path       absolute path it was picked up from
-#   deploy_path       absolute path it was deployed to (differs from the mirror
-#                     under ON_CONFLICT="version"; empty when the deploy was
-#                     skipped)
 #   archive_path      absolute path of the local archive copy -- THIS is what you
 #                     use to retrieve the file afterwards
-#   size_bytes        integer
-#   hash              full digest of the content (HASH_ALGO)
-#   prev_hash         digest that was already at the destination when there was a
-#                     collision; empty otherwise. It chains to an earlier row's
-#                     hash, so a self-join rebuilds a path's whole history.
-#   source_modified   the file's mtime. On Linux this is the closest thing to a
-#                     reliable "creation date" -- see below
-#   source_created    real birth time, and EMPTY unless the platform exposes one
-#                     to Python (macOS/BSD do; Linux does not, whatever the
-#                     filesystem). Treat it as a bonus: build on source_modified.
-#   age_at_pickup_s   how long the file sat in the pickup directory before being
-#                     taken (now - mtime). A latency KPI: a rising curve means
-#                     SCAN_INTERVAL or MIN_STABLE_AGE is too high, or the
-#                     producer writes slowly.
-#   pickup_dir        absolute directory it came from -- group by supplier/site
-#   host              machine that ran it, for multi-host deployments
+#   pickup_dir        the directory it came from -- group by supplier/site
+#   size_bytes, hash  size and full content digest (HASH_ALGO)
+#   prev_hash         digest that was already at the destination on a collision.
+#                     Chains to an earlier row's hash, so a self-join rebuilds a
+#                     path's whole history.
+#   source_created    real birth time, EMPTY unless the platform exposes one to
+#                     Python (macOS/BSD do; Linux does not). Build on file_date.
+#   age_at_pickup_s   how long the file waited before being taken -- a latency
+#                     KPI: a rising curve means SCAN_INTERVAL or MIN_STABLE_AGE
+#                     is too high, or the producer writes slowly.
 #
-# Text fields are RFC 4180 quoted (inner quotes doubled), so paths containing
-# the delimiter, a quote or a newline survive intact. Numbers and timestamps are
-# left bare so they type cleanly on import.
-#
-# Examples
-#   REPORT_DIR=""                            # off (default)
-#   REPORT_DIR="/var/log/file-deploy/reports"
-#   REPORT_DIR="/mnt/nas/bi/file-deploy"     # where Power BI already looks
-REPORT_DIR=""
+# "" disables the report entirely.
+REPORT_DIR = ""
 
-# Field separator. Power BI and Excel in a French locale often expect ";".
-REPORT_DELIMITER=","
+# Field separator of the PUBLISHED copy. Power BI and Excel in a French locale
+# often expect ";". The state always stays comma-separated so it can be read
+# back whatever this says.
+REPORT_DELIMITER = ","
+
+# Split the published report into one file per period: none | daily | monthly.
+# A row lives in exactly one file, so the whole folder read together is the
+# report -- nothing to reconcile. Splitting also means a spreadsheet open on
+# last month's file never collides with this month's writes.
+REPORT_SPLIT = none
+
+# Drop a row this long after it was delivered (or first seen, if it never was).
+# 0 keeps everything for ever.
+REPORT_KEEP_DAYS = 90
 
 # ===========================================================================
 # Logging

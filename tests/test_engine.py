@@ -88,30 +88,22 @@ class TestConflictVerdict(unittest.TestCase):
                                engine.DEPLOY_CONFLICT])
 
 
-class TestCsv(unittest.TestCase):
-    def _row(self, **over):
-        row = dict((c, "") for c in engine.REPORT_COLUMNS)
-        row.update(over)
-        return row
+class TestReportSchema(unittest.TestCase):
+    def test_core_columns_match_file_dispatch(self):
+        # The first eight must stay identical, in order: the two tools' reports
+        # are meant to read the same way.
+        self.assertEqual(engine.REPORT_COLUMNS[:8],
+                         ("filename", "first_seen", "file_date", "destination",
+                          "moved_at", "status", "retries", "reason"))
 
-    def test_header_matches_the_columns(self):
-        self.assertEqual(engine.csv_header(",").split(","),
-                         list(engine.REPORT_COLUMNS))
+    def test_no_duplicate_columns(self):
+        self.assertEqual(len(set(engine.REPORT_COLUMNS)),
+                         len(engine.REPORT_COLUMNS))
 
-    def test_quoting_survives_a_delimiter_and_a_quote(self):
-        line = engine.csv_row(self._row(file_name='b,"x".txt'), ",")
-        self.assertIn('"b,""x"".txt"', line)
-
-    def test_numbers_and_dates_are_left_bare_for_typing(self):
-        line = engine.csv_row(self._row(size_bytes=42, age_at_pickup_s=7,
-                                        deployed_at="2026-01-01T00:00:00+0000"), ",")
-        self.assertIn(",42,", line)
-        self.assertIn(",2026-01-01T00:00:00+0000,", line)
-
-    def test_custom_delimiter(self):
-        line = engine.csv_row(self._row(outcome="DEPLOYED"), ";")
-        self.assertIn('"DEPLOYED"', line)
-        self.assertEqual(line.count(";"), len(engine.REPORT_COLUMNS) - 1)
+    def test_statuses_are_the_shared_vocabulary(self):
+        self.assertEqual(
+            sorted((engine.STATUS_SUCCESS, engine.STATUS_PENDING, engine.STATUS_FAILED)),
+            ["failed", "pending", "success"])
 
 
 class TestConfig(unittest.TestCase):

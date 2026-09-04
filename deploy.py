@@ -45,6 +45,7 @@ Standard library only. Requires Python 3.9 or newer.
 """
 
 import argparse
+import csv
 import errno
 import fcntl
 import hashlib
@@ -356,11 +357,24 @@ def diagnose(exc, op, path, other=None):
 
 
 def iso(epoch):
+    """A report timestamp, in the same shape file-dispatch writes.
+
+    Local, no offset: the two reports are meant to be read side by side, and a
+    column that parses differently in one of them defeats that.
+    """
     try:
-        return datetime.fromtimestamp(float(epoch)).astimezone().strftime(
-            "%Y-%m-%dT%H:%M:%S%z")
+        return datetime.fromtimestamp(float(epoch)).strftime("%Y-%m-%dT%H:%M:%S")
     except (ValueError, OSError, OverflowError):
         return ""
+
+
+def now_precise():
+    """Same, with milliseconds.
+
+    Only for first_seen, which is half of a row's key: two deliveries of the
+    same path within one second would otherwise collapse into one row.
+    """
+    return datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
 
 
 # ==========================================================================
@@ -395,12 +409,9 @@ class Runner(object):
         self.input_dirs = []
         self.deep_scan = False
         self.force_rediscover = False
-        self._report_started = set()
         self._metadata_warned = False
-        self._spool_warned = False
-        self._report_error = None
-        self.n_spooled = 0
-        self.n_report_lost = 0
+        self._report = None
+        self._report_seen = set()
 
         self.state = cfg.STATE_DIR
         self.archive_name = cfg.LOCAL_ARCHIVE_DIR
@@ -408,125 +419,201 @@ class Runner(object):
 
     # ---------------------------------------------------------------- report
     #
-    # The CSV is a side-channel: it must never fail a deployment. But a row that
-    # cannot be written is gone for good -- the file has already been drained, so
-    # no later cycle can reconstruct it, and a BI dataset with silent holes is
-    # worse than one that is late. Rows that cannot be written are therefore
-    # spooled in STATE_DIR (always writable: the run needs it anyway) and flushed
-    # on the next cycle that can reach the report.
-    def _spool_path(self):
-        return os.path.join(self.state, "report-spool.jsonl")
+    # Same shape as file-dispatch, deliberately: report.state is the authority
+    # and the CSV is *published* from it. A spreadsheet holding the CSV open on a
+    # share blocks the rename that publishes it -- so publishing is allowed to
+    # fail, while the state is not, and the next run simply publishes again.
+    #
+    # One row per file, opened the first time the file is seen and closed when it
+    # is delivered, so a file that is stuck (unreadable, blocked by a conflict,
+    # waiting to settle) is visible with its status and its retry count instead
+    # of being absent from the dataset entirely.
+    def report_load(self):
+        """Read the state, keyed by (relpath, first_seen).
 
-    @staticmethod
-    def _row_day(row):
-        """The day the row belongs to, so a late flush lands in the right file."""
-        stamp = str(row.get("deployed_at") or "")
-        return stamp[:10] if len(stamp) >= 10 else datetime.now().strftime("%Y-%m-%d")
-
-    def _write_row(self, row):
-        """Append one row to its day's file. True on success, False otherwise."""
-        path = os.path.join(self.cfg.REPORT_DIR,
-                            "file-deploy-%s.csv" % self._row_day(row))
-        delim = self.cfg.REPORT_DELIMITER
-        try:
-            if path not in self._report_started:
-                os.makedirs(self.cfg.REPORT_DIR, exist_ok=True)
-                if not os.path.exists(path) or os.path.getsize(path) == 0:
-                    with open(path, "a", encoding="utf-8") as fh:
-                        fh.write(engine.csv_header(delim) + "\n")
-                # Only now: a header that failed must be retried, not assumed.
-                self._report_started.add(path)
-            with open(path, "a", encoding="utf-8") as fh:
-                fh.write(engine.csv_row(row, delim) + "\n")
-            return True
-        except OSError as exc:
-            self._report_error = diagnose(exc, "append", path)
-            return False
-
-    def _spool(self, row):
-        try:
-            with open(self._spool_path(), "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-            self.n_spooled += 1
-            if not self._spool_warned:
-                self._spool_warned = True
-                self.log("WARN", "REPORT_SPOOLED",
-                         spool=self._spool_path(),
-                         note="the deployment succeeded; only its report row could "
-                              "not be written. It is queued and will be flushed on "
-                              "the next cycle that can reach REPORT_DIR.",
-                         **(self._report_error or {}))
-            return True
-        except OSError as exc:
-            # Both the report and its spool are unreachable: say so, once.
-            self.n_report_lost += 1
-            if not self._spool_warned:
-                self._spool_warned = True
-                self.log("ERROR", "REPORT_ROW_LOST",
-                         note="neither REPORT_DIR nor the local spool could be "
-                              "written; this row is not recoverable",
-                         **diagnose(exc, "append", self._spool_path()))
-            return False
-
-    def flush_spool(self):
-        """Replay everything queued by an earlier run. Cheap when there is none."""
-        if not self.cfg.REPORT_DIR or self.dry:
+        Falls back to a published report when there is no state yet, so an
+        existing report carries over the first time this runs.
+        """
+        self._report = {}
+        self._report_seen = set()
+        if not self.cfg.REPORT_DIR:
             return
-        path = self._spool_path()
+        path = self._state_csv()
         if not os.path.exists(path):
-            return
+            path = self._published_path(self._period_of({}))
         try:
-            with open(path, "r", encoding="utf-8") as fh:
-                rows = [json.loads(l) for l in fh if l.strip()]
-        except (OSError, ValueError) as exc:
-            self.log("WARN", "REPORT_SPOOL_UNREADABLE", spool=path, err=str(exc))
-            return
-        written, pending = 0, []
-        for row in rows:
-            if self._write_row(row):
-                written += 1
-            else:
-                pending.append(row)
-        try:
-            if pending:
-                tmp = path + ".tmp"
-                with open(tmp, "w", encoding="utf-8") as fh:
-                    for row in pending:
-                        fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-                os.replace(tmp, path)
-            else:
-                os.remove(path)
-        except OSError:
-            pass
-        if written:
-            self.log("INFO", "REPORT_SPOOL_FLUSHED", recovered=written,
-                     still_queued=len(pending))
+            with open(path, "r", encoding="utf-8", newline="") as fh:
+                for row in csv.DictReader(fh):
+                    key = (row.get("relpath", ""), row.get("first_seen", ""))
+                    if key[0]:
+                        self._report[key] = dict(
+                            (c, row.get(c, "") or "") for c in engine.REPORT_COLUMNS)
+        except (OSError, csv.Error):
+            self._report = {}   # unreadable or corrupt: start over, never lose the run
 
-    def report(self, outcome, src_path, deploy_path, archive_path, relpath,
-               size, digest, prev_hash, mtime, btime, age, pickup_dir):
-        if not self.cfg.REPORT_DIR or self.dry:
+    def _state_csv(self):
+        return os.path.join(self.cfg.REPORT_DIR, "report.state")
+
+    def _period_of(self, row):
+        """Which published file a row belongs to, from its first_seen.
+
+        Partitioning, not snapshotting: a row lives in exactly one file, so the
+        whole set read together is the report -- no duplicates to reconcile,
+        which is what makes a Power BI folder import work with no extra step.
+        """
+        if self.cfg.REPORT_SPLIT == "monthly":
+            return (row.get("first_seen") or "")[:7]
+        if self.cfg.REPORT_SPLIT == "daily":
+            return (row.get("first_seen") or "")[:10]
+        return ""
+
+    def _published_path(self, period):
+        name = "report-%s.csv" % period if period else "report.csv"
+        return os.path.join(self.cfg.REPORT_DIR, name)
+
+    def report_note(self, relpath, status, **fields):
+        """Record where `relpath` stands. Called once per file per cycle.
+
+        Reuses the file's open row if it has one -- counting a retry, once per
+        run -- and opens a new one otherwise. A delivery closes the row, so the
+        next drop of the same name opens a fresh one and the history is kept.
+        """
+        if self._report is None or not self.cfg.REPORT_DIR or self.dry:
             return
-        row = {
-            "run_id": self.log.run_id,
-            "deployed_at": iso(time.time()),
-            "instance": self.cfg.INSTANCE_ID,
-            "outcome": outcome,
-            "file_name": os.path.basename(src_path),
-            "relpath": relpath,
-            "source_path": src_path,
-            "deploy_path": deploy_path or "",
-            "archive_path": archive_path or "",
-            "size_bytes": size,
-            "hash": digest,
-            "prev_hash": prev_hash or "",
-            "source_modified": iso(mtime),
-            "source_created": iso(btime) if btime else "",
-            "age_at_pickup_s": age,
-            "pickup_dir": pickup_dir,
-            "host": self.host,
-        }
-        if not self._write_row(row):
-            self._spool(row)
+        open_rows = [k for k, r in self._report.items()
+                     if k[0] == relpath and r.get("status") != "success"]
+        if open_rows:
+            key = max(open_rows, key=lambda k: k[1])
+            row = self._report[key]
+            if key not in self._report_seen:
+                row["retries"] = str(int(row.get("retries") or 0) + 1)
+        else:
+            key = (relpath, now_precise())
+            row = dict.fromkeys(engine.REPORT_COLUMNS, "")
+            row.update(relpath=relpath, filename=os.path.basename(relpath),
+                       first_seen=key[1], retries="0",
+                       instance=self.cfg.INSTANCE_ID, host=self.host)
+            self._report[key] = row
+        self._report_seen.add(key)
+        row["status"] = status
+        row["run_id"] = self.log.run_id
+        for k, v in fields.items():
+            if v not in (None, ""):
+                row[k] = str(v)
+        if status == "success":
+            row["moved_at"] = iso(time.time())
+        return key
+
+    def report_save(self):
+        """Write the state, then publish the CSV from it.
+
+        Two steps on purpose. The state must be written -- losing it loses the
+        retry counts and the first_seen of everything in flight -- while
+        publishing is best effort.
+        """
+        if self._report is None or not self.cfg.REPORT_DIR or self.dry:
+            return
+        try:
+            os.makedirs(self.cfg.REPORT_DIR, exist_ok=True)
+        except OSError as exc:
+            self.log("ERROR", "REPORT_DIR_UNUSABLE", dir=self.cfg.REPORT_DIR,
+                     **diagnose(exc, "makedirs", self.cfg.REPORT_DIR))
+            return
+
+        rows = [r for k, r in self._report.items()
+                if k in self._report_seen or self._keep(r)]
+        rows.sort(key=lambda r: (r.get("first_seen", ""), r.get("relpath", "")))
+
+        if not self._report_seen and len(rows) == len(self._report) \
+                and not self._publish_lagging(rows):
+            # Nothing observed, nothing aged out, and every published file is in
+            # step with the state: a quiet cron would otherwise rewrite the whole
+            # report every cycle, which on a network share is real traffic.
+            return
+
+        if not self._write_csv(self._state_csv(), rows, ","):
+            return                      # nothing to publish from
+
+        by_period = {}
+        for row in rows:
+            by_period.setdefault(self._period_of(row), []).append(row)
+        touched = set(self._period_of(self._report[k]) for k in self._report_seen
+                      if k in self._report)
+        for period, part in sorted(by_period.items()):
+            # Only rewrite a file this run actually changed, so a spreadsheet
+            # open on last month's file never collides with this month's writes.
+            if period and period not in touched \
+                    and os.path.exists(self._published_path(period)):
+                continue
+            if not self._write_csv(self._published_path(period), part,
+                                   self.cfg.REPORT_DELIMITER):
+                self.log("WARN", "REPORT_NOT_PUBLISHED",
+                         file=os.path.basename(self._published_path(period)),
+                         state=self._state_csv(),
+                         note="a program is probably holding it open; the state is "
+                              "safe and it will be published on the next run")
+        if self.cfg.REPORT_SPLIT != "none":
+            self._prune_published(set(by_period))
+
+    def _keep(self, row):
+        """Keep a row not seen this run only while it is inside the retention."""
+        if self.cfg.REPORT_KEEP_DAYS <= 0:
+            return True
+        stamp = row.get("moved_at") or row.get("first_seen") or ""
+        try:
+            age = datetime.now() - datetime.fromisoformat(stamp)
+        except ValueError:
+            return True                 # unparseable: keep rather than lose it
+        return age.days < self.cfg.REPORT_KEEP_DAYS
+
+    def _publish_lagging(self, rows):
+        """True when a published file is missing, or older than the state.
+
+        Without this the report would stay stale after a publish that failed,
+        until the next file happened to arrive -- days, on a quiet weekend.
+        """
+        try:
+            state_mtime = os.path.getmtime(self._state_csv())
+        except OSError:
+            return True
+        for period in set(self._period_of(r) for r in rows):
+            try:
+                if os.path.getmtime(self._published_path(period)) < state_mtime:
+                    return True
+            except OSError:
+                return True
+        return False
+
+    def _write_csv(self, path, rows, delimiter):
+        """Write rows atomically. Returns False and logs the state's failures."""
+        tmp = "%s.partial-%d" % (path, os.getpid())
+        try:
+            with open(tmp, "w", encoding="utf-8", newline="") as fh:
+                w = csv.DictWriter(fh, fieldnames=list(engine.REPORT_COLUMNS),
+                                   delimiter=delimiter)
+                w.writeheader()
+                w.writerows(rows)
+            os.replace(tmp, path)       # readers never see a half-written file
+            return True
+        except (OSError, csv.Error) as exc:
+            self._unlink(tmp)
+            if path == self._state_csv():   # this one may not fail quietly
+                self.log("ERROR", "REPORT_STATE_UNWRITABLE",
+                         **diagnose(exc, "write", path))
+            return False
+
+    def _prune_published(self, keep):
+        """A period emptied by retention leaves a file behind; drop it."""
+        try:
+            names = os.listdir(self.cfg.REPORT_DIR)
+        except OSError:
+            return
+        for name in names:
+            if not (name.startswith("report-") and name.endswith(".csv")):
+                continue
+            if name[len("report-"):-len(".csv")] in keep:
+                continue
+            self._unlink(os.path.join(self.cfg.REPORT_DIR, name))
 
     # ------------------------------------------------------- deployment root
     def check_deploy_root(self):
@@ -837,6 +924,13 @@ class Runner(object):
             except OSError:
                 pass
 
+    def _note_failure(self, relpath, outcome, reason, src, pickup, mtime, size,
+                      digest=""):
+        """One place for the failure rows, so they all carry the same fields."""
+        self.report_note(relpath, engine.STATUS_FAILED, outcome=outcome,
+                         reason=reason, file_date=iso(mtime), size_bytes=size,
+                         hash=digest, pickup_dir=pickup, source_path=src)
+
     def _rollback(self, saved_prev, dpath, published, relpath):
         """Put the deployment tree back exactly as it was.
 
@@ -974,10 +1068,17 @@ class Runner(object):
             if self.log.debug_on:
                 self.log("DEBUG", "SKIP_UNSTABLE", relpath=relpath,
                          age_s=int(age), min_stable_age=cfg.MIN_STABLE_AGE)
+            self.report_note(relpath, engine.STATUS_PENDING, outcome="SKIP_UNSTABLE",
+                             reason="still being written", file_date=iso(mtime),
+                             size_bytes=size, pickup_dir=pickup,
+                             source_path=src)
             return True
 
         digest = file_digest(src, cfg.HASH_ALGO)
         if digest is None:
+            self.report_note(relpath, engine.STATUS_FAILED, outcome="HASH_FAILED",
+                             reason="unreadable", file_date=iso(mtime),
+                             size_bytes=size, pickup_dir=pickup, source_path=src)
             return self.file_error("%s|%s|%s" % (relpath, size, mtime),
                                    "HASH_FAILED", relpath=relpath,
                                    hash_algo=cfg.HASH_ALGO)
@@ -1012,6 +1113,8 @@ class Runner(object):
             self.deploy_failed = True
             self.log("ERROR", "DEPLOY_FAILED", stage="mkdir", relpath=relpath,
                      **diagnose(exc, "makedirs", os.path.dirname(dst)))
+            self._note_failure(relpath, "DEPLOY_FAILED", "cannot create the "
+                               "destination directory", src, pickup, mtime, size, digest)
             return True
 
         outcome, dpath, prev = self.resolve_deploy(dst, digest, mtime)
@@ -1025,6 +1128,8 @@ class Runner(object):
                      on_conflict=cfg.ON_CONFLICT,
                      hint="the source file was kept; resolve the collision or "
                           "change ON_CONFLICT")
+            self._note_failure(relpath, "DEPLOY_CONFLICT", "the destination holds "
+                               "different content", src, pickup, mtime, size, digest)
             return True
 
         if outcome == engine.DEPLOY_RETRY:
@@ -1041,6 +1146,10 @@ class Runner(object):
                               "and retried every cycle")
             elif self.log.debug_on:
                 self.log("DEBUG", "DEPLOY_RETRY", relpath=relpath, repeat="1")
+            self.report_note(relpath, engine.STATUS_PENDING, outcome="DEPLOY_RETRY",
+                             reason="waiting for the destination to clear",
+                             file_date=iso(mtime), size_bytes=size, hash=digest,
+                             pickup_dir=pickup, source_path=src, destination=dst)
             return True
 
         if outcome == engine.DEPLOY_SKIPPED:
@@ -1071,6 +1180,9 @@ class Runner(object):
                     self.log("ERROR", "DEPLOY_FAILED", stage="stash-previous",
                              relpath=relpath, dst=dpath,
                              **diagnose(exc, "rename", dpath))
+                    self._note_failure(relpath, "DEPLOY_FAILED", "cannot stash the "
+                                       "version being replaced", src, pickup, mtime,
+                                       size, digest)
                     return True
             stage, detail = self.atomic_copy(src, dpath, digest)
             if stage:
@@ -1079,6 +1191,9 @@ class Runner(object):
                 self.deploy_failed = True
                 self.log("ERROR", "DEPLOY_FAILED", stage=stage, relpath=relpath,
                          dst=dpath, deployed="no", source_kept="yes", **detail)
+                self._note_failure(relpath, "DEPLOY_FAILED", detail.get("cause")
+                                   or detail.get("err") or stage, src, pickup,
+                                   mtime, size, digest)
                 return True
             published = True
             if outcome == engine.DEPLOYED_VERSION:
@@ -1100,6 +1215,11 @@ class Runner(object):
                      deployed="no", source_kept="yes",
                      hint="the file was still being written; the deployment was "
                           "rolled back and the source left alone, to be retried")
+            self.report_note(relpath, engine.STATUS_PENDING,
+                             outcome="SOURCE_CHANGED_DURING_COPY",
+                             reason="rewritten while being copied",
+                             file_date=iso(mtime), size_bytes=size,
+                             pickup_dir=pickup, source_path=src)
             return True
 
         # --- 5. commit -----------------------------------------------------
@@ -1108,6 +1228,9 @@ class Runner(object):
             # The source could not be drained, so the whole cycle is undone: the
             # deployment tree goes back to exactly what it was.
             self._rollback(saved_prev, dpath, published, relpath)
+            self._note_failure(relpath, "SOURCE_STUCK", "deployed but the source "
+                               "could not be drained; rolled back", src, pickup,
+                               mtime, size, digest)
             return True
         # Past this point the transaction is committed on both sides. Dropping the
         # stashed previous version is the only thing left, and losing that to a
@@ -1145,9 +1268,14 @@ class Runner(object):
             self.log("INFO", outcome, relpath=relpath, size=size,
                      hash=digest[:8] + "…", archive=arch_rel)
             self.n_deployed += 1
-        self.report(outcome, src, ("" if outcome == engine.DEPLOY_SKIPPED else dpath),
-                    archive_path or "", relpath, size, digest, prev or "",
-                    mtime, btime, int(age), pickup)
+        self.report_note(relpath, engine.STATUS_SUCCESS, outcome=outcome,
+                         reason="", file_date=iso(mtime),
+                         destination=("" if outcome == engine.DEPLOY_SKIPPED else dpath),
+                         source_path=src, archive_path=archive_path or "",
+                         pickup_dir=pickup, size_bytes=size, hash=digest,
+                         prev_hash=prev or "",
+                         source_created=iso(btime) if btime else "",
+                         age_at_pickup_s=int(age))
         return False
 
     # --------------------------------------------------------- one directory
@@ -1243,7 +1371,6 @@ class Runner(object):
             if self.log.debug_on:
                 self.log("DEBUG", "DEEP_SCAN", interval_s=cfg.DEEP_SCAN_INTERVAL)
 
-        self.flush_spool()
         self.load_leaves()
         self.load_inputs()
 
@@ -1447,6 +1574,7 @@ def main(argv=None):
             cfg.values["REPORT_DIR"] = ""
 
     runner = Runner(cfg, log, cfg.DRY_RUN)
+    runner.report_load()
     started = time.time()
     cycle = 0
     last_hb = 0.0
@@ -1473,12 +1601,12 @@ def main(argv=None):
             break
         time.sleep(max(1, cfg.SCAN_INTERVAL))
     log.cycle = None
+    runner.report_save()
 
     log("INFO", "RUN_SUMMARY", cycles=cycle, scanned=runner.n_scanned,
         deployed=runner.n_deployed, overwritten=runner.n_overwritten,
         conflicts=runner.n_conflicts, moved=runner.n_moved,
-        errors=runner.n_errors, report_spooled=runner.n_spooled,
-        report_lost=runner.n_report_lost, mount=runner.mount_state or "unknown")
+        errors=runner.n_errors, mount=runner.mount_state or "unknown")
     log("INFO", "END")
 
     # Undelivered data outranks delivered-but-not-drained.

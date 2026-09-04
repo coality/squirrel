@@ -943,120 +943,158 @@ class TestConfigAndCli(Base):
 
 # ==========================================================================
 class TestReport(Base):
-    def csv(self):
-        rd = os.path.join(self.sb, "reports")
-        files = sorted(os.path.join(rd, f) for f in os.listdir(rd)) if os.path.isdir(rd) else []
-        return files[0] if files else None
+    """The report has the same shape as file-dispatch's, deliberately.
 
-    def rows(self):
-        """Data rows of the current day's report, header excluded."""
-        path = self.csv()
-        if not path:
-            return []
-        with open(path, encoding="utf-8") as fh:
-            return [l for l in fh.read().splitlines()[1:] if l.strip()]
+    report.state is the authority and the CSV is published from it, so a
+    spreadsheet holding the CSV open costs nothing; and a row is opened per
+    file rather than per success, so a file that is stuck is visible instead of
+    being absent from the dataset.
+    """
 
-    def test_one_row_per_file_with_quoting(self):
-        self.drop("input/a.txt", "one\n")
-        self.drop('input/sub/b,"x".txt', "two\n")
-        self.write_conf(REPORT_DIR='"%s"' % os.path.join(self.sb, "reports"))
-        self.run_fd()
-        path = self.csv()
-        self.assertIsNotNone(path)
-        with open(path, encoding="utf-8") as fh:
-            body = fh.read()
-        self.assertIn("run_id,deployed_at,instance,outcome", body)
-        self.assertEqual(len(body.strip().splitlines()), 3, "header + one row per file")
-        self.assertIn('"a.txt"', body)
-        self.assertIn("/input/archive/a.txt", body, "archive path recorded")
-        self.assertIn('"b,""x"".txt"', body, "delimiter and quote escaped")
+    def rep(self):
+        return os.path.join(self.sb, "reports")
 
-    def test_rows_append_to_the_same_day(self):
+    def published(self, name="report.csv"):
+        return os.path.join(self.rep(), name)
+
+    def read(self, name="report.csv"):
+        import csv as _csv
+        with open(self.published(name), encoding="utf-8", newline="") as fh:
+            return list(_csv.DictReader(fh))
+
+    def with_report(self, **extra):
+        self.write_conf(REPORT_DIR='"%s"' % self.rep(), **extra)
+
+    def test_state_and_published_csv(self):
         self.drop("input/a.txt")
-        self.write_conf(REPORT_DIR='"%s"' % os.path.join(self.sb, "reports"))
+        self.with_report()
         self.run_fd()
+        self.assertTrue(os.path.exists(os.path.join(self.rep(), "report.state")),
+                        "the authority")
+        rows = self.read()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["filename"], "a.txt")
+        self.assertEqual(rows[0]["status"], "success")
+        self.assertEqual(rows[0]["outcome"], "DEPLOYED")
+        self.assertEqual(rows[0]["retries"], "0")
+        self.assertTrue(rows[0]["moved_at"])
+        self.assertIn("input/archive/a.txt", rows[0]["archive_path"])
+
+    def test_core_columns_are_the_shared_ones(self):
+        self.drop("input/a.txt")
+        self.with_report()
+        self.run_fd()
+        with open(self.published(), encoding="utf-8") as fh:
+            header = fh.readline().strip().split(",")
+        self.assertEqual(header[:8],
+                         ["filename", "first_seen", "file_date", "destination",
+                          "moved_at", "status", "retries", "reason"])
+
+    def test_a_stuck_file_is_visible_instead_of_absent(self):
+        # The gap the per-file model closes: only successes used to be recorded.
+        bad = self.drop("input/bad.txt", "secret\n")
+        self.drop("input/good.txt")
+        os.chmod(bad, 0o000)
+        self.with_report()
+        try:
+            self.run_fd()
+        finally:
+            os.chmod(bad, 0o644)
+        rows = dict((r["filename"], r) for r in self.read())
+        self.assertEqual(rows["good.txt"]["status"], "success")
+        self.assertEqual(rows["bad.txt"]["status"], "failed")
+        self.assertEqual(rows["bad.txt"]["reason"], "unreadable")
+
+    def test_retries_are_counted_once_per_run(self):
+        bad = self.drop("input/bad.txt", "secret\n")
+        os.chmod(bad, 0o000)
+        self.with_report()
+        try:
+            for _ in range(3):
+                self.run_fd()
+        finally:
+            os.chmod(bad, 0o644)
+        rows = self.read()
+        self.assertEqual(len(rows), 1, "one row for the file, not one per attempt")
+        self.assertEqual(rows[0]["retries"], "2", "two retries after the first sight")
+        # Once it can be read, the same row closes.
+        self.run_fd()
+        rows = self.read()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "success")
+
+    def test_a_locked_csv_costs_nothing_and_heals_itself(self):
+        self.drop("input/a.txt")
+        self.with_report()
+        self.run_fd()
+        # Stand in for a spreadsheet holding it: os.replace onto this cannot work.
+        os.remove(self.published())
+        os.mkdir(self.published())
         self.drop("input/b.txt")
         self.run_fd()
-        with open(self.csv(), encoding="utf-8") as fh:
-            body = fh.read()
-        self.assertEqual(len(body.strip().splitlines()), 3, "header not repeated")
-
-    def test_custom_delimiter(self):
-        self.drop("input/a.txt")
-        self.write_conf(REPORT_DIR='"%s"' % os.path.join(self.sb, "reports"),
-                        REPORT_DELIMITER='";"')
+        self.assertIn("REPORT_NOT_PUBLISHED", self.log())
+        import csv as _csv
+        with open(os.path.join(self.rep(), "report.state"), newline="") as fh:
+            self.assertEqual(len(list(_csv.DictReader(fh))), 2, "the state kept it")
+        # Released, and nothing new to process: it must republish by itself.
+        os.rmdir(self.published())
         self.run_fd()
-        with open(self.csv(), encoding="utf-8") as fh:
-            body = fh.read()
-        self.assertIn("run_id;deployed_at;instance;outcome", body)
+        self.assertEqual(sorted(r["filename"] for r in self.read()),
+                         ["a.txt", "b.txt"])
 
-    def test_prev_hash_chains_to_the_previous_row(self):
-        self.write_conf(REPORT_DIR='"%s"' % os.path.join(self.sb, "reports"))
+    def test_idle_run_rewrites_nothing(self):
+        self.drop("input/a.txt")
+        self.with_report()
+        self.run_fd()
+        before = dict((f, os.stat(os.path.join(self.rep(), f)).st_mtime_ns)
+                      for f in os.listdir(self.rep()))
+        for _ in range(3):
+            self.run_fd()
+        after = dict((f, os.stat(os.path.join(self.rep(), f)).st_mtime_ns)
+                     for f in os.listdir(self.rep()))
+        self.assertEqual(before, after)
+
+    def test_split_partitions_and_leaves_the_past_alone(self):
+        self.drop("input/a.txt")
+        self.with_report(REPORT_SPLIT="daily")
+        self.run_fd()
+        import datetime as dt
+        today = dt.date.today().isoformat()
+        self.assertTrue(os.path.exists(self.published("report-%s.csv" % today)))
+        self.assertFalse(os.path.exists(self.published("report.csv")))
+
+    def test_custom_delimiter_on_the_published_file_only(self):
+        self.drop("input/a.txt")
+        self.with_report(REPORT_DELIMITER='";"')
+        self.run_fd()
+        with open(self.published(), encoding="utf-8") as fh:
+            self.assertTrue(fh.readline().startswith("filename;first_seen;"))
+        # The state stays comma-separated so it is always readable back.
+        with open(os.path.join(self.rep(), "report.state"), encoding="utf-8") as fh:
+            self.assertTrue(fh.readline().startswith("filename,first_seen,"))
+
+    def test_awkward_names_survive_quoting(self):
+        self.drop('input/b,"x".txt', "two\n")
+        self.with_report()
+        self.run_fd()
+        self.assertEqual(self.read()[0]["filename"], 'b,"x".txt')
+
+    def test_prev_hash_chains_to_the_previous_delivery(self):
+        self.with_report()
         self.drop("input/f.txt", "v1\n")
         self.run_fd()
         self.drop("input/f.txt", "v2\n")
         self.run_fd()
-        with open(self.csv(), encoding="utf-8") as fh:
-            rows = [r for r in fh.read().splitlines()[1:] if r]
-        first = rows[0].split(",")
-        second = rows[1].split(",")
-        idx_hash = list(__import__("engine").REPORT_COLUMNS).index("hash")
-        idx_prev = list(__import__("engine").REPORT_COLUMNS).index("prev_hash")
-        self.assertEqual(second[idx_prev], first[idx_hash],
-                         "prev_hash chains, so a self-join rebuilds the history")
-
-    def test_unwritable_report_is_queued_then_recovered(self):
-        """A row that cannot be written is never lost.
-
-        The file has already been drained by then, so no later cycle could
-        reconstruct the row: it is spooled locally and replayed as soon as the
-        report is reachable again.
-        """
-        rd = os.path.join(self.sb, "reports")
-        self.write_conf(REPORT_DIR='"%s"' % rd)
-        self.drop("input/a.txt")
-        self.run_fd()
-        self.assertEqual(len(self.rows()), 1)
-        # Make the day's file unwritable, then deploy another file.
-        os.chmod(self.csv(), 0o444)
-        self.drop("input/b.txt")
-        r = self.run_fd()
-        os.chmod(self.csv(), 0o644)
-        self.assertEqual(r.returncode, EX_OK, "the report never fails a deployment")
-        self.assertEqual(self.pending(), [], "the file was still delivered")
-        self.assertEqual(len(self.rows()), 1, "its row could not be written")
-        self.assertIn("REPORT_SPOOLED", self.log())
-        spool = os.path.join(self.sb, "state", "compta", "report-spool.jsonl")
-        self.assertTrue(os.path.exists(spool), "queued locally")
-        # Next run, with the report reachable again: the row is replayed.
-        self.run_fd()
-        self.assertEqual(len(self.rows()), 2, "the queued row was recovered")
-        self.assertIn("REPORT_SPOOL_FLUSHED", self.log())
-        self.assertFalse(os.path.exists(spool), "and the queue is drained")
-        self.assertIn("b.txt", "".join(self.rows()))
-
-    def test_a_late_row_lands_in_its_own_day(self):
-        # A row spooled on one day and flushed later belongs to the day it was
-        # deployed, so the dataset stays chronologically honest.
-        import json
-        rd = os.path.join(self.sb, "reports")
-        self.write_conf(REPORT_DIR='"%s"' % rd)
-        os.makedirs(os.path.join(self.sb, "state", "compta"), exist_ok=True)
-        spool = os.path.join(self.sb, "state", "compta", "report-spool.jsonl")
-        with open(spool, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps({"deployed_at": "2026-01-15T09:00:00+0100",
-                                 "instance": "compta", "outcome": "DEPLOYED",
-                                 "file_name": "old.txt"}) + "\n")
-        self.drop("input/a.txt")
-        self.run_fd()
-        self.assertTrue(os.path.exists(os.path.join(rd, "file-deploy-2026-01-15.csv")),
-                        "the late row went to its own day")
+        rows = sorted(self.read(), key=lambda r: r["first_seen"])
+        self.assertEqual(len(rows), 2, "each delivery opens its own row")
+        self.assertEqual(rows[1]["prev_hash"], rows[0]["hash"],
+                         "a self-join rebuilds the history of a path")
 
     def test_rehearsal_writes_no_report(self):
         self.drop("input/a.txt")
-        self.write_conf(REPORT_DIR='"%s"' % os.path.join(self.sb, "reports"))
+        self.with_report()
         self.run_fd("--dry-run")
-        self.assertIsNone(self.csv())
+        self.assertFalse(os.path.isdir(self.rep()) and os.listdir(self.rep()))
 
 
 if __name__ == "__main__":

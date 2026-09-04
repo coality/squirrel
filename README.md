@@ -183,27 +183,38 @@ forces a deep pass on its next cycle.
 
 ## Reporting
 
-Set `REPORT_DIR` and every file that moves appends a row to
-`<REPORT_DIR>/file-deploy-<YYYY-MM-DD>.csv` — one file per day, every target in
-it. In Power BI: **Get Data → Folder →** point at `REPORT_DIR` → **Combine &
-Transform**, and new days append themselves on refresh.
+Set `REPORT_DIR` and you get two files, **the same shape file-dispatch
+writes**, so the two reports read side by side:
 
-18 columns, including `archive_path` (where the file actually is now, so you can
-retrieve it), `relpath` (identical on both sides, the natural join key),
-`prev_hash` (what an overwrite replaced) and `age_at_pickup_s` (how long a file
-waited before being taken — a latency KPI). Every column is documented in
+```
+<REPORT_DIR>/report.state   the authority — never open it
+<REPORT_DIR>/report.csv     published from the state — this is what you read
+```
+
+Publishing is allowed to fail, the state is not: a spreadsheet holding
+`report.csv` open blocks the rename that publishes it, nothing is lost, and the
+next run republishes by itself — even a run with nothing new to do.
+
+**One row per file, not per success.** The row opens the first time a file is
+seen and closes when it is delivered, so a file that is stuck — unreadable,
+blocked by a conflict, still being written — is visible with its `status` and
+its `retries` instead of being absent from the dataset.
+
+The first eight columns are file-dispatch's, unchanged: `filename`,
+`first_seen`, `file_date`, `destination`, `moved_at`, `status`, `retries`,
+`reason`. Then come the thirteen only a move can fill, among them
+`archive_path` (where the file actually is now, so you can retrieve it),
+`relpath` (identical on both sides, the natural join key), `prev_hash` (what an
+overwrite replaced) and `age_at_pickup_s` (a latency KPI). All documented in
 [`file-deploy.conf.example`](file-deploy.conf.example).
 
-Two things to know: `source_created` is a real birth time and is **empty** on
-filesystems that do not record one — CIFS/SMB usually does not, so build on
-`source_modified`. And `REPORT_DELIMITER=";"` if your Excel/Power BI locale
-expects semicolons.
+In Power BI: **Get Data → Folder →** `REPORT_DIR` → **Combine & Transform**,
+filtering on `*.csv` so `report.state` is left alone. `REPORT_SPLIT = daily` or
+`monthly` partitions the published copy; `REPORT_DELIMITER = ";"` if your locale
+expects semicolons; `REPORT_KEEP_DAYS` bounds the size.
 
-A row that cannot be written is **queued locally and replayed**, not dropped:
-by then the file has already been drained, so nothing else could reconstruct it.
-Watch for `REPORT_SPOOLED` (queued) and `REPORT_SPOOL_FLUSHED` (recovered), and
-alert on `REPORT_ROW_LOST` — the only case where a row is genuinely gone, which
-takes both `REPORT_DIR` and the local spool being unwritable.
+`source_created` is a real birth time and is **empty** unless the platform
+exposes one to Python — Linux does not — so build on `file_date`.
 
 Nothing is written during a rehearsal, so `--dry-run` stays inert.
 

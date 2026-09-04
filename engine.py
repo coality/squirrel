@@ -10,7 +10,8 @@ unit-test (see tests/test_engine.py):
   - conflict_verdict()            what to do about an existing destination
   - candidate_names()             the naming rule shared by the deployment tree
                                   and the local archive
-  - enc() / esc_glob() / csv_row  the small encoders the logs and the report use
+  - enc() / esc_glob()            the small encoders the logs use
+  - REPORT_COLUMNS               the report schema, shared with file-dispatch
 
 The one rule that shapes this file: a decision that must survive a crash cannot
 depend on the wall clock or on anything the previous run happened to remember.
@@ -161,34 +162,24 @@ def conflict_verdict(deployed_digest, incoming_digest, policy):
 # --------------------------------------------------------------------------
 # The CSV report
 # --------------------------------------------------------------------------
+# The first eight are the core file-dispatch also publishes, in the same order
+# and with the same meaning, so the two reports read the same way. What follows
+# is what only a move can say.
 REPORT_COLUMNS = (
-    "run_id", "deployed_at", "instance", "outcome", "file_name", "relpath",
-    "source_path", "deploy_path", "archive_path", "size_bytes", "hash",
-    "prev_hash", "source_modified", "source_created", "age_at_pickup_s",
-    "pickup_dir", "host",
+    "filename", "first_seen", "file_date", "destination", "moved_at",
+    "status", "retries", "reason",
+    "relpath", "instance", "run_id", "host", "outcome",
+    "source_path", "archive_path", "pickup_dir",
+    "size_bytes", "hash", "prev_hash", "source_created", "age_at_pickup_s",
 )
-# Columns left unquoted so a BI tool types them as numbers or dates on import.
-_BARE = frozenset(("size_bytes", "age_at_pickup_s", "deployed_at",
-                   "source_modified", "source_created"))
+
+# A row's coarse state, shared with file-dispatch. `outcome` refines it with the
+# deployment verdict; these three are what a dashboard filters on.
+STATUS_SUCCESS = "success"
+STATUS_PENDING = "pending"      # waiting: unstable, or a collision not yet clear
+STATUS_FAILED = "failed"        # attempted and refused
 
 
-def csv_row(values, delimiter=","):
-    """One RFC 4180 line: text fields quoted, inner quotes doubled.
-
-    Paths may contain the delimiter, a quote or a newline; all three survive.
-    """
-    out = []
-    for col in REPORT_COLUMNS:
-        v = "" if values.get(col) is None else str(values[col])
-        if col in _BARE:
-            out.append(v)
-        else:
-            out.append('"' + v.replace('"', '""') + '"')
-    return delimiter.join(out)
-
-
-def csv_header(delimiter=","):
-    return delimiter.join(REPORT_COLUMNS)
 
 
 # --------------------------------------------------------------------------
@@ -228,6 +219,8 @@ SETTINGS = [
     # report
     Setting("REPORT_DIR", "path", ""),
     Setting("REPORT_DELIMITER", "str", ","),
+    Setting("REPORT_SPLIT", "enum", "none", choices=("none", "daily", "monthly")),
+    Setting("REPORT_KEEP_DAYS", "int", 90, minimum=0),
     # logging
     Setting("LOG_LEVEL", "enum", "INFO", choices=("DEBUG", "INFO", "WARN", "ERROR")),
     Setting("LOG_FORMAT", "enum", "text", choices=("text", "json")),

@@ -258,46 +258,48 @@ handover directory someone else empties. `fail` treats it as an incident —
 Both re-hash the file on every cycle until it resolves, so neither is free on
 large files.
 
-### CSV report
+### Report
 
-When `REPORT_DIR` is set, every file that actually moved appends one row to
-`<REPORT_DIR>/file-deploy-<YYYY-MM-DD>.csv`: one file per day, header written on
-creation, RFC 4180 quoting on text fields. It is a reporting side-channel, not
-state: deleting it changes nothing, and nothing is written during a rehearsal.
+Same shape as file-dispatch's, deliberately: the two tools publish the same
+first eight columns, in the same order, with the same `status` vocabulary, so
+their reports read side by side.
 
-**A row that cannot be written is queued, never dropped.** The report must never
-fail a deployment — but by the time a row is written the file has already been
-drained, so no later cycle could reconstruct it, and a dataset with silent holes
-is worse than one that is late. Failures are therefore spooled to
-`STATE_DIR/report-spool.jsonl` (`REPORT_SPOOLED`, WARN) and replayed on the next
-cycle that can reach the report (`REPORT_SPOOL_FLUSHED`). A queued row keeps its
-original `deployed_at`, so a late flush lands in the day it belongs to rather
-than the day it was recovered. `RUN_SUMMARY` carries `report_spooled=` and
-`report_lost=`; the latter is only ever non-zero when the local spool itself is
-unwritable (`REPORT_ROW_LOST`, ERROR).
+```
+<REPORT_DIR>/report.state    the authority
+<REPORT_DIR>/report.csv      published from the state
+```
 
-Columns: `run_id`, `deployed_at`, `project`, `env`, `outcome`, `file_name`,
-`relpath`, `source_path`, `deploy_path`, `archive_path`, `size_bytes`, `hash`,
-`prev_hash`, `source_modified`, `source_created`, `age_at_pickup_s`,
-`pickup_dir`, `host`.
+Two files on purpose. A spreadsheet holding the published copy open on a share
+blocks the rename that publishes it, so **publishing is allowed to fail and the
+state is not**: nothing is lost, `REPORT_NOT_PUBLISHED` is logged, and the next
+run publishes again — including a run with nothing new to do, because a
+published file older than the state is republished on sight.
 
-`archive_path` is the retrieval key: it is where the file actually is now.
-`source_created` is a real birth time and is **empty** unless the platform
-exposes one to Python — macOS and the BSDs do, **Linux does not, whatever the
-filesystem**. Treat it as a bonus and build on `source_modified`. `age_at_pickup_s` is `now − mtime` at pickup, a latency measure of how
-long a file waited before being taken.
+**One row per file, opened on first sight and closed on delivery.** A file that
+is stuck is therefore visible with its `status` and `retries`, rather than
+absent from the dataset as it would be in an append-on-success log. A delivery
+closes the row, so the next drop of the same path opens a fresh one and the
+history is kept; `first_seen` carries milliseconds because it is half of the
+row's key.
 
-### In the local archive
-
-The target name is a **pure function** of `(base name, source mtime, hash)` —
-never of the wall clock — so that every retry resolves to the same path.
-
-| Condition | Name used |
+| Group | Columns |
 |---|---|
-| Name free | `archive/report.xml` |
-| Taken, identical content | Reused as is — no copy created (`ARCHIVE_REUSED`) |
-| Taken, different content | `archive/report_<YYYYMMDD_HHMMSS>.xml`, stamp derived from the source mtime |
-| That one also taken, different content | `archive/report_<stamp>_<hash8>.xml` |
+| Shared with file-dispatch | `filename`, `first_seen`, `file_date`, `destination`, `moved_at`, `status`, `retries`, `reason` |
+| Specific to a move | `relpath`, `instance`, `run_id`, `host`, `outcome`, `source_path`, `archive_path`, `pickup_dir`, `size_bytes`, `hash`, `prev_hash`, `source_created`, `age_at_pickup_s` |
+
+`status` is the coarse state a dashboard filters on — `success`, `pending`,
+`failed` — and `outcome` refines it with the deployment verdict. `archive_path`
+is the retrieval key: it is where the file actually is now. `prev_hash` chains
+to an earlier row's `hash`, so a self-join rebuilds a path's history.
+`source_created` is a real birth time and is **empty** unless the platform
+exposes one to Python — Linux does not — so build on `file_date`.
+
+`REPORT_SPLIT` partitions the published copy (`none` / `daily` / `monthly`): a
+row lives in exactly one file, so reading the whole folder is the report with
+nothing to reconcile, and a past period is never rewritten. `REPORT_KEEP_DAYS`
+drops a row that long after it was delivered. `REPORT_DELIMITER` applies to the
+published copy only; the state stays comma-separated so it can always be read
+back. Nothing is written during a rehearsal.
 
 ---
 
@@ -392,7 +394,9 @@ where a column exists.
 | `LOCAL_ARCHIVE_DIR` | `"archive"` | Name of the local archive; `""` disables it |
 | `ON_CONFLICT` | `"overwrite"` | `overwrite` / `version` / `skip` / `retry` / `fail` when the destination holds different content — see [§6](#6--naming) |
 | `REPORT_DIR` | `""` | Directory receiving the daily CSV of everything that moved; `""` disables it |
-| `REPORT_DELIMITER` | `","` | CSV field separator (`";"` for a French-locale Excel/Power BI) |
+| `REPORT_DELIMITER` | `","` | Field separator of the published copy (`";"` for a French locale) |
+| `REPORT_SPLIT` | `"none"` | `none` / `daily` / `monthly` partitioning of the published copy |
+| `REPORT_KEEP_DAYS` | `90` | Drop a row this long after delivery; 0 keeps everything |
 | `DEPLOY_MARKER` | `".file-deploy-root"` | Deployment-root sentinel |
 | `HASH_ALGO` | `"sha256"` | Any algorithm `hashlib` knows |
 | `PRESERVE_METADATA` | `yes` | Carry mode and timestamps over; never fatal |
