@@ -24,15 +24,19 @@ trap cleanup EXIT
 new_case() {
     local d; d=$(mktemp -d "$WORK/case.XXXXXX")
     mkdir -p "$d/state" "$d/logs"
-    : > "$d/targets.tsv"
     printf '%s' "$d"
 }
 
 write_conf() {  # dir [extra config lines...]
     local d=$1; shift
+    local inst src dep idn
+    IFS=$'\t' read -r inst src dep idn < "$d/.pair"
     {
         cat <<EOF
-INPUT_DIR_NAME="input"
+INSTANCE_ID="$inst"
+SOURCE_DIR="$src"
+DEPLOY_DIR="$dep"
+INPUT_DIR_NAME="$idn"
 SCAN_INTERVAL=1
 RUN_DURATION=0
 MIN_STABLE_AGE=0
@@ -46,18 +50,20 @@ LOG_FORMAT="text"
 LOG_ROTATE_MAX_BYTES=10485760
 LOG_ROTATE_KEEP=7
 AUDIT_LOG=true
-TARGETS_FILE="$d/targets.tsv"
-STATE_DIR="$d/state"
-LOG_DIR="$d/logs"
-LOCK_FILE="$d/run.lock"
+STATE_DIR="$d/state/$inst"
+LOG_DIR="$d/logs/$inst"
+LOCK_FILE="$d/run-$inst.lock"
 EOF
         local kv; for kv in "$@"; do printf '%s\n' "$kv"; done
     } > "$d/conf"
 }
 
-add_target() {  # dir project env src deploy_root [idn] [scan] [enabled]
-    local d=$1 p=$2 e=$3 src=$4 dep=$5 idn=${6:--} scan=${7:--} en=${8:-true}
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$p" "$e" "$src" "$dep" "$idn" "$scan" "$en" >> "$d/targets.tsv"
+# One configuration = one source/destination pair. The instance is named
+# <project>__<env> so the log and state paths keep the shape the assertions use.
+add_target() {  # dir project env source deploy [idn] [scan] [enabled]
+    local d=$1 p=$2 e=$3 src=$4 dep=$5 idn=${6:--}
+    [[ $idn == - ]] && idn=input
+    printf '%s\t%s\t%s\t%s\n' "${p}__${e}" "$src" "$dep" "$idn" > "$d/.pair"
 }
 
 # run_shimmed <shim_dir> <case_dir> [env...]: run with a fake cp/rm ahead on
@@ -75,9 +81,9 @@ make_shim() {
 
 run() { bash "$SCRIPT" --config "$1/conf"; }
 
-oplog() { printf '%s/logs/%s__%s/operations.log' "$1" "$2" "$3"; }
+oplog() { printf '%s/logs/%s__%s/file-deploy.log' "$1" "$2" "$3"; }
 auditlog() { printf '%s/logs/%s__%s/audit.log' "$1" "$2" "$3"; }
-deployed_mark() { printf '%s/state/%s__%s.deployed' "$1" "$2" "$3"; }
+deployed_mark() { printf '%s/state/%s__%s/deployed' "$1" "$2" "$3"; }
 
 # NUL-based counts so that file names containing newlines count as one file.
 # The root sentinels are bookkeeping, never content.
@@ -125,27 +131,6 @@ title() { printf '\n== %s\n' "$1"; }
 # Tests
 # ---------------------------------------------------------------------------
 
-test_multitarget_and_isolation() {  # matrix 1,4,12,13,21
-    title "multi-target, mirror depth, log isolation, atomic deploy"
-    local d; d=$(new_case)
-    mkdir -p "$d/srcA/input" "$d/srcB/deep/nested/input"
-    echo aaa > "$d/srcA/input/a.txt"
-    echo bbb > "$d/srcB/deep/nested/input/b.txt"
-    add_target "$d" projA prod "$d/srcA" "$d/arcA"
-    add_target "$d" projB prod "$d/srcB" "$d/arcB"
-    write_conf "$d"
-    run "$d"; local rc=$?
-    assert_exit "$rc" 0 "run"
-    assert_file "$d/arcA/input/a.txt" "A mirror"
-    assert_file "$d/arcB/deep/nested/input/b.txt" "B mirror depth"
-    assert_grep "$(oplog "$d" projA prod)" 'event=DEPLOYED'
-    assert_nogrep "$(oplog "$d" projA prod)" 'project=projB' "no cross-target logs"
-    assert_nogrep "$(auditlog "$d" projA prod)" 'b.txt' "no cross-target audit trail"
-    assert_grep "$d/logs/_run.log" 'event=START'
-    assert_grep "$d/logs/_run.log" 'event=RUN_SUMMARY'
-    assert_nogrep "$d/logs/_run.log" 'event=DEPLOYED' "_run.log has no per-target events"
-    assert_eq 0 "$(find "$d/arcA" -name '*.tmp.*' | wc -l | tr -d ' ')" "no tmp residue"
-}
 
 test_defaults_inheritance() {  # matrix 2
     title "default resolution ('-' inherits INPUT_DIR_NAME)"
@@ -158,17 +143,6 @@ test_defaults_inheritance() {  # matrix 2
     assert_file "$d/arc/input/x.txt" "inherited input dir name"
 }
 
-test_enabled_false() {  # matrix 3
-    title "enabled=false target is ignored"
-    local d; d=$(new_case)
-    mkdir -p "$d/src/input"
-    echo x > "$d/src/input/x.txt"
-    add_target "$d" p e "$d/src" "$d/arc" - - false
-    write_conf "$d"
-    run "$d"
-    assert_eq 0 "$(count_files "$d/arc")" "nothing archived"
-    assert_nofile "$d/logs/p__e/operations.log" "no per-target log"
-}
 
 test_copy_and_audit() {  # matrix 5
     title "a move is recorded in the audit trail"
@@ -309,14 +283,6 @@ test_log_rotation() {  # matrix 15
     assert_file "$(oplog "$d" p e).1" "rotated file exists"
 }
 
-test_exit_config() {  # matrix 16 (config)
-    title "exit 1 on unreadable targets file"
-    local d; d=$(new_case)
-    write_conf "$d" "TARGETS_FILE=\"$d/nope.tsv\""
-    run "$d"; local rc=$?
-    assert_exit "$rc" 1 "config error"
-    assert_grep "$d/logs/_run.log" 'event=TARGETS_UNREADABLE'
-}
 
 test_exit_notarget() {  # matrix 16 (no target), 19
     title "exit 2 when the only source is missing"
@@ -373,13 +339,13 @@ test_lock_busy() {  # matrix 17
     echo x > "$d/src/input/x.txt"
     add_target "$d" p e "$d/src" "$d/arc"
     write_conf "$d"
-    ( exec 8> "$d/run.lock"; flock 8; sleep 3 ) &
+    ( exec 8> "$d/run-p__e.lock"; flock 8; sleep 3 ) &
     local holder=$!
     sleep 0.4
     run "$d"; local rc=$?
     wait "$holder" 2>/dev/null
     assert_exit "$rc" 3 "lock busy"
-    assert_grep "$d/logs/_run.log" 'event=LOCK_BUSY'
+    assert_grep "$(oplog "$d" p e)" 'event=LOCK_BUSY'
 }
 
 test_dry_run() {  # matrix 18
@@ -551,11 +517,11 @@ test_force_rediscovery() {  # manual --rediscover
     # request manual rediscovery
     bash "$SCRIPT" --rediscover --config "$d/conf"; local rc=$?
     assert_exit "$rc" 0 "--rediscover exits ok"
-    assert_file "$d/state/.force-rediscover" "marker created"
+    assert_file "$d/state/p__e/.force-rediscover" "marker created"
     run "$d"
     assert_file "$d/arc/b/input/b.txt" "discovered after --rediscover"
-    assert_nofile "$d/state/.force-rediscover" "marker consumed"
-    assert_grep "$d/logs/_run.log" 'event=FORCE_REDISCOVER'
+    assert_nofile "$d/state/p__e/.force-rediscover" "marker consumed"
+    assert_grep "$(oplog "$d" p e)" 'event=FORCE_REDISCOVER'
 }
 
 test_antioubli() {  # matrix 25
@@ -596,18 +562,6 @@ test_dirskip_disabled() {  # matrix 26
 }
 
 
-test_duplicate_target() {  # matrix 28
-    title "duplicate (project,env) rejected, first kept"
-    local d; d=$(new_case)
-    mkdir -p "$d/src/input"
-    echo x > "$d/src/input/x.txt"
-    add_target "$d" p e "$d/src" "$d/arc"
-    add_target "$d" p e "$d/src2" "$d/arc2"
-    write_conf "$d"
-    run "$d"
-    assert_grep "$d/logs/_run.log" 'event=TARGET_DUPLICATE'
-    assert_file "$d/arc/input/x.txt" "first target processed"
-}
 
 test_resilience_unreadable_file() {  # matrix 22 (resilience)
     title "an unreadable file is skipped, others still archived"
@@ -707,98 +661,11 @@ test_input_name_case_sensitive() {  # a single name stays case-sensitive
     assert_eq 1 "$(count_files "$d/arc")" "only one file"
 }
 
-test_extra_dir_basic() {  # EXTRA_DIRS: fixed source -> precise destination, depth
-    title "EXTRA_DIRS: fixed source archived to a precise destination (depth=1)"
-    local d; d=$(new_case)
-    mkdir -p "$d/special/sub/deep"
-    echo a > "$d/special/a.txt"
-    echo b > "$d/special/sub/b.txt"
-    echo c > "$d/special/sub/deep/c.txt"
-    write_conf "$d" "EXTRA_DIRS=( \$'reports\t$d/special\t$d/arcR\t1' )"
-    run "$d"
-    assert_file   "$d/arcR/a.txt"          "direct file to the precise destination"
-    assert_file   "$d/arcR/sub/b.txt"      "level-1 subdir file mirrored under dest"
-    assert_nofile "$d/arcR/sub/deep/c.txt" "level-2 beyond depth=1 ignored"
-    assert_eq 2 "$(count_files "$d/arcR")" "exactly two files"
-    assert_grep "$(oplog "$d" reports extra)" 'event=DEPLOYED'
-    assert_grep "$(auditlog "$d" reports extra)" 'a.txt'
-    assert_grep "$d/logs/_run.log" 'mode="fixed"'
-}
 
-test_extra_dir_depth0() {  # depth=0 -> only files directly in the source
-    title "EXTRA_DIRS depth=0 archives only the source's direct files"
-    local d; d=$(new_case)
-    mkdir -p "$d/special/sub"
-    echo a > "$d/special/a.txt"
-    echo b > "$d/special/sub/b.txt"
-    write_conf "$d" "EXTRA_DIRS=( \$'reports\t$d/special\t$d/arcR\t0' )"
-    run "$d"
-    assert_file   "$d/arcR/a.txt"     "direct file archived"
-    assert_nofile "$d/arcR/sub/b.txt" "subdir ignored at depth=0"
-    assert_eq 1 "$(count_files "$d/arcR")" "exactly one file"
-}
 
-test_extra_dir_unlimited() {  # depth=unlimited -> the whole subtree
-    title "EXTRA_DIRS depth=unlimited archives the whole subtree"
-    local d; d=$(new_case)
-    mkdir -p "$d/special/sub/deep"
-    echo a > "$d/special/a.txt"
-    echo b > "$d/special/sub/b.txt"
-    echo c > "$d/special/sub/deep/c.txt"
-    write_conf "$d" "EXTRA_DIRS=( \$'reports\t$d/special\t$d/arcR\tunlimited' )"
-    run "$d"
-    assert_file "$d/arcR/a.txt"          "direct file"
-    assert_file "$d/arcR/sub/b.txt"      "level-1 file"
-    assert_file "$d/arcR/sub/deep/c.txt" "deep file archived (unlimited)"
-    assert_eq 3 "$(count_files "$d/arcR")" "all three files"
-}
 
-test_extra_dir_coexist_isolation() {  # a normal target and an extra rule, isolated
-    title "EXTRA_DIRS coexists with a normal target, state isolated"
-    local d; d=$(new_case)
-    mkdir -p "$d/src/input" "$d/special"
-    echo t > "$d/src/input/t.txt"
-    echo x > "$d/special/x.txt"
-    add_target "$d" proj prod "$d/src" "$d/arc"
-    write_conf "$d" "EXTRA_DIRS=( \$'reports\t$d/special\t$d/arcR\t0' )"
-    run "$d"
-    assert_file "$d/arc/input/t.txt" "normal target still mirrors input"
-    assert_file "$d/arcR/x.txt"      "extra rule archives to its destination"
-    assert_nogrep "$(auditlog "$d" reports extra)" 't.txt'  "extra trail has no target file"
-    assert_nogrep "$(auditlog "$d" proj prod)"     'x.txt'  "target trail has no extra file"
-    assert_grep "$d/logs/_run.log" 'input="1" extra="1"'
-}
 
-test_extra_dir_idempotent_and_exclude() {  # dedup on re-run + EXCLUDE_DIR_PATTERNS honoured
-    title "EXTRA_DIRS is idempotent and honours EXCLUDE_DIR_PATTERNS"
-    local d; d=$(new_case)
-    mkdir -p "$d/special/keep" "$d/special/archived"
-    echo a > "$d/special/a.txt"
-    echo k > "$d/special/keep/k.txt"
-    echo z > "$d/special/archived/z.txt"
-    write_conf "$d" "EXTRA_DIRS=( \$'reports\t$d/special\t$d/arcR\t1' )" "EXCLUDE_DIR_PATTERNS=('*archived*')"
-    run "$d"
-    assert_file   "$d/arcR/a.txt"            "direct file"
-    assert_file   "$d/arcR/keep/k.txt"       "normal subdir kept"
-    assert_nofile "$d/arcR/archived/z.txt"   "excluded subdir pruned"
-    assert_eq 2 "$(count_files "$d/arcR")" "two files"
-    : > "$(oplog "$d" reports extra)"
-    run "$d"
-    assert_eq 2 "$(count_files "$d/arcR")" "no re-copy on second run"
-    assert_nogrep "$(oplog "$d" reports extra)" 'event=DEPLOYED' "source already drained"
-}
 
-test_extra_dir_malformed() {  # missing source/destination -> rule rejected
-    title "EXTRA_DIRS malformed rule (missing fields) is rejected"
-    local d; d=$(new_case)
-    mkdir -p "$d/special"; echo a > "$d/special/a.txt"
-    # A single field: label only, no source and no destination.
-    write_conf "$d" "EXTRA_DIRS=( 'reports' )"
-    run "$d"; local rc=$?
-    assert_grep "$d/logs/_run.log" 'event=EXTRA_MALFORMED'
-    assert_nofile "$d/arcR/a.txt" "nothing archived from a malformed rule"
-    assert_exit "$rc" 0 "run exits cleanly"
-}
 
 # ---------------------------------------------------------------------------
 # Regression tests for the review findings
@@ -838,8 +705,8 @@ test_archive_marker_adopted() {
     local d; d=$(new_case)
     mkdir -p "$d/src/input" "$d/arc/input"
     echo x > "$d/src/input/x.txt"
-    # A tree this target has deployed to before, whose marker was lost.
-    : > "$(deployed_mark "$d" p e)"
+    # A tree this configuration has deployed to before, whose marker was lost.
+    mkdir -p "$d/state/p__e"; : > "$(deployed_mark "$d" p e)"
     echo old > "$d/arc/input/gone.txt"
     add_target "$d" p e "$d/src" "$d/arc"
     write_conf "$d"
@@ -873,7 +740,7 @@ test_deep_scan_recovers_stale_mtime() {
     assert_eq 1 "$(count_files "$d/arc")" "the mtime skip hides it"
     assert_eq 1 "$(count_pending "$d/src")" "and it is still waiting in the source"
     # Make the deep pass due (deterministically, no sleep).
-    touch -d '-1 hour' "$d/state/p__e.deepscan"
+    touch -d '-1 hour' "$d/state/p__e/deepscan"
     touch -d "$pinned" "$d/src/input"
     write_conf "$d" 'DEEP_SCAN_INTERVAL=60'
     run "$d"
@@ -1068,7 +935,7 @@ test_report_csv() {
     run "$d"
     local csv; csv=$(find "$d/reports" -name '*.csv' | head -1)
     assert_file "$csv" "a dated CSV was written"
-    assert_grep "$csv" 'run_id,deployed_at,project,env,outcome' "header present"
+    assert_grep "$csv" 'run_id,deployed_at,instance,outcome' "header present"
     assert_eq 3 "$(wc -l < "$csv" | tr -d ' ')" "header + one row per file"
     assert_grep "$csv" '"DEPLOYED"'
     assert_grep "$csv" '"a.txt"'
@@ -1092,8 +959,8 @@ test_report_delimiter_and_dry_run() {
     assert_eq 0 "$(find "$d/reports" -name '*.csv' 2>/dev/null | wc -l)" "rehearsal wrote nothing"
     run "$d"
     local csv; csv=$(find "$d/reports" -name '*.csv' | head -1)
-    assert_grep "$csv" 'run_id;deployed_at;project;env' "semicolon header"
-    assert_grep "$csv" '"DEPLOYED";"x.txt"' "semicolon rows"
+    assert_grep "$csv" 'run_id;deployed_at;instance;outcome' "semicolon header"
+    assert_grep "$csv" '"p__e";"DEPLOYED";"x.txt"' "semicolon rows"
 }
 
 test_dry_run_flag() {
@@ -1110,8 +977,8 @@ test_dry_run_flag() {
     assert_eq "$before" "$(fingerprint "$d/src")" "source byte-identical"
     assert_grep "$(oplog "$d" p e)" 'event=WOULD_MOVE'
     # A rehearsal left on is indistinguishable from a run that delivers nothing.
-    assert_grep "$d/logs/_run.log" 'event=DRY_RUN_ACTIVE'
-    assert_grep "$d/logs/_run.log" 'source="--dry-run"'
+    assert_grep "$(oplog "$d" p e)" 'event=DRY_RUN_ACTIVE'
+    assert_grep "$(oplog "$d" p e)" 'source="--dry-run"'
     # The flag is applied after the config, so it cannot be overridden by it.
     run "$d"
     assert_eq 1 "$(count_files "$d/arc")" "the same command without the flag delivers"
@@ -1126,8 +993,8 @@ test_dry_run_then_real_deploys() {
     write_conf "$d" 'DRY_RUN=true'
     run "$d"
     assert_eq 0 "$(count_files "$d/arc")" "rehearsal deployed nothing"
-    assert_nofile "$d/state/p__e.leaves.tsv" "and settled no directory"
-    assert_nofile "$d/state/p__e.deepscan" "and did not consume the deep pass"
+    assert_nofile "$d/state/p__e/leaves.tsv" "and settled no directory"
+    assert_nofile "$d/state/p__e/deepscan" "and did not consume the deep pass"
     # The prescribed workflow: rehearse, then flip DRY_RUN off and run for real.
     # The rehearsal must not have recorded the pickup dir as up to date.
     write_conf "$d"
@@ -1172,8 +1039,8 @@ test_discovery_cache_config_change() {
     write_conf "$d" 'DISCOVERY_INTERVAL=99999'
     run "$d"
     assert_eq 1 "$(count_files "$d/arc")" "only 'input' discovered"
-    : > "$d/targets.tsv"
     add_target "$d" p e "$d/src" "$d/arc" "input,Input"
+    write_conf "$d" 'DISCOVERY_INTERVAL=99999'
     : > "$(oplog "$d" p e)"
     run "$d"
     assert_grep "$(oplog "$d" p e)" 'reason="config-changed"'
@@ -1194,28 +1061,7 @@ test_audit_rotation() {
     if (( sz <= 800 )); then _ok "audit.log kept bounded [$sz]"; else _no "audit.log unbounded [$sz]"; fi
 }
 
-test_target_bad_enabled() {
-    title "a target dropped by an unparsable 'enabled' column says so"
-    local d; d=$(new_case)
-    mkdir -p "$d/src/input" "$d/arc"
-    echo x > "$d/src/input/x.txt"
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' p e "$d/src" "$d/arc" - - 'oui' >> "$d/targets.tsv"
-    write_conf "$d"
-    run "$d"
-    assert_grep "$d/logs/_run.log" 'event=TARGET_BAD_ENABLED'
-    assert_eq 0 "$(count_files "$d/arc")" "target skipped, not half-processed"
-}
 
-test_target_extra_fields() {
-    title "a whitespace-split line with shifted columns is flagged"
-    local d; d=$(new_case)
-    mkdir -p "$d/src/input" "$d/arc"
-    echo x > "$d/src/input/x.txt"
-    printf 'p e %s %s input,Input 10 true extra\n' "$d/src" "$d/arc" >> "$d/targets.tsv"
-    write_conf "$d"
-    run "$d"
-    assert_grep "$d/logs/_run.log" 'event=TARGET_EXTRA_FIELDS'
-}
 
 # ---------------------------------------------------------------------------
 # Move mode: the no-loss properties
@@ -1402,14 +1248,107 @@ test_archived_dirname_still_deployed() {
 
 
 # ---------------------------------------------------------------------------
+# One configuration = one instance
+# ---------------------------------------------------------------------------
+
+test_instance_isolation() {
+    title "two configurations share nothing and run concurrently"
+    local d; d=$(new_case)
+    mkdir -p "$d/srcA/input" "$d/srcB/input"
+    echo a > "$d/srcA/input/a.txt"
+    echo b > "$d/srcB/input/b.txt"
+    # Two configurations in the same directory, distinguished only by their id.
+    add_target "$d" compta prod "$d/srcA" "$d/arcA"; write_conf "$d"; mv "$d/conf" "$d/confA"
+    add_target "$d" rh     prod "$d/srcB" "$d/arcB"; write_conf "$d"; mv "$d/conf" "$d/confB"
+    bash "$SCRIPT" --config "$d/confA" >/dev/null 2>&1
+    bash "$SCRIPT" --config "$d/confB" >/dev/null 2>&1
+    assert_file "$d/arcA/input/a.txt" "A deployed"
+    assert_file "$d/arcB/input/b.txt" "B deployed"
+    # Separate state, separate logs -- nothing to mix up.
+    assert_file "$d/state/compta__prod/deployed" "A has its own state"
+    assert_file "$d/state/rh__prod/deployed"     "B has its own state"
+    assert_nogrep "$(oplog "$d" compta prod)" 'b.txt' "A's log has none of B"
+    assert_nogrep "$(oplog "$d" rh prod)"     'a.txt' "B's log has none of A"
+    # Separate locks, so one does not serialise behind the other.
+    assert_file "$d/run-compta__prod.lock"
+    assert_file "$d/run-rh__prod.lock"
+}
+
+test_state_dir_conflict() {
+    title "two configurations pointed at one state dir are refused"
+    local d; d=$(new_case)
+    mkdir -p "$d/srcA/input" "$d/srcB/input"
+    echo a > "$d/srcA/input/a.txt"
+    echo b > "$d/srcB/input/b.txt"
+    # Default paths make this impossible; force it by overriding STATE_DIR.
+    add_target "$d" compta prod "$d/srcA" "$d/arcA"
+    write_conf "$d" "STATE_DIR=\"$d/shared\""; mv "$d/conf" "$d/confA"
+    add_target "$d" rh prod "$d/srcB" "$d/arcB"
+    write_conf "$d" "STATE_DIR=\"$d/shared\""; mv "$d/conf" "$d/confB"
+    bash "$SCRIPT" --config "$d/confA" >/dev/null 2>&1
+    local out rc
+    out=$(bash "$SCRIPT" --config "$d/confB" 2>&1); rc=$?
+    assert_exit "$rc" 1 "config error"
+    assert_grep "$(oplog "$d" rh prod)" 'event=STATE_DIR_CONFLICT'
+    # Refused before anything moved: mixing two instances' caches would make
+    # each one mistake the other's "already deployed here" marker for its own.
+    assert_file "$d/srcB/input/b.txt" "nothing taken from the second source"
+    assert_eq 0 "$(count_files "$d/arcB")" "nothing deployed"
+}
+
+test_instance_id_defaults_to_config_name() {
+    title "INSTANCE_ID defaults to the configuration file's base name"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/input"
+    echo x > "$d/src/input/x.txt"
+    add_target "$d" p e "$d/src" "$d/arc"; write_conf "$d"
+    # Drop the explicit id and every path override, then rename the file: the id
+    # must follow the file, and the paths must follow the id. The script is
+    # copied into the sandbox because the defaults hang off ITS directory.
+    grep -v '^INSTANCE_ID=' "$d/conf" | grep -v '^STATE_DIR=' | grep -v '^LOG_DIR=' \
+        | grep -v '^LOCK_FILE=' > "$d/facturation.conf"
+    cp "$SCRIPT" "$d/file-deploy.sh"
+    bash "$d/file-deploy.sh" --config "$d/facturation.conf" >/dev/null 2>&1
+    assert_file "$d/arc/input/x.txt" "deployed"
+    assert_grep "$d/logs/facturation/file-deploy.log" 'instance=facturation'
+    assert_file "$d/state/facturation/deployed" "state named after the config"
+}
+
+test_missing_source_or_deploy() {
+    title "a configuration without both directories is refused"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/input"
+    add_target "$d" p e "$d/src" "$d/arc"; write_conf "$d"
+    local out rc
+    out=$(grep -v '^DEPLOY_DIR=' "$d/conf" > "$d/half.conf"; bash "$SCRIPT" --config "$d/half.conf" 2>&1); rc=$?
+    assert_exit "$rc" 1 "config error"
+    case $out in
+        *"SOURCE_DIR and DEPLOY_DIR must both be set"*) _ok "names what is missing" ;;
+        *) _no "clear message, got: [$out]" ;;
+    esac
+}
+
+test_invalid_instance_id() {
+    title "an unusable INSTANCE_ID stops the run"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/input"
+    add_target "$d" p e "$d/src" "$d/arc"; write_conf "$d" 'INSTANCE_ID="../escape"'
+    local out rc
+    out=$(run "$d" 2>&1); rc=$?
+    assert_exit "$rc" 1 "config error"
+    case $out in
+        *"Invalid INSTANCE_ID"*) _ok "names the offending value" ;;
+        *) _no "clear message, got: [$out]" ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
 # Run all
 # ---------------------------------------------------------------------------
 main() {
     [[ -f $SCRIPT ]] || { printf 'Script not found: %s\n' "$SCRIPT" >&2; exit 2; }
 
-    test_multitarget_and_isolation
     test_defaults_inheritance
-    test_enabled_false
     test_copy_and_audit
     test_idempotence_and_dirskip
     test_versioning_and_revert
@@ -1417,7 +1356,6 @@ main() {
     test_source_drained
     test_json_logging
     test_log_rotation
-    test_exit_config
     test_exit_notarget
     test_exit_archive_error
     test_lock_busy
@@ -1434,17 +1372,10 @@ main() {
     test_force_rediscovery
     test_antioubli
     test_dirskip_disabled
-    test_duplicate_target
     test_resilience_unreadable_file
     test_multiple_input_names
     test_input_name_comma_separated
     test_input_name_case_sensitive
-    test_extra_dir_basic
-    test_extra_dir_depth0
-    test_extra_dir_unlimited
-    test_extra_dir_coexist_isolation
-    test_extra_dir_idempotent_and_exclude
-    test_extra_dir_malformed
     test_copy_failed_midtree
     test_input_name_with_space
     test_input_name_no_globs
@@ -1464,14 +1395,17 @@ main() {
     test_conflict_retry
     test_report_csv
     test_report_delimiter_and_dry_run
+    test_instance_isolation
+    test_state_dir_conflict
+    test_instance_id_defaults_to_config_name
+    test_missing_source_or_deploy
+    test_invalid_instance_id
     test_dry_run_flag
     test_dry_run_then_real_deploys
     test_verbose_flag_wins
     test_config_missing_value
     test_discovery_cache_config_change
     test_audit_rotation
-    test_target_bad_enabled
-    test_target_extra_fields
     test_local_archive_not_rescanned
     test_pickup_dir_unwritable
     test_source_stuck_exit5

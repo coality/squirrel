@@ -1,60 +1,100 @@
-# file-deploy.conf — global defaults, sourced by file-deploy.sh
-# Copy this file to file-deploy.conf and adjust. Values here are the defaults
-# applied to a target whenever its column in targets.tsv is empty or "-".
+# file-deploy.conf — one configuration, one source, one destination.
+#
+# Copy this file and adjust. To handle another source/destination pair, write
+# another configuration file and give it its own run:
+#
+#   file-deploy.sh --config /etc/file-deploy/compta-prod.conf
+#   file-deploy.sh --config /etc/file-deploy/rh-homol.conf
+#
+# WARNING: this tool DELETES from the source. Rehearse with --dry-run first.
 
-# --- Defaults applied per target when the column is "-" ---
-INPUT_DIR_NAME="input"          # EXACT name(s) of the scanned directory. Several exact,
-                                # case-sensitive names allowed, separated by COMMAS,
-                                # e.g. "input,Input,input_". 'input' alone does NOT match
-                                # 'Input' — list each variant. Names are matched literally
-                                # (no globs: "input*" matches a directory really called
-                                # "input*", not "input_old") and MAY CONTAIN SPACES, e.g.
-                                # "Input Files,input" — which is why only commas separate.
-SCAN_INTERVAL=2                 # seconds between scan passes (small = better capture;
-                                # idle passes only stat directories, so this stays cheap)
+# ===========================================================================
+# Identity — read this first
+# ===========================================================================
+# Names this configuration in the logs and in the CSV report, AND is what the
+# state, log and lock paths are derived from. That is what makes it impossible
+# for two configurations to trample each other's state.
+#
+# Defaults to this file's base name (compta-prod.conf -> "compta-prod").
+# Allowed characters: letters, digits, . _ -
+INSTANCE_ID="compta-prod"
 
-# --- Execution ---
-# Continuous mode: the script loops for RUN_DURATION seconds, scanning every
-# SCAN_INTERVAL, so there is no per-minute gap. Keep it high; a cron entry every
-# minute just restarts it if it died, and the internal flock guarantees a single
-# instance. See README "Run with cron".
-RUN_DURATION=86400              # ~24h continuous loop, then it recycles (cron restarts it)
-# SAFETY SETTING. A file is only taken out of the source once it has been
-# untouched for this long. 0 is safe ONLY if you can prove every producer
-# publishes atomically (writes elsewhere, then renames into 'input'). Windows
-# Explorer copies, SMB clients, rsync without --partial-dir, scanners and ERP
-# exports usually do NOT. Size it as the longest plausible write plus clock
-# skew; it costs latency, not throughput. The size+mtime re-check performed
-# immediately before the move is the backstop, this is the tuning knob.
+# ===========================================================================
+# What to drain, and where to
+# ===========================================================================
+# SOURCE_DIR is a ROOT: file-deploy looks under it for directories named
+# INPUT_DIR_NAME, at any depth, and drains those. DEPLOY_DIR receives the same
+# tree, relative paths included:
+#
+#   SOURCE_DIR/projA/input/facture.xml  ->  DEPLOY_DIR/projA/input/facture.xml
+#   SOURCE_DIR/projB/input/sub/bl.txt   ->  DEPLOY_DIR/projB/input/sub/bl.txt
+#
+# Both are required. Absolute paths.
+SOURCE_DIR="/mnt/nas/compta"
+DEPLOY_DIR="/mnt/nas/deploy/compta"
+
+# EXACT name(s) of the directories to drain under SOURCE_DIR. Several allowed,
+# separated by COMMAS only, e.g. "input,Input,input_" — 'input' alone does NOT
+# match 'Input'. Names are matched literally (no globs: "input*" matches a
+# directory really called "input*", not "input_old") and MAY CONTAIN SPACES,
+# e.g. "Input Files,input" — which is why the comma is the only separator.
+#
+# Files taken: those directly inside each input directory, and those directly
+# inside its direct sub-directories. Nothing deeper.
+INPUT_DIR_NAME="input"
+
+# ===========================================================================
+# Safety
+# ===========================================================================
+# A file is only taken once it has been untouched for this long. 0 is safe ONLY
+# if you can prove every producer publishes atomically (writes elsewhere, then
+# renames into place). Windows Explorer copies, SMB clients, rsync without
+# --partial-dir, scanners and ERP exports usually do NOT. Size it as the longest
+# plausible write plus clock skew; it costs latency, not throughput. The
+# size+mtime re-check performed immediately before the move is the backstop,
+# this is the tuning knob.
 MIN_STABLE_AGE=10
-# Sentinel file at the root of every deploy_root. It is what tells a mounted
-# deployment share apart from a bare, unmounted mount point: without it, an
-# unmounted destination would be filled on the local disk, every file would then
-# be moved out of the source because of it, and on remount the tree would be
-# empty and the sources gone. The script creates the marker itself (on the first
-# run for a target, or by adopting a pre-existing tree); a missing marker on a
-# target that has deployed here before is refused with DEPLOY_UNAVAILABLE and
-# exit 4. "" disables the check -- strongly discouraged on a mounted share.
+
+# Simulate: log a WOULD_MOVE line per file with the deployment verdict and the
+# archive path, without writing or deleting anything. --dry-run does the same
+# from the command line and is preferred: it cannot be left switched on by
+# accident. Whenever it is active the run logs DRY_RUN_ACTIVE at WARN.
+DRY_RUN=false
+
+# Sentinel file at the root of DEPLOY_DIR. It is what tells a mounted deployment
+# share apart from a bare, unmounted mount point: without it, an unmounted
+# destination would be filled on the local disk, every file would then be moved
+# out of the source because of it, and on remount the tree would be empty and
+# the sources gone. The script creates the marker itself (on the first run, or
+# by adopting a pre-existing tree); a missing marker on a configuration that has
+# deployed here before is refused with DEPLOY_UNAVAILABLE and exit 4.
+# "" disables the check -- strongly discouraged on a mounted share.
 DEPLOY_MARKER=".file-deploy-root"
 
 # Name of the archive directory created next to each file taken out of the
-# source: <pickup dir>/<name>/<file>. Matched EXACTLY (case-sensitive, no
-# globs) and pruned from every walk, so file-deploy never re-deploys its own
-# output -- which also means a directory of this name is never deployed. Rename
-# it here if that collides with a real directory in your tree. "" disables the
-# local archive entirely: moved files then exist only in the deployment tree.
+# source: <pickup dir>/<name>/<file>. Matched EXACTLY (case-sensitive, no globs)
+# and pruned from every walk, so file-deploy never re-deploys its own output --
+# which also means a directory of this name is never deployed. Rename it here if
+# that collides with a real directory in your tree. "" disables the local
+# archive entirely: moved files then exist only in the deployment tree.
 LOCAL_ARCHIVE_DIR="archive"
 
-# --- What to do when the destination already holds a DIFFERENT file ---
-#
+# Content hash, used to verify every copy before it is published and to name
+# archive entries. Single word, must accept a file path and print the digest
+# first (sha256sum, sha1sum, md5sum, b2sum...).
+HASH_CMD="sha256sum"
+
+# ===========================================================================
+# What to do when the destination already holds a DIFFERENT file
+# ===========================================================================
 # Identical content is never a conflict: nothing is rewritten, and the source
 # file is archived and drained either way. This setting only decides what
-# happens when <deploy_root>/<same relative path> exists with a different hash.
+# happens when DEPLOY_DIR/<same relative path> exists with a different hash.
 #
 #   overwrite  Replace the deployed file. The version it replaced is NOT lost:
 #              the incoming file is archived locally, and the audit line records
-#              the digest that was replaced (prev_hash=). This is the default
-#              and the right choice when the source is authoritative.
+#              the digest that was replaced (prev_hash=). Right when the source
+#              is authoritative.
 #
 #   version    Deploy alongside instead of replacing: the existing file is kept
 #              and the incoming one lands next to it as
@@ -66,31 +106,74 @@ LOCAL_ARCHIVE_DIR="archive"
 #              still archived locally and drained from the pickup directory, so
 #              nothing is lost and nothing piles up -- but the deployed file
 #              stays stale. Logged at WARN (DEPLOY_SKIPPED) on every collision.
-#              Use when the destination is authoritative and re-deliveries are
-#              expected noise.
+#              Use when the destination is authoritative.
 #
-#   fail       Refuse. The source file is KEPT in its pickup directory, nothing
-#              is archived, an ERROR is logged (DEPLOY_CONFLICT) and the run
-#              exits 4. Use when a collision means something upstream is wrong
-#              and a human must look. Note the file is retried every cycle until
-#              the collision is resolved.
+#   retry      Leave BOTH sides alone and keep the source file where it is, to
+#              be retried every cycle until the collision clears by itself --
+#              typically when a downstream consumer takes the deployed file
+#              away. WARN once per run (DEPLOY_RETRY), exit 0. Note the file is
+#              re-hashed on every cycle until it resolves.
+#
+#   fail       Refuse. The source file is KEPT, nothing is archived, an ERROR is
+#              logged (DEPLOY_CONFLICT) and the run exits 4. Use when a
+#              collision means something upstream is wrong and a human must look.
 #
 # Examples
 #   ON_CONFLICT="overwrite"   # source wins; history kept in the local archive
 #   ON_CONFLICT="version"     # keep both sides, never clobber anything
 #   ON_CONFLICT="skip"        # destination wins; drain the source anyway
+#   ON_CONFLICT="retry"       # wait for the destination to clear, keep the file
 #   ON_CONFLICT="fail"        # stop and alert; keep the source file untouched
 #
-# Whatever the policy, a rehearsal (--dry-run) reports the exact verdict it
-# would apply, per file, in the WOULD_MOVE line's deploy= field.
+# An unrecognised value stops the run (exit 1) rather than guessing. Whatever
+# the policy, --dry-run reports the exact verdict it would apply, per file, in
+# the WOULD_MOVE line's deploy= field.
 ON_CONFLICT="overwrite"
 
-# --- CSV report, for BI tools ---
-#
+# ===========================================================================
+# Scanning
+# ===========================================================================
+# Seconds between scan passes. Small is fine: an idle pass only stats the input
+# directories, it does not list them.
+SCAN_INTERVAL=2
+
+# Continuous mode: the script loops for RUN_DURATION seconds, scanning every
+# SCAN_INTERVAL, so there is no per-minute gap. Keep it high; a cron entry every
+# minute just restarts it if it died, and the flock guarantees a single instance
+# per INSTANCE_ID. See README "Run with cron".
+RUN_DURATION=86400
+
+# Locating the input directories is a full-tree walk, so it is cached and only
+# redone every DISCOVERY_INTERVAL seconds (or on --rediscover, or when the
+# settings that shape the walk change). Lower it if new input directories appear
+# often.
+DISCOVERY_INTERVAL=1800
+# Cap the discovery walk depth (0 = unlimited); set it if the input directories
+# sit at a known depth, e.g. 6.
+DISCOVERY_MAXDEPTH=0
+
+# Skip a directory whose mtime has not changed since the last pass.
+USE_DIR_MTIME_SKIP=true
+# The skip above trusts the share to bump a directory's mtime when a file is
+# added. Every DEEP_SCAN_INTERVAL seconds one pass ignores the skip and lists
+# everything, which recovers a share that does not. It is cheap: a drained
+# pickup directory is the steady state. 0 = off, and a share with unreliable
+# directory mtimes then hides new files indefinitely.
+DEEP_SCAN_INTERVAL=300
+
+# Directory-name patterns (case-insensitive globs) to ignore anywhere in the
+# tree. A matching directory is skipped and never descended into. Useful for a
+# producer's staging directories. Bash array; empty = off.
+EXCLUDE_DIR_PATTERNS=()
+# EXCLUDE_DIR_PATTERNS=('~*' '*.tmp' '*en_cours*')
+
+# ===========================================================================
+# CSV report, for BI tools
+# ===========================================================================
 # When set, every file that actually moved appends one row to
 #   <REPORT_DIR>/file-deploy-<YYYY-MM-DD>.csv
-# One file per day, all targets in it, header written when the file is created.
-# Point Power BI (or anything else) at the DIRECTORY and let it append the lot:
+# One file per day, header written when the file is created. Point Power BI (or
+# anything else) at the DIRECTORY and let it append the lot:
 #   Get Data > Folder > <REPORT_DIR> > Combine & Transform
 #
 # Nothing is written during a rehearsal: --dry-run stays inert.
@@ -98,7 +181,7 @@ ON_CONFLICT="overwrite"
 # Columns
 #   run_id            correlates a row with the run that produced it (see logs)
 #   deployed_at       when the move completed, ISO-8601 with timezone
-#   project, env      the target -- what you slice by
+#   instance          the INSTANCE_ID of the configuration that produced it
 #   outcome           DEPLOYED | DEPLOYED_OVERWRITE | DEPLOYED_VERSION
 #                     | DEPLOYED_IDENTICAL | DEPLOY_SKIPPED
 #   file_name         base name only
@@ -112,16 +195,18 @@ ON_CONFLICT="overwrite"
 #                     use to retrieve the file afterwards
 #   size_bytes        integer
 #   hash              full digest of the content ($HASH_CMD)
-#   prev_hash         digest that was replaced, on an overwrite; empty otherwise
-#   source_modified   the file's mtime. NOTE: on Linux this is the closest thing
-#                     to a reliable "creation date" -- see below
+#   prev_hash         digest that was already at the destination when there was a
+#                     collision; empty otherwise. It chains to an earlier row's
+#                     hash, so a self-join rebuilds a path's whole history.
+#   source_modified   the file's mtime. On Linux this is the closest thing to a
+#                     reliable "creation date" -- see below
 #   source_created    real birth time when the filesystem records one. ext4 and
 #                     xfs usually do; CIFS/SMB mounts usually do NOT, and the
-#                     column is then EMPTY. Do not build a report on it without
-#                     checking your share first; use source_modified instead.
+#                     column is then EMPTY. Check your share before building on
+#                     it (stat -c '%w' somefile); use source_modified instead.
 #   age_at_pickup_s   how long the file sat in the pickup directory before being
 #                     taken (now - mtime). A latency KPI: a rising curve means
-#                     the scan interval or MIN_STABLE_AGE is too high, or the
+#                     SCAN_INTERVAL or MIN_STABLE_AGE is too high, or the
 #                     producer writes slowly.
 #   pickup_dir        absolute directory it came from -- group by supplier/site
 #   host              machine that ran it, for multi-host deployments
@@ -131,74 +216,39 @@ ON_CONFLICT="overwrite"
 # left bare so they type cleanly on import.
 #
 # Examples
-#   REPORT_DIR=""                      # off (default)
+#   REPORT_DIR=""                            # off (default)
 #   REPORT_DIR="/var/log/file-deploy/reports"
-#   REPORT_DIR="/mnt/nas/bi/file-deploy"   # drop it where Power BI already looks
-#
-# Field separator. Power BI and Excel in a French locale often expect ";".
-#   REPORT_DELIMITER=","
-#   REPORT_DELIMITER=";"
+#   REPORT_DIR="/mnt/nas/bi/file-deploy"     # where Power BI already looks
 REPORT_DIR=""
+
+# Field separator. Power BI and Excel in a French locale often expect ";".
 REPORT_DELIMITER=","
-HASH_CMD="sha256sum"            # content hash command
-DRY_RUN=false                   # true = simulate, copy nothing
-# TARGETS_FILE defaults to <script directory>/targets.tsv; set an absolute path to override:
-# TARGETS_FILE="/opt/file-deploy/targets.tsv"
 
-# --- Discovery & I/O (minimise disk access) ---
-DISCOVERY_INTERVAL=1800         # seconds between full-tree rediscoveries of input dirs
-DISCOVERY_MAXDEPTH=0            # cap the discovery walk depth (0 = unlimited); set it if input dirs
-                                # sit at a bounded depth to speed up discovery, e.g. 6
-USE_DIR_MTIME_SKIP=true         # skip a directory whose mtime has not changed
-# The skip above trusts the share to bump a directory's mtime when a file is
-# added. Every DEEP_SCAN_INTERVAL seconds one pass ignores the skip and lists
-# everything, which recovers a share that does not. It is cheap: a drained
-# pickup directory is the steady state. 0 = off, and a share with unreliable
-# directory mtimes then hides new files indefinitely.
-DEEP_SCAN_INTERVAL=300          # seconds between passes that ignore the mtime skip
-# Directory-name patterns (case-insensitive globs) to ignore anywhere in the tree.
-# A matching directory is skipped and never descended into. Bash array; empty = off.
-EXCLUDE_DIR_PATTERNS=()
-# EXCLUDE_DIR_PATTERNS=('*archived*' '*archive*' '*.bak')
-
-# --- Extra directories: specific source -> specific destination rules ---
-# Besides the automatic discovery of "input" directories (driven by targets.tsv),
-# you can archive one or more SPECIFIC directories to a SPECIFIC destination, with
-# no discovery at all. Each rule is one array element, TAB-separated (like
-# targets.tsv, so paths may contain spaces):
-#
-#     label <TAB> source <TAB> destination <TAB> depth
-#
-#   - label        identity of the rule; its state and logs live under
-#                  "<label>__extra" (state/<label>__extra.*,
-#                  logs/<label>__extra/). Must be unique.
-#   - source       the exact directory to drain (a fixed path; no "input" lookup).
-#   - destination  where its content is mirrored: <source>/sub/f -> <destination>/sub/f.
-#   - depth        0  = only files directly in <source>;
-#                  N  = also N sub-levels deep (1 = like the input scanner);
-#                  -1 = the whole subtree (aliases: unlimited, inf, all).
-#                  Empty or "-" defaults to 1.
-#
-# The same engine applies: the MOVE (files are drained into a local archive),
-# stability, EXCLUDE_DIR_PATTERNS, DRY_RUN, per-rule logging and audit trail.
-# Bash array; empty = no extra directories. Tip: write real TABs, or use $'...\t...'.
-EXTRA_DIRS=()
-# EXTRA_DIRS=(
-#   $'reports\t/mnt/nas/app/reports\t/mnt/nas/archive/reports\t2'
-#   $'daily\t/mnt/nas/daily out\t/mnt/nas/archive/daily\t0'
-#   $'everything\t/mnt/nas/app/exports\t/mnt/nas/archive/exports\tunlimited'
-# )
-
-# --- Logging ---
-LOG_LEVEL="INFO"                # DEBUG | INFO | WARN | ERROR  (DEBUG = maximum detail)
-LOG_FORMAT="text"               # text (key=value) | json (JSON lines)
+# ===========================================================================
+# Logging
+# ===========================================================================
+LOG_LEVEL="INFO"                # DEBUG | INFO | WARN | ERROR
+LOG_FORMAT="text"               # text (key=value) or json
+LOG_CONSOLE="auto"              # auto (mirror to the terminal when interactive)
+                                # | always | never
 LOG_ROTATE_MAX_BYTES=10485760   # rotate a log past 10 MB (0 = never)
 LOG_ROTATE_KEEP=7               # number of rotated files kept
-AUDIT_LOG=true                  # write a separate append-only audit log per target
-LOG_CONSOLE="auto"              # mirror log lines to the terminal: auto (only when interactive) | always | never
-HEARTBEAT_INTERVAL=60           # seconds between periodic "still alive" summaries in _run.log (0 = off)
+AUDIT_LOG=true                  # append-only trail of what moved
+HEARTBEAT_INTERVAL=60           # seconds between "still alive" summaries (0 = off)
 
-# --- Paths (optional; derived from the script directory if unset) ---
-# STATE_DIR="/opt/file-deploy/state"
-# LOG_DIR="/opt/file-deploy/logs"
-# LOCK_FILE="/opt/file-deploy/run.lock"
+# ===========================================================================
+# Paths — optional
+# ===========================================================================
+# All three default to something derived from INSTANCE_ID, which is why two
+# configurations cannot collide:
+#
+#   STATE_DIR  <script dir>/state/<INSTANCE_ID>
+#   LOG_DIR    <script dir>/logs/<INSTANCE_ID>
+#   LOCK_FILE  <script dir>/run-<INSTANCE_ID>.lock
+#
+# Override them only to put them elsewhere, and keep them distinct per
+# configuration: a shared STATE_DIR is refused at startup (STATE_DIR_CONFLICT),
+# but a shared LOCK_FILE would silently serialise two configurations instead.
+# STATE_DIR="/var/lib/file-deploy/compta-prod"
+# LOG_DIR="/var/log/file-deploy/compta-prod"
+# LOCK_FILE="/run/file-deploy-compta-prod.lock"

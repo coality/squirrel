@@ -42,51 +42,75 @@ assumed to already exist; mounting it is out of scope.
 ## Install
 
 ```sh
-cp file-deploy.conf.example file-deploy.conf
-cp targets.tsv.example  targets.tsv
-# edit both to match your environment
+cp file-deploy.conf.example compta-prod.conf
+# edit it to match your environment
 ```
 
-`logs/` and `state/` are created on first run.
+`logs/` and `state/` are created on first run, namespaced by `INSTANCE_ID`.
 
 ## Configure
 
-Two files, both documented inline:
+**One configuration file describes one pair**: a source root and a deployment
+root. To handle another pair, write another file and give it its own run.
 
-- **`file-deploy.conf`** — global defaults. Every key is explained in
-  [`file-deploy.conf.example`](file-deploy.conf.example); the full table is in
-  [SPEC.md §9](SPEC.md#9--configuration).
-- **`targets.tsv`** — one **tab-separated** line per `(project, env)`:
+```sh
+cp file-deploy.conf.example compta-prod.conf
+```
 
-  ```
-  project ⇥ env ⇥ source_root ⇥ deploy_root ⇥ input_dir_name ⇥ scan_interval ⇥ enabled
-  ```
+The four settings that matter:
 
-  Use `-` to inherit the global default. Tabs matter: a space-aligned line is
-  split on whitespace, which shifts every column after a value containing one.
+```sh
+INSTANCE_ID="compta-prod"                 # identity; everything hangs off it
+SOURCE_DIR="/mnt/nas/compta"              # root searched for input/ directories
+DEPLOY_DIR="/mnt/nas/deploy/compta"       # root receiving the mirror
+MIN_STABLE_AGE=10                         # safety: see below
+```
 
-The three settings worth deciding before you start:
+`SOURCE_DIR` is a **root**, not the pickup directory: file-deploy looks under it
+for directories named `INPUT_DIR_NAME` (`input` by default) at any depth, and
+drains those. The deployment tree receives the same relative paths.
+
+```
+SOURCE_DIR/projA/input/facture.xml  ->  DEPLOY_DIR/projA/input/facture.xml
+SOURCE_DIR/projB/input/sub/bl.txt   ->  DEPLOY_DIR/projB/input/sub/bl.txt
+```
+
+`INSTANCE_ID` is what makes two configurations independent: the state, log and
+lock paths are derived from it, so they cannot collide and two configurations
+run in parallel rather than serialising.
+
+```
+state/compta-prod/   logs/compta-prod/   run-compta-prod.lock
+state/rh-homol/      logs/rh-homol/      run-rh-homol.lock
+```
+
+Override `STATE_DIR`, `LOG_DIR` and `LOCK_FILE` only to move them elsewhere, and
+keep them distinct per configuration — a shared `STATE_DIR` is refused at
+startup, but a shared `LOCK_FILE` would silently serialise instead.
+
+The rest is documented inline in
+[`file-deploy.conf.example`](file-deploy.conf.example); the full table is in
+[SPEC.md §9](SPEC.md#9--configuration). The three worth deciding before you
+start:
 
 | Setting | Why it matters |
 |---|---|
 | `MIN_STABLE_AGE` | **Safety.** A file is only taken once untouched for this long. `0` is safe only if every producer writes elsewhere and renames into place — most NAS producers do not. See [SPEC.md §8.3](SPEC.md#83-stability-and-in-place-writes). |
-| `LOCAL_ARCHIVE_DIR` | Name of the archive created beside each drained file (default `archive`). It is matched exactly and pruned from every walk, so a directory of that name is never deployed. Rename it if that collides with a real directory in your tree. |
-| `DEPLOY_MARKER` | Sentinel guarding each `deploy_root`. Leave it on: it is what stops an unmounted destination from draining your source into nothing. |
-| `ON_CONFLICT` | What to do when the destination already holds the same path with **different** content: `overwrite` (default, source wins), `version` (keep both), `skip` (destination wins, source still drained), `retry` (leave both, try again next cycle), `fail` (keep the source, exit 4). Identical content is never a conflict. Fully documented in [`file-deploy.conf.example`](file-deploy.conf.example). |
+| `ON_CONFLICT` | What to do when the destination already holds the same path with **different** content: `overwrite` (default, source wins), `version` (keep both), `skip` (destination wins, source still drained), `retry` (leave both, try again next cycle), `fail` (keep the source, exit 4). Identical content is never a conflict. |
 | `REPORT_DIR` | Set it to get one CSV row per file moved, one file per day, ready for a BI tool. See [Reporting](#reporting). |
 
 ## Rehearse, then enable
 
 ```sh
 # 1. rehearse: nothing is written, nothing is deleted
-./file-deploy.sh --config file-deploy.conf --once --dry-run --verbose
+./file-deploy.sh --config compta-prod.conf --once --dry-run --verbose
 
 # 2. read every WOULD_MOVE line: the relative path, the deployment verdict
 #    (DEPLOYED / DEPLOYED_OVERWRITE / DEPLOYED_IDENTICAL) and the archive path
 grep WOULD_MOVE logs/*/operations.log
 
 # 3. same command without --dry-run, for real
-./file-deploy.sh --config file-deploy.conf --once --verbose
+./file-deploy.sh --config compta-prod.conf --once --verbose
 ```
 
 `--dry-run` is the flag form of `DRY_RUN=true`; the flag is applied after the
@@ -96,7 +120,7 @@ anything. Whenever it is active — from either source — the run logs
 `DRY_RUN_ACTIVE` at `WARN` so monitoring can catch it.
 
 Check the result: the pickup directory holds only `archive/`, the deployment
-tree mirrors it, and `state/<project>__<env>.deployed` exists.
+tree mirrors it, and `state/<INSTANCE_ID>/deployed` exists.
 
 ## Run with cron
 
@@ -105,8 +129,11 @@ The scanner runs **continuously** — an internal loop scanning every
 acts as a **watchdog**: if the process dies the next tick restarts it, and the
 internal `flock` guarantees a single instance. No root, no systemd.
 
+One entry per configuration; they run in parallel, each with its own lock.
+
 ```cron
-* * * * * /opt/file-deploy/file-deploy.sh --config /opt/file-deploy/file-deploy.conf >> /opt/file-deploy/logs/cron.err 2>&1
+* * * * * /opt/file-deploy/file-deploy.sh --config /opt/file-deploy/compta-prod.conf >> /opt/file-deploy/cron.err 2>&1
+* * * * * /opt/file-deploy/file-deploy.sh --config /opt/file-deploy/rh-homol.conf   >> /opt/file-deploy/cron.err 2>&1
 ```
 
 With `RUN_DURATION` set high (e.g. 24 h) the loop recycles about once a day. The
@@ -116,13 +143,12 @@ only. `cron.err` should stay empty; anything in it is a real crash.
 ## Logs and troubleshooting
 
 ```
-logs/_run.log                        orchestration: start, targets, heartbeat, summary
-logs/<project>__<env>/operations.log everything about one target
-logs/<project>__<env>/audit.log      append-only trail of what moved, with outcome and hashes
+logs/<INSTANCE_ID>/file-deploy.log   everything: startup, per-file events, heartbeat, summary
+logs/<INSTANCE_ID>/audit.log         append-only trail of what moved, with outcome and hashes
 ```
 
-Every line carries `run=` to correlate an execution, and target lines carry
-`project=`, `env=` and `cycle=`. `LOG_FORMAT=json` emits the same fields as JSON.
+Every line carries `run=` to correlate an execution and `instance=` to name the
+configuration. `LOG_FORMAT=json` emits the same fields as JSON.
 
 **Nothing is being deployed?** Run `--once --debug`, which turns on every event
 and mirrors it to the terminal. The likely answers, in order:
@@ -141,7 +167,7 @@ and mirrors it to the terminal. The likely answers, in order:
 `SOURCE_NOT_WRITABLE` and `MOUNT_MISSING`, and on `errors=` in `RUN_SUMMARY`.
 
 Exit codes: `0` success · `1` config error · `2` no usable target · `3` lock
-busy (expected from the watchdog) · `4` a deployment write failed · `5` a file
+busy, same configuration already running · `4` a deployment write failed · `5` a file
 was deployed but could not leave the source. **`4` means data was not
 delivered; `5` means it was delivered but the source is filling up.** Both
 deserve their own alert.
@@ -179,7 +205,7 @@ Nothing is written during a rehearsal, so `--dry-run` stays inert.
 - **Permissions**: the cron user needs read access to the source, **write**
   access to each pickup directory (unlinking a file needs `w+x` on its parent)
   and to each `deploy_root`. No root required.
-- **State lives in `state/`** and none of it is required for correctness — see
+- **State lives in `STATE_DIR`** and none of it is required for correctness — see
   [SPEC.md §11](SPEC.md#11--persistent-state).
 
 ## Testing

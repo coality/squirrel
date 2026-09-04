@@ -19,7 +19,8 @@
 #   - The deployment tree mirrors the source and holds the CURRENT state: a
 #     redeployment overwrites (and says so). Timestamped versions accumulate in
 #     the local archive, not in the deployment tree.
-#   - Several targets (project x environment) are described in targets.tsv.
+#   - One configuration = one source root and one deployment root. To handle
+#     another pair, write another configuration file and give it its own run.
 #   - Per-target logging (operations + audit); orchestration events go to _run.log.
 #   - Minimal disk I/O: input directory locations are cached and only rediscovered
 #     periodically; unchanged directories (same mtime) are skipped without listing.
@@ -45,8 +46,8 @@ set -uo pipefail
 # Exit codes
 # ---------------------------------------------------------------------------
 readonly EX_OK=0        # success
-readonly EX_CONFIG=1    # configuration error (config / targets unreadable)
-readonly EX_NOTARGET=2  # no usable target (all sources missing/unreadable)
+readonly EX_CONFIG=1    # configuration error (bad or incomplete configuration)
+readonly EX_NOSOURCE=2  # the source directory is missing, unreadable or not writable
 readonly EX_LOCKED=3    # another instance holds the lock (non-fatal)
 readonly EX_DEPLOY=4    # at least one deploy/archive write failed (destination broken)
 readonly EX_SOURCE=5    # at least one source file could not be removed (source fills up)
@@ -105,16 +106,28 @@ AUDIT_LOG=true
 LOG_CONSOLE="auto"      # auto (mirror to terminal when interactive) | always | never
 HEARTBEAT_INTERVAL=60   # seconds between periodic "still alive" summaries (0 = off)
 EXCLUDE_DIR_PATTERNS=() # case-insensitive glob patterns of directory names to ignore (empty = none)
-EXTRA_DIRS=()          # explicit "label<TAB>source<TAB>destination<TAB>depth" rules (see file-deploy.conf.example)
+
+# The pair this configuration drains. One configuration = one source root and
+# one deployment root, mirroring each other. To handle another pair, write
+# another configuration file and give it its own run.
+SOURCE_DIR=""
+DEPLOY_DIR=""
+# Identifier for this configuration. It names the instance in the logs and in
+# the CSV report, AND it is what the state, log and lock paths are derived from,
+# so two configurations can never share them by accident. Defaults to the
+# configuration file's base name; [A-Za-z0-9._-] only.
+INSTANCE_ID=""
 
 # Resolve the script directory portably (no readlink -f).
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 
 # Path defaults derived from the script directory (may be overridden in config).
-TARGETS_FILE="$SCRIPT_DIR/targets.tsv"
-STATE_DIR="$SCRIPT_DIR/state"
-LOG_DIR="$SCRIPT_DIR/logs"
-LOCK_FILE="$SCRIPT_DIR/run.lock"
+# Left empty on purpose: resolved from INSTANCE_ID after the config is read, so
+# that setting them is optional and never accidental. Override in the config to
+# put them elsewhere.
+STATE_DIR=""
+LOG_DIR=""
+LOCK_FILE=""
 
 CONFIG_FILE="$SCRIPT_DIR/file-deploy.conf"
 
@@ -347,9 +360,8 @@ _rotate_file() {
     : > "$f"
 }
 
-# Current target context (set by scan_target, empty at orchestration level).
-CUR_PROJECT=""
-CUR_ENV=""
+# Instance context: one configuration = one instance, named by INSTANCE_ID.
+CUR_INSTANCE=""
 CUR_CYCLE=""
 CUR_OPLOG=""
 CUR_AUDIT=""
@@ -371,8 +383,8 @@ _emit_file() {
     fi
     if [[ $LOG_FORMAT == json ]]; then
         line="{\"ts\":\"$ts\",\"level\":\"$level\",\"run\":\"$(json_esc "$RUN_ID")\""
-        if (( withctx )) && [[ -n $CUR_PROJECT ]]; then
-            line+=",\"project\":\"$(json_esc "$CUR_PROJECT")\",\"env\":\"$(json_esc "$CUR_ENV")\""
+        if (( withctx )) && [[ -n $CUR_INSTANCE ]]; then
+            line+=",\"instance\":\"$(json_esc "$CUR_INSTANCE")\""
             [[ -n $CUR_CYCLE ]] && line+=",\"cycle\":$CUR_CYCLE"
         fi
         line+=",\"event\":\"$event\""
@@ -383,8 +395,8 @@ _emit_file() {
         line+="}"
     else
         line="$ts $level run=$RUN_ID"
-        if (( withctx )) && [[ -n $CUR_PROJECT ]]; then
-            line+=" project=$CUR_PROJECT env=$CUR_ENV"
+        if (( withctx )) && [[ -n $CUR_INSTANCE ]]; then
+            line+=" instance=$CUR_INSTANCE"
             [[ -n $CUR_CYCLE ]] && line+=" cycle=$CUR_CYCLE"
         fi
         line+=" event=$event"
@@ -450,13 +462,13 @@ report_row() {
         REPORT_STARTED[$REPORT_FILE]=1
         mkdir -p -- "$REPORT_DIR" 2>/dev/null
         if [[ ! -s $REPORT_FILE ]]; then
-            printf '%s\n' "run_id${d}deployed_at${d}project${d}env${d}outcome${d}file_name${d}relpath${d}source_path${d}deploy_path${d}archive_path${d}size_bytes${d}hash${d}prev_hash${d}source_modified${d}source_created${d}age_at_pickup_s${d}pickup_dir${d}host" \
+            printf '%s\n' "run_id${d}deployed_at${d}instance${d}outcome${d}file_name${d}relpath${d}source_path${d}deploy_path${d}archive_path${d}size_bytes${d}hash${d}prev_hash${d}source_modified${d}source_created${d}age_at_pickup_s${d}pickup_dir${d}host" \
                 >> "$REPORT_FILE" 2>/dev/null
         fi
     fi
     local created=""
     (( ${10} > 0 )) && created=$(epoch_iso "${10}")
-    printf '%s\n' "$(csv_q "$RUN_ID")$d$(epoch_iso "$(now_epoch)")$d$(csv_q "$CUR_PROJECT")$d$(csv_q "$CUR_ENV")$d$(csv_q "$1")$d$(csv_q "${2##*/}")$d$(csv_q "$5")$d$(csv_q "$2")$d$(csv_q "$3")$d$(csv_q "$4")$d${6}$d$(csv_q "$7")$d$(csv_q "$8")$d$(epoch_iso "$9")$d${created}$d${11}$d$(csv_q "${12}")$d$(csv_q "${HOSTNAME:-}")" \
+    printf '%s\n' "$(csv_q "$RUN_ID")$d$(epoch_iso "$(now_epoch)")$d$(csv_q "$CUR_INSTANCE")$d$(csv_q "$1")$d$(csv_q "${2##*/}")$d$(csv_q "$5")$d$(csv_q "$2")$d$(csv_q "$3")$d$(csv_q "$4")$d${6}$d$(csv_q "$7")$d$(csv_q "$8")$d$(epoch_iso "$9")$d${created}$d${11}$d$(csv_q "${12}")$d$(csv_q "${HOSTNAME:-}")" \
         >> "$REPORT_FILE" 2>/dev/null
     return 0
 }
@@ -490,150 +502,17 @@ audit_write() {
 }
 
 # ---------------------------------------------------------------------------
-# Targets
-# ---------------------------------------------------------------------------
-declare -a T_PROJECT=() T_ENV=() T_SRC=() T_DEP=() T_IDN=() T_SCAN=() T_KEY=() T_LAST=()
-declare -a T_MODE=() T_DEPTH=()   # per-target: mode "input"|"fixed"; depth (fixed only, -1=unlimited)
-declare -A _seen_target=()
-declare -A T_MOUNT_STATE=()   # key -> "ok" | "missing" (for state-change logging)
-declare -A DEPLOY_CHECKED=()  # key -> 1 once the deployment root has been validated
-declare -A DEPLOYED_ONCE=()   # key -> 1 once the "we have deployed here" file exists
-
-# load_targets: parse targets.tsv into the T_* arrays. Returns EX_CONFIG on a
-# fatal read error.
-load_targets() {
-    if [[ ! -f $TARGETS_FILE || ! -r $TARGETS_FILE ]]; then
-        log_run ERROR TARGETS_UNREADABLE file="$(enc "$TARGETS_FILE")"
-        return $EX_CONFIG
-    fi
-    local raw c1 c2 c3 c4 c5 c6 c7 rest
-    local project env src arc idn scan enabled key
-    local lineno=0
-    while IFS= read -r raw || [[ -n $raw ]]; do
-        (( lineno++ ))
-        # Skip blank and comment lines.
-        local t; t=$(trim "$raw")
-        [[ -z $t ]] && continue
-        [[ $t == \#* ]] && continue
-        # Tab-separated when a tab is present (paths may contain spaces),
-        # otherwise fall back to whitespace-separated for convenience.
-        if [[ $raw == *$'\t'* ]]; then
-            IFS=$'\t' read -r c1 c2 c3 c4 c5 c6 c7 rest <<< "$raw"
-        else
-            read -r c1 c2 c3 c4 c5 c6 c7 rest <<< "$raw"
-        fi
-        project=$(trim "${c1:-}"); env=$(trim "${c2:-}")
-        src=$(trim "${c3:-}");     arc=$(trim "${c4:-}")
-        idn=$(trim "${c5:-}");     scan=$(trim "${c6:-}"); enabled=$(trim "${c7:-}")
-
-        if [[ -z $project || -z $env || -z $src || -z $arc ]]; then
-            log_run WARN TARGET_MALFORMED line_no="$lineno" line="$(enc "$t")"
-            continue
-        fi
-        # Resolve optional columns / defaults.
-        [[ -z $idn || $idn == - ]] && idn=$INPUT_DIR_NAME
-        [[ -z $scan || $scan == - ]] && scan=$SCAN_INTERVAL
-        [[ -z $enabled || $enabled == - ]] && enabled=true
-        # Extra columns almost always mean the line was split on whitespace
-        # because it has no tab, so every column after a value containing a
-        # space is shifted -- which used to disable the target in silence.
-        if [[ -n ${rest:-} ]]; then
-            log_run WARN TARGET_EXTRA_FIELDS project="$project" env="$env" line_no="$lineno" \
-                extra="$(enc "$rest")" hint="more than 7 columns; are the columns TAB-separated?"
-        fi
-        if ! is_uint "$scan"; then
-            log_run WARN TARGET_BAD_INTERVAL project="$project" env="$env" scan_interval="$(enc "$scan")"
-            scan=$SCAN_INTERVAL
-        fi
-        (( scan < 1 )) && scan=1
-
-        key="$(sanitize "$project")__$(sanitize "$env")"
-        if [[ -n ${_seen_target[$key]:-} ]]; then
-            log_run ERROR TARGET_DUPLICATE project="$project" env="$env" line_no="$lineno"
-            continue
-        fi
-        _seen_target[$key]=1
-
-        case ${enabled,,} in
-            true|yes|on|1)  enabled=true ;;
-            false|no|off|0)
-                log_run DEBUG TARGET_DISABLED project="$project" env="$env" enabled="$(enc "$enabled")"
-                continue ;;
-            *)  # Never drop a target on an unparsable flag without saying so.
-                log_run WARN TARGET_BAD_ENABLED project="$project" env="$env" line_no="$lineno" \
-                    enabled="$(enc "$enabled")" \
-                    hint="last column must be true/false; target skipped. Are the columns TAB-separated?"
-                continue ;;
-        esac
-        T_PROJECT+=("$project"); T_ENV+=("$env")
-        T_SRC+=("$src");         T_DEP+=("$arc")
-        T_IDN+=("$idn");         T_SCAN+=("$scan")
-        T_KEY+=("$key");         T_LAST+=(0)
-        T_MODE+=("input");       T_DEPTH+=("-")
-    done < "$TARGETS_FILE"
-    return 0
-}
-
-# load_extra_dirs: append the EXTRA_DIRS rules as "fixed" targets. Each rule
-# (label<TAB>source<TAB>destination<TAB>depth) archives one specific source
-# directory to one specific destination — no "input" discovery, a mirror rooted
-# at <destination>: <source>/sub/f -> <destination>/sub/f. Its <label> is its
-# identity: its state and logs live under "<label>__extra", exactly like a
-# (project, env) target, so the whole engine is reused unchanged.
-#   depth: 0 = files directly in <source> only; N = N sub-levels deep;
-#          -1 / "unlimited" = the whole subtree. Empty/"-" defaults to 1.
-load_extra_dirs() {
-    local entry label src dst depth key san n=0
-    for entry in "${EXTRA_DIRS[@]:-}"; do
-        [[ -z $entry ]] && continue
-        (( n++ ))
-        IFS=$'\t' read -r label src dst depth <<< "$entry"
-        label=$(trim "${label:-}"); src=$(trim "${src:-}")
-        dst=$(trim "${dst:-}");     depth=$(trim "${depth:-}")
-        # Trailing slashes would break the relative-path computation.
-        while [[ $src == */ ]]; do src=${src%/}; done
-        while [[ $dst == */ ]]; do dst=${dst%/}; done
-        if [[ -z $label || -z $src || -z $dst ]]; then
-            log_run WARN EXTRA_MALFORMED index="$n" entry="$(enc "$entry")" \
-                hint="expected label<TAB>source<TAB>destination<TAB>depth"
-            continue
-        fi
-        case ${depth,,} in
-            ''|-) depth=1 ;;
-            unlimited|inf|all|-1) depth=-1 ;;
-            *) if ! is_uint "$depth"; then
-                   log_run WARN EXTRA_BAD_DEPTH label="$(enc "$label")" depth="$(enc "$depth")" \
-                       hint="depth must be 0, a positive integer, or -1/unlimited; using 1"
-                   depth=1
-               fi ;;
-        esac
-        san=$(sanitize "$label"); key="${san}__extra"
-        if [[ -n ${_seen_target[$key]:-} ]]; then
-            log_run ERROR EXTRA_DUPLICATE label="$(enc "$label")" key="$key" index="$n"
-            continue
-        fi
-        _seen_target[$key]=1
-        T_PROJECT+=("$label"); T_ENV+=("extra")
-        T_SRC+=("$src");       T_DEP+=("$dst")
-        T_IDN+=("");           T_SCAN+=("$SCAN_INTERVAL")
-        T_KEY+=("$key");       T_LAST+=(0)
-        T_MODE+=("fixed");     T_DEPTH+=("$depth")
-    done
-    return 0
-}
-
-# ---------------------------------------------------------------------------
 # Discovery (locate input dirs) + per-leaf settled mtimes
 #   STATE_DIR/<key>.inputs.tsv  -> one enc(input_dir) per line (governs rediscovery)
 #   STATE_DIR/<key>.leaves.tsv  -> "<enc(leaf)>\t<settled_mtime>" (per-leaf skip state)
 # ---------------------------------------------------------------------------
 
-# discover_or_load_dirs <key> <src> <idn> <inputs_cache> <leaves_cache>
+# discover_or_load_dirs <src> <idn> <inputs_cache> <leaves_cache>
 # Populates INPUT_DIRS (the input directories) and DIRLAST (leaf -> settled mtime).
 # The full-tree walk (rediscovery) only LOCATES input dirs: it prunes AT each input
 # (never descends into them) and honours DISCOVERY_MAXDEPTH / EXCLUDE_DIR_PATTERNS,
 # so it does not walk the (large) subtrees. Sub-directories are enumerated cheaply
-# per cycle in scan_target (one bulk readdir per input).
+# per cycle in scan_cycle (one bulk readdir per input).
 declare -a INPUT_DIRS=()
 declare -A DIRLAST=()
 declare -a IDNAMES=()
@@ -641,7 +520,7 @@ declare -a IDNAMES=()
 # split_idn <list>: split the configured input directory names into IDNAMES.
 # ONLY commas (and newlines) separate. A whitespace split would silently make
 # every name containing a space unusable -- and NAS shares routinely have them,
-# which is also why targets.tsv is tab-separated in the first place.
+# which is why the comma is the only separator.
 split_idn() {
     local rest=${1//$'\n'/,} nm
     IDNAMES=()
@@ -686,7 +565,7 @@ load_leaves_cache() {
 }
 
 discover_or_load_dirs() {
-    local key=$1 src=$2 idn=$3 inputs_cache=$4 leaves_cache=$5
+    local src=$1 idn=$2 inputs_cache=$3 leaves_cache=$4
     INPUT_DIRS=()
 
     # Load persisted per-leaf settled mtimes (local disk, cheap).
@@ -785,10 +664,13 @@ write_inputs_cache() {  # cache header
 # ---------------------------------------------------------------------------
 # Per-run accumulators
 # ---------------------------------------------------------------------------
-ANY_TARGET_OK=0
+SOURCE_OK=0           # 1 once the source has been scannable at least once
+MOUNT_STATE=""        # "" | ok | missing, so a change of state is logged once
+DEPLOY_CHECKED=0      # 1 once the deployment root has been validated this run
+DEPLOYED_ONCE=0       # 1 once the "we have deployed here" state file exists
 ANY_DEPLOY_FAILED=0   # something could not be written to the deployment tree -> exit 4
 ANY_SOURCE_STUCK=0    # something was deployed but could not leave the source -> exit 5
-declare -A RUN_DEPLOYED=() RUN_OVERWRITTEN=() RUN_CONFLICTS=() RUN_MOVED=() RUN_ERRORS=() RUN_SCANNED=()
+RUN_DEPLOYED=0 RUN_OVERWRITTEN=0 RUN_CONFLICTS=0 RUN_MOVED=0 RUN_ERRORS=0 RUN_SCANNED=0
 
 # _file_error <errkey> <event> [k=v ...]
 # Report a per-file error that may well be permanent (unreadable file, bogus
@@ -883,7 +765,7 @@ conflict_verdict() {
     return 0
 }
 
-# deploy_file <src> <dst> <hash> <mtime> <encrel> <key>
+# deploy_file <src> <dst> <hash> <mtime> <encrel>
 # Put the file in the deployment tree according to $ON_CONFLICT. Sets
 # DEPLOY_ACTION and, on a real write, DEPLOY_DST. Returns 1 (and logs) on
 # failure, always leaving whatever was already deployed untouched.
@@ -892,7 +774,7 @@ DEPLOY_OLD_HASH=""
 DEPLOY_DST=""
 declare -A CONFLICT_SEEN=()   # key SEP relpath -> 1 once a pending conflict was reported
 deploy_file() {
-    local src=$1 dst=$2 h=$3 mtime=$4 encrel=$5 key=$6 err dst_dir=${2%/*}
+    local src=$1 dst=$2 h=$3 mtime=$4 encrel=$5 err dst_dir=${2%/*}
     DEPLOY_ACTION=DEPLOYED; DEPLOY_OLD_HASH=""; DEPLOY_DST=$dst
     if ! err=$(mkdir -p -- "$dst_dir" 2>&1); then
         log_tgt ERROR DEPLOY_FAILED stage="mkdir" relpath="$encrel" \
@@ -924,8 +806,8 @@ deploy_file() {
             # not a failure, hence WARN once per run and exit 0. It clears by
             # itself as soon as the deployed file changes or goes away.
             (( CYC_CONFLICTS++ ))
-            if [[ -z ${CONFLICT_SEEN["$key$SEP$encrel"]:-} ]]; then
-                CONFLICT_SEEN["$key$SEP$encrel"]=1
+            if [[ -z ${CONFLICT_SEEN["$encrel"]:-} ]]; then
+                CONFLICT_SEEN["$encrel"]=1
                 log_tgt WARN DEPLOY_RETRY relpath="$encrel" dst="$(enc "$dst")" \
                     deployed_hash="${DEPLOY_OLD_HASH:0:8}…" incoming_hash="${h:0:8}…" \
                     on_conflict="$ON_CONFLICT" \
@@ -1043,7 +925,7 @@ stamp_from_epoch() {
     printf '%s' "$out"
 }
 
-# process_file <key> <src_root> <dep_root> <src_path>
+# process_file <src_root> <dep_root> <src_path>
 # Move one source file: deploy it, then take it out of the pickup directory.
 # Sets DIR_UNSETTLED=1 whenever the file could not be finalised, so the
 # directory is rescanned next cycle.
@@ -1062,7 +944,7 @@ stamp_from_epoch() {
 DIR_UNSETTLED=0
 DEEP_SCAN=0        # 1 when this cycle ignores the directory-mtime skip
 process_file() {
-    local key=$1 src_root=$2 dep_root=$3 src=$4
+    local src_root=$1 dep_root=$2 src=$3
     local relpath encrel meta meta2 size mtime now age h err
 
     relpath=${src#"$src_root"/}
@@ -1075,7 +957,7 @@ process_file() {
     }
     size=${meta%% *}; mtime=${meta##* }
     if ! is_uint "$size" || ! is_int "$mtime"; then
-        _file_error "$key$SEP$encrel" META_UNREADABLE relpath="$encrel" meta="$(enc "$meta")"
+        _file_error "$encrel" META_UNREADABLE relpath="$encrel" meta="$(enc "$meta")"
         return 0
     fi
 
@@ -1093,7 +975,7 @@ process_file() {
 
     # Never consume what could not be read back.
     h=$(hash_file "$src") || {
-        _file_error "$key$SEP$encrel$SEP$size$SEP$mtime" HASH_FAILED \
+        _file_error "$encrel$SEP$size$SEP$mtime" HASH_FAILED \
             relpath="$encrel" hash_cmd="$HASH_CMD"
         return 0
     }
@@ -1125,7 +1007,7 @@ process_file() {
     is_uint "$btime" || btime=0
 
     # 2. Deploy first: the source is still there to retry from if this fails.
-    deploy_file "$src" "$dst" "$h" "$mtime" "$encrel" "$key" || { DIR_UNSETTLED=1; return 0; }
+    deploy_file "$src" "$dst" "$h" "$mtime" "$encrel" || { DIR_UNSETTLED=1; return 0; }
 
     # 3. The source must not have moved under us while we were copying. If it
     #    did, what we just deployed is a snapshot of a half-written file: leave
@@ -1158,9 +1040,9 @@ process_file() {
 
     # Remember that this target has really written to its deployment root, so a
     # later run can tell "first deployment" from "the share vanished".
-    if [[ -z ${DEPLOYED_ONCE[$key]:-} ]]; then
-        DEPLOYED_ONCE[$key]=1
-        : > "$STATE_DIR/$key.deployed" 2>/dev/null
+    if (( DEPLOYED_ONCE == 0 )); then
+        DEPLOYED_ONCE=1
+        : > "$STATE_DIR/deployed" 2>/dev/null
     fi
 
     local encarc=""; [[ -n $ARC_PATH ]] && encarc=$(enc "${ARC_PATH#"$src_root"/}")
@@ -1199,7 +1081,7 @@ process_file() {
     (( CYC_BYTES += size ))
 }
 
-# scan_one_dir <leaf> <mt> <src_root> <dep_root> <key> <root_dir>
+# scan_one_dir <leaf> <mt> <src_root> <dep_root> <root_dir>
 # Process one directory: skip the local archive directory and anything matching
 # EXCLUDE_DIR_PATTERNS (never the <root_dir> itself), skip it when its mtime is
 # unchanged, otherwise move each file directly inside it (never deeper —
@@ -1207,7 +1089,7 @@ process_file() {
 # computed against <src_root> and mirrored under <dep_root>. Uses the caller's
 # locals (seen / scan_dirs / rescanned / cache_dirty) by dynamic scope.
 scan_one_dir() {
-    local leaf=$1 mt=$2 src_root=$3 dep_root=$4 key=$5 root_dir=$6
+    local leaf=$1 mt=$2 src_root=$3 dep_root=$4 root_dir=$5
     local base=${leaf##*/} f
     if [[ $leaf != "$root_dir" ]]; then
         # The local archive is our own output, never an input. Exact,
@@ -1231,7 +1113,7 @@ scan_one_dir() {
         # A directory that can never be drained needs an operator, not a retry:
         # it gets its own exit code so it cannot hide behind a green run.
         ANY_SOURCE_STUCK=1
-        _file_error "$key$SEP$leaf" SOURCE_NOT_WRITABLE dir="$(enc "${leaf#"$src_root"/}")" \
+        _file_error "$leaf" SOURCE_NOT_WRITABLE dir="$(enc "${leaf#"$src_root"/}")" \
             hint="files are moved out of the source: the pickup directory needs w+x"
         return 0
     fi
@@ -1244,7 +1126,7 @@ scan_one_dir() {
     DIR_UNSETTLED=0
     while IFS= read -r -d '' f; do
         [[ -f $f ]] || continue
-        process_file "$key" "$src_root" "$dep_root" "$f"
+        process_file "$src_root" "$dep_root" "$f"
     done < <(find "$leaf" -mindepth 1 -maxdepth 1 -type f -print0 2>/dev/null)
     # Settle (cache the mtime) only if everything finalised; otherwise leave the
     # previous value so the leaf is rescanned next cycle.
@@ -1271,14 +1153,14 @@ scan_one_dir() {
 # "Deployed here before" is recorded by a per-target state file, written on the
 # first successful move. Returns 0 (ok) or 1 (refuse).
 check_deploy_root() {
-    local dep=$1 key=$2
+    local dep=$1
     [[ -z $DEPLOY_MARKER ]] && return 0
-    [[ -n ${DEPLOY_CHECKED[$key]:-} ]] && return 0
+    (( DEPLOY_CHECKED )) && return 0
     local marker="$dep/$DEPLOY_MARKER"
-    if [[ -e $marker ]]; then DEPLOY_CHECKED[$key]=1; return 0; fi
+    if [[ -e $marker ]]; then DEPLOY_CHECKED=1; return 0; fi
 
     local deployed_before=0 nonempty=0 probe
-    [[ -e "$STATE_DIR/$key.deployed" ]] && deployed_before=1
+    [[ -e "$STATE_DIR/deployed" ]] && deployed_before=1
     if [[ -d $dep ]]; then
         probe=$(find "$dep" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)
         [[ -n $probe ]] && nonempty=1
@@ -1293,7 +1175,7 @@ check_deploy_root() {
 
     if [[ $DRY_RUN == true ]]; then
         log_tgt INFO DEPLOY_MARKER_MISSING dep="$(enc "$dep")" dry="1"
-        DEPLOY_CHECKED[$key]=1
+        DEPLOY_CHECKED=1
         return 0
     fi
     if ! mkdir -p -- "$dep" 2>/dev/null || ! { : > "$marker"; } 2>/dev/null; then
@@ -1308,66 +1190,53 @@ check_deploy_root() {
     else
         log_tgt INFO DEPLOY_MARKER_CREATED dep="$(enc "$dep")" marker="$(enc "$DEPLOY_MARKER")"
     fi
-    DEPLOY_CHECKED[$key]=1
+    DEPLOY_CHECKED=1
     return 0
 }
 
 # ---------------------------------------------------------------------------
-# scan_target <idx>: one cycle over a single target.
+# scan_cycle <idx>: one cycle over a single target.
 # ---------------------------------------------------------------------------
 CYC_SCANNED=0 CYC_DEPLOYED=0 CYC_OVERWRITTEN=0 CYC_CONFLICTS=0 CYC_MOVED=0 CYC_ERRORS=0 CYC_BYTES=0
-scan_target() {
-    local idx=$1
-    CUR_PROJECT=${T_PROJECT[$idx]}
-    CUR_ENV=${T_ENV[$idx]}
-    local src=${T_SRC[$idx]} dep=${T_DEP[$idx]} idn=${T_IDN[$idx]} key=${T_KEY[$idx]}
-    local mode=${T_MODE[$idx]} depth=${T_DEPTH[$idx]}
+scan_cycle() {
+    local src=$SOURCE_DIR dep=$DEPLOY_DIR idn=$INPUT_DIR_NAME
+    local inputs_cache="$STATE_DIR/inputs.tsv"
+    local leaves_cache="$STATE_DIR/leaves.tsv"
 
-    local tdir="$LOG_DIR/$key"
-    mkdir -p -- "$tdir" 2>/dev/null
-    CUR_OPLOG="$tdir/operations.log"
-    CUR_AUDIT="$tdir/audit.log"
-    local inputs_cache="$STATE_DIR/$key.inputs.tsv"
-    local leaves_cache="$STATE_DIR/$key.leaves.tsv"
+    log_tgt DEBUG CYCLE_BEGIN src="$(enc "$src")" deploy="$(enc "$dep")" input_dir_name="$idn"
 
-    log_tgt DEBUG TARGET_BEGIN mode="$mode" src="$(enc "$src")" deploy="$(enc "$dep")" \
-        input_dir_name="$idn" depth="$depth"
-
-    # Guard: the source must be an existing, readable, searchable directory.
-    # A precise reason plus the deepest existing ancestor makes an unmounted
-    # share or a wrong path immediately obvious.
+    # Guard: the source must be an existing, readable, searchable, writable
+    # directory. A precise reason plus the deepest existing ancestor makes an
+    # unmounted share or a wrong path immediately obvious.
     local mreason; mreason=$(mount_reason "$src")
     if [[ $mreason != ok ]]; then
-        local prev=${T_MOUNT_STATE[$key]:-} anc; anc=$(deepest_existing "$src")
-        local lvl=DEBUG; [[ $prev != missing ]] && lvl=ERROR   # loud on change, quiet on repeat
-        T_MOUNT_STATE[$key]=missing
+        local anc; anc=$(deepest_existing "$src")
+        local lvl=DEBUG; [[ $MOUNT_STATE != missing ]] && lvl=ERROR  # loud on change
+        MOUNT_STATE=missing
         _emit_file "$CUR_OPLOG" 1 "$lvl" MOUNT_MISSING \
             "src=$(enc "$src")" "reason=$mreason" "deepest_existing=$(enc "$anc")"
         return 0
     fi
-    if [[ ${T_MOUNT_STATE[$key]:-} == missing ]]; then
-        log_tgt INFO MOUNT_OK src="$(enc "$src")"
-    fi
-    T_MOUNT_STATE[$key]=ok
-    ANY_TARGET_OK=1
+    [[ $MOUNT_STATE == missing ]] && log_tgt INFO MOUNT_OK src="$(enc "$src")"
+    MOUNT_STATE=ok
+    SOURCE_OK=1
 
     # The deployment tree must really be mounted before a single byte is
     # written -- and, above all, before a single file is taken out of the source
     # because of it.
-    if ! check_deploy_root "$dep" "$key"; then
-        RUN_ERRORS[$key]=$(( ${RUN_ERRORS[$key]:-0} + 1 ))
+    if ! check_deploy_root "$dep"; then
+        RUN_ERRORS=$(( RUN_ERRORS + 1 ))
         ANY_DEPLOY_FAILED=1
         return 0
     fi
 
     # Periodic deep pass: ignore the directory-mtime skip every
-    # DEEP_SCAN_INTERVAL seconds. In move mode this is belt-and-braces rather
-    # than load-bearing -- a processed file no longer exists, and any file left
-    # behind already keeps its directory unsettled (see _file_error) -- but it
-    # still recovers a directory whose mtime the share failed to update. The
-    # timestamp lives in a state file so cron re-invocations do not each force
-    # a deep pass.
-    local deep_marker="$STATE_DIR/$key.deepscan" nowd dmt
+    # DEEP_SCAN_INTERVAL seconds. This is belt-and-braces -- a processed file no
+    # longer exists, and any file left behind already keeps its directory
+    # unsettled (see _file_error) -- but it still recovers a directory whose
+    # mtime the share failed to update. The timestamp lives in a state file so
+    # cron re-invocations do not each force a deep pass.
+    local deep_marker="$STATE_DIR/deepscan" nowd dmt
     nowd=$(now_epoch)
     DEEP_SCAN=0
     if (( FORCE_REDISCOVER )); then
@@ -1382,44 +1251,25 @@ scan_target() {
         (( DEBUG_ON )) && log_tgt DEBUG DEEP_SCAN interval_s="$DEEP_SCAN_INTERVAL"
     fi
 
-    if [[ $mode == fixed ]]; then
-        load_leaves_cache "$leaves_cache"
-    else
-        discover_or_load_dirs "$key" "$src" "$idn" "$inputs_cache" "$leaves_cache"
-    fi
+    discover_or_load_dirs "$src" "$idn" "$inputs_cache" "$leaves_cache"
 
     CYC_SCANNED=0 CYC_DEPLOYED=0 CYC_OVERWRITTEN=0 CYC_CONFLICTS=0 CYC_MOVED=0 CYC_ERRORS=0 CYC_BYTES=0
     local -A seen=()
     local input mt leaf dir_reads=0 scan_dirs=0 rescanned=0 cache_dirty=0
     local t_start; t_start=$(date +%s%N 2>/dev/null)
 
-    if [[ $mode == fixed ]]; then
-        # Explicit rule: one bulk readdir of the fixed source down to <depth>
-        # sub-levels returns every directory to scan with its mtime in a single
-        # walk. Excluded dirs are pruned (never descended). Files mirror under the
-        # destination: <src>/sub/f -> <arc>/sub/f. depth -1 = the whole subtree.
+    # One bulk readdir per input dir returns the input AND each of its direct
+    # subdirs with their mtime in a single directory read (~1 CIFS round-trip),
+    # instead of one stat per directory. We then scan the input's direct files and
+    # each direct subdir's direct files (never deeper).
+    for input in "${INPUT_DIRS[@]:-}"; do
+        [[ -z $input ]] && continue
         (( dir_reads++ ))
-        local -a dexpr=(); (( depth >= 0 )) && dexpr=( -maxdepth "$depth" )
-        local -a fexpr=(); build_prune_expr; fexpr=( ${PRUNE_EXPR[@]+"${PRUNE_EXPR[@]}"} )
         while IFS=$'\t' read -r -d '' mt leaf; do
             [[ -z $leaf ]] && continue
-            scan_one_dir "$leaf" "$mt" "$src" "$dep" "$key" "$src"
-        done < <(find "$src" -mindepth 0 ${dexpr[@]+"${dexpr[@]}"} ${fexpr[@]+"${fexpr[@]}"} \
-                      -type d -printf '%T@\t%p\0' 2>/dev/null)
-    else
-        # One bulk readdir per input dir returns the input AND each of its direct
-        # subdirs with their mtime in a single directory read (~1 CIFS round-trip),
-        # instead of one stat per directory. We then scan the input's direct files and
-        # each direct subdir's direct files (never deeper).
-        for input in "${INPUT_DIRS[@]:-}"; do
-            [[ -z $input ]] && continue
-            (( dir_reads++ ))
-            while IFS=$'\t' read -r -d '' mt leaf; do
-                [[ -z $leaf ]] && continue
-                scan_one_dir "$leaf" "$mt" "$src" "$dep" "$key" "$input"
-            done < <(find "$input" -mindepth 0 -maxdepth 1 -type d -printf '%T@\t%p\0' 2>/dev/null)
-        done
-    fi
+            scan_one_dir "$leaf" "$mt" "$src" "$dep" "$input"
+        done < <(find "$input" -mindepth 0 -maxdepth 1 -type d -printf '%T@\t%p\0' 2>/dev/null)
+    done
 
     # Persist settled mtimes for the leaves seen this cycle (only when something
     # changed; this also drops leaves that disappeared).
@@ -1433,15 +1283,15 @@ scan_target() {
         mv -f -- "$tmp" "$leaves_cache"
     fi
 
-    RUN_DEPLOYED[$key]=$(( ${RUN_DEPLOYED[$key]:-0} + CYC_DEPLOYED ))
-    RUN_OVERWRITTEN[$key]=$(( ${RUN_OVERWRITTEN[$key]:-0} + CYC_OVERWRITTEN ))
-    RUN_CONFLICTS[$key]=$(( ${RUN_CONFLICTS[$key]:-0} + CYC_CONFLICTS ))
-    RUN_MOVED[$key]=$(( ${RUN_MOVED[$key]:-0} + CYC_MOVED ))
-    RUN_ERRORS[$key]=$(( ${RUN_ERRORS[$key]:-0} + CYC_ERRORS ))
-    RUN_SCANNED[$key]=$(( ${RUN_SCANNED[$key]:-0} + CYC_SCANNED ))
+    RUN_DEPLOYED=$(( RUN_DEPLOYED + CYC_DEPLOYED ))
+    RUN_OVERWRITTEN=$(( RUN_OVERWRITTEN + CYC_OVERWRITTEN ))
+    RUN_CONFLICTS=$(( RUN_CONFLICTS + CYC_CONFLICTS ))
+    RUN_MOVED=$(( RUN_MOVED + CYC_MOVED ))
+    RUN_ERRORS=$(( RUN_ERRORS + CYC_ERRORS ))
+    RUN_SCANNED=$(( RUN_SCANNED + CYC_SCANNED ))
 
     # Per-cycle detail is DEBUG (it happens every SCAN_INTERVAL); INFO summaries
-    # come from HEARTBEAT and the final TARGET_SUMMARY.
+    # come from HEARTBEAT and the final RUN_SUMMARY.
     local t_end dur_ms=0; t_end=$(date +%s%N 2>/dev/null)
     [[ $t_start =~ ^[0-9]+$ && $t_end =~ ^[0-9]+$ ]] && dur_ms=$(( (t_end - t_start) / 1000000 ))
     log_tgt DEBUG CYCLE_SUMMARY dir_reads="$dir_reads" scan_dirs="$scan_dirs" rescanned="$rescanned" \
@@ -1458,13 +1308,15 @@ usage() {
 Usage: file-deploy.sh [--config FILE] [--dry-run] [--once] [--debug] [--verbose]
                       [--rediscover] [--help]
 
-Moves files from "input" directories on a mounted NAS share into a mirror
-deployment tree, keeping a local archive copy behind in the source. Targets are
-described in targets.tsv. See README.md for details.
+Moves files from "input" directories under SOURCE_DIR into a mirror deployment
+tree at DEPLOY_DIR, keeping a local archive copy behind in the source. One
+configuration file describes one such pair; run it once per pair. See README.md.
 
 WARNING: this tool DELETES from the source. Rehearse with --dry-run first.
 
   --config FILE  Use this configuration file (default: <script dir>/file-deploy.conf).
+                 Its INSTANCE_ID is what the state, log and lock paths hang off,
+                 so two configurations never collide.
   --rediscover   Request an immediate rediscovery of the input directories:
                  drops a marker the running scanner picks up next cycle. Exits
                  right away without scanning.
@@ -1529,6 +1381,29 @@ load_config() {
            exit $EX_CONFIG ;;
     esac
     [[ -n $FORCE_CONSOLE ]] && LOG_CONSOLE=$FORCE_CONSOLE
+    # The identity comes first: the state, log and lock paths hang off it, which
+    # is what makes it impossible for two configurations to share them.
+    if [[ -z $INSTANCE_ID ]]; then
+        INSTANCE_ID=${CONFIG_FILE##*/}
+        INSTANCE_ID=${INSTANCE_ID%.conf}
+        [[ -z $INSTANCE_ID ]] && INSTANCE_ID="file-deploy"
+    fi
+    if [[ ! $INSTANCE_ID =~ ^[A-Za-z0-9._-]+$ ]]; then
+        printf 'Invalid INSTANCE_ID: %s (allowed: letters, digits, . _ -)\n' "$INSTANCE_ID" >&2
+        exit $EX_CONFIG
+    fi
+    [[ -z $STATE_DIR ]] && STATE_DIR="$SCRIPT_DIR/state/$INSTANCE_ID"
+    [[ -z $LOG_DIR   ]] && LOG_DIR="$SCRIPT_DIR/logs/$INSTANCE_ID"
+    [[ -z $LOCK_FILE ]] && LOCK_FILE="$SCRIPT_DIR/run-$INSTANCE_ID.lock"
+
+    if [[ -z $SOURCE_DIR || -z $DEPLOY_DIR ]]; then
+        printf 'SOURCE_DIR and DEPLOY_DIR must both be set in %s\n' "$CONFIG_FILE" >&2
+        exit $EX_CONFIG
+    fi
+    # Trailing slashes would break every relative-path computation.
+    while [[ $SOURCE_DIR == */ && ${#SOURCE_DIR} -gt 1 ]]; do SOURCE_DIR=${SOURCE_DIR%/}; done
+    while [[ $DEPLOY_DIR == */ && ${#DEPLOY_DIR} -gt 1 ]]; do DEPLOY_DIR=${DEPLOY_DIR%/}; done
+
     LOG_LEVEL_NUM=${LVLNUM[$LOG_LEVEL]:-20}
     (( LOG_LEVEL_NUM <= 10 )) && DEBUG_ON=1 || DEBUG_ON=0
     case ${LOG_CONSOLE,,} in
@@ -1546,7 +1421,12 @@ main() {
     load_config
 
     mkdir -p -- "$STATE_DIR" "$LOG_DIR" 2>/dev/null
-    RUN_LOG="$LOG_DIR/_run.log"
+    # One configuration, one instance: orchestration and per-file events share a
+    # single log. There is no second target to keep them apart from.
+    RUN_LOG="$LOG_DIR/file-deploy.log"
+    CUR_OPLOG=$RUN_LOG
+    CUR_AUDIT="$LOG_DIR/audit.log"
+    CUR_INSTANCE=$INSTANCE_ID
     RUN_ID="$(ts_compact)-$$"
     FORCE_MARKER="$STATE_DIR/.force-rediscover"
 
@@ -1562,7 +1442,8 @@ main() {
         exit $EX_CONFIG
     fi
 
-    # Single-instance lock (self-managed; nothing hard-coded in the crontab).
+    # Single-instance lock. The default lock path carries INSTANCE_ID, so two
+    # configurations run concurrently instead of silently serialising.
     exec 9> "$LOCK_FILE" || { printf 'Cannot open lock file: %s\n' "$LOCK_FILE" >&2; exit $EX_CONFIG; }
     if ! flock -n 9; then
         # Expected every minute in continuous mode (the cron watchdog finds the
@@ -1571,20 +1452,35 @@ main() {
         exit $EX_LOCKED
     fi
 
+    # A state directory belongs to exactly one instance. The default paths make
+    # a clash impossible, but STATE_DIR can be overridden -- and two
+    # configurations sharing one would silently mix their caches and their
+    # "already deployed here" marker, so refuse instead.
+    local owner_file="$STATE_DIR/.instance" owner=""
+    [[ -f $owner_file ]] && IFS= read -r owner < "$owner_file"
+    if [[ -n $owner && $owner != "$INSTANCE_ID" ]]; then
+        log_run ERROR STATE_DIR_CONFLICT state_dir="$(enc "$STATE_DIR")" \
+            owner="$(enc "$owner")" instance="$(enc "$INSTANCE_ID")" \
+            hint="this state directory belongs to another configuration; give each one its own INSTANCE_ID or its own STATE_DIR"
+        exit $EX_CONFIG
+    fi
+    [[ -n $owner ]] || printf '%s\n' "$INSTANCE_ID" > "$owner_file" 2>/dev/null
+
     # --- Startup banner (shown on the console when interactive) ---
     log_run INFO START pid="$$" host="${HOSTNAME:-$(uname -n 2>/dev/null)}" \
-        user="$(id -un 2>/dev/null)" bash="$BASH_VERSION"
+        user="$(id -un 2>/dev/null)" bash="$BASH_VERSION" instance="$INSTANCE_ID"
     log_run INFO PATHS script_dir="$(enc "$SCRIPT_DIR")" config="$(enc "$CONFIG_FILE")" \
-        config_status="$CONFIG_STATUS" targets="$(enc "$TARGETS_FILE")" \
-        state_dir="$(enc "$STATE_DIR")" log_dir="$(enc "$LOG_DIR")" lock="$(enc "$LOCK_FILE")"
-    log_run INFO CONFIG input_dir_name="$INPUT_DIR_NAME" scan_interval="$SCAN_INTERVAL" \
+        config_status="$CONFIG_STATUS" state_dir="$(enc "$STATE_DIR")" \
+        log_dir="$(enc "$LOG_DIR")" lock="$(enc "$LOCK_FILE")"
+    log_run INFO CONFIG source_dir="$(enc "$SOURCE_DIR")" deploy_dir="$(enc "$DEPLOY_DIR")" \
+        input_dir_name="$INPUT_DIR_NAME" scan_interval="$SCAN_INTERVAL" \
         run_duration="$RUN_DURATION" min_stable_age="$MIN_STABLE_AGE" \
         discovery_interval="$DISCOVERY_INTERVAL" discovery_maxdepth="$DISCOVERY_MAXDEPTH" \
         use_dir_mtime_skip="$USE_DIR_MTIME_SKIP" deep_scan_interval="$DEEP_SCAN_INTERVAL" \
         deploy_marker="$(enc "$DEPLOY_MARKER")" local_archive_dir="$(enc "$LOCAL_ARCHIVE_DIR")" \
         hash_cmd="$HASH_CMD" dry_run="$DRY_RUN" on_conflict="$ON_CONFLICT" \
         report_dir="$(enc "$REPORT_DIR")" \
-        exclude_patterns="$(enc "${EXCLUDE_DIR_PATTERNS[*]:-}")" extra_dirs="${#EXTRA_DIRS[@]}" \
+        exclude_patterns="$(enc "${EXCLUDE_DIR_PATTERNS[*]:-}")" \
         log_format="$LOG_FORMAT" log_level="$LOG_LEVEL" console="$LOG_CONSOLE"
     [[ $CONFIG_STATUS == missing ]] && log_run WARN CONFIG_NOT_FOUND config="$(enc "$CONFIG_FILE")" \
         hint="config file not found; running with built-in defaults"
@@ -1600,108 +1496,45 @@ main() {
         REPORT_DIR=""
     fi
 
-    if ! load_targets; then
-        exit $EX_CONFIG
-    fi
-    load_extra_dirs   # append EXTRA_DIRS rules as "fixed" targets
-    local ntargets=${#T_KEY[@]} i n_input=0 n_fixed=0
-    for (( i = 0; i < ntargets; i++ )); do
-        if [[ ${T_MODE[i]} == fixed ]]; then (( n_fixed++ )); else (( n_input++ )); fi
-    done
-    log_run INFO TARGETS_LOADED count="$ntargets" input="$n_input" extra="$n_fixed"
-    if (( ntargets == 0 )); then
-        log_run WARN NO_TARGETS hint="no enabled target in $TARGETS_FILE and no EXTRA_DIRS rule"
-        log_run INFO END
-        exit $EX_OK
-    fi
-
-    # Log every resolved target so a wrong source/archive path is obvious.
-    for (( i = 0; i < ntargets; i++ )); do
-        log_run INFO TARGET project="${T_PROJECT[i]}" env="${T_ENV[i]}" mode="${T_MODE[i]}" \
-            source="$(enc "${T_SRC[i]}")" deploy="$(enc "${T_DEP[i]}")" \
-            input_dir_name="${T_IDN[i]}" depth="${T_DEPTH[i]}" scan_interval="${T_SCAN[i]}"
-    done
-
-    # Poll granularity = smallest per-target scan interval.
-    local tick=$SCAN_INTERVAL
-    for (( i = 0; i < ntargets; i++ )); do
-        (( T_SCAN[i] < tick )) && tick=${T_SCAN[i]}
-    done
-    (( tick < 1 )) && tick=1
-
+    local tick=$SCAN_INTERVAL; (( tick < 1 )) && tick=1
     local cycle=0 first=1 now last_hb=0
     while (( first || SECONDS < RUN_DURATION )); do
         first=0
         (( cycle++ ))
         CUR_CYCLE=$cycle
-        # Manual rediscovery request (marker dropped by `--rediscover`): force a
-        # full-tree rediscovery for every target this cycle.
+        # Manual rediscovery request (marker dropped by `--rediscover`).
         if [[ -e $FORCE_MARKER ]]; then
             FORCE_REDISCOVER=1
             rm -f -- "$FORCE_MARKER" 2>/dev/null
-            for (( i = 0; i < ntargets; i++ )); do T_LAST[i]=0; done
             log_run INFO FORCE_REDISCOVER cycle="$cycle"
         else
             FORCE_REDISCOVER=0
         fi
         now=$(now_epoch)
-        for (( i = 0; i < ntargets; i++ )); do
-            if (( now - T_LAST[i] >= T_SCAN[i] )); then
-                T_LAST[i]=$now
-                scan_target "$i"
-            fi
-        done
-        CUR_PROJECT="" CUR_ENV="" CUR_CYCLE=""
+        scan_cycle
 
         # Periodic heartbeat: proves the loop is alive and shows, at a glance,
-        # whether it is archiving or stuck (e.g. every target MOUNT_MISSING).
+        # whether it is delivering or stuck.
         if (( HEARTBEAT_INTERVAL > 0 )) && (( now - last_hb >= HEARTBEAT_INTERVAL )); then
             last_hb=$now
-            local hb_moved=0 hb_err=0 hb_missing=0 kk
-            for kk in "${T_KEY[@]}"; do
-                hb_moved=$(( hb_moved + ${RUN_MOVED[$kk]:-0} ))
-                hb_err=$(( hb_err + ${RUN_ERRORS[$kk]:-0} ))
-                [[ ${T_MOUNT_STATE[$kk]:-} == missing ]] && (( hb_missing++ ))
-            done
-            log_run INFO HEARTBEAT cycle="$cycle" elapsed_s="$SECONDS" targets="$ntargets" \
-                moved="$hb_moved" errors="$hb_err" mount_missing="$hb_missing"
+            log_run INFO HEARTBEAT cycle="$cycle" elapsed_s="$SECONDS" \
+                moved="$RUN_MOVED" errors="$RUN_ERRORS" mount="${MOUNT_STATE:-unknown}"
         fi
 
         (( SECONDS < RUN_DURATION )) || break
         sleep "$tick"
     done
+    CUR_CYCLE=""
 
-    # Aggregated run summary (orchestration log).
-    local tot_deployed=0 tot_overwritten=0 tot_conflicts=0 tot_moved=0 tot_errors=0 k
-    for k in "${T_KEY[@]}"; do
-        tot_deployed=$(( tot_deployed + ${RUN_DEPLOYED[$k]:-0} ))
-        tot_overwritten=$(( tot_overwritten + ${RUN_OVERWRITTEN[$k]:-0} ))
-        tot_conflicts=$(( tot_conflicts + ${RUN_CONFLICTS[$k]:-0} ))
-        tot_moved=$(( tot_moved + ${RUN_MOVED[$k]:-0} ))
-        tot_errors=$(( tot_errors + ${RUN_ERRORS[$k]:-0} ))
-    done
-
-    # Emit a TARGET_SUMMARY into each target's own operations log.
-    for (( i = 0; i < ntargets; i++ )); do
-        k=${T_KEY[i]}
-        CUR_PROJECT=${T_PROJECT[i]}; CUR_ENV=${T_ENV[i]}
-        CUR_OPLOG="$LOG_DIR/$k/operations.log"
-        [[ -d "$LOG_DIR/$k" ]] && log_tgt INFO TARGET_SUMMARY \
-            deployed="${RUN_DEPLOYED[$k]:-0}" overwritten="${RUN_OVERWRITTEN[$k]:-0}" \
-            conflicts="${RUN_CONFLICTS[$k]:-0}" moved="${RUN_MOVED[$k]:-0}" errors="${RUN_ERRORS[$k]:-0}" \
-            scanned="${RUN_SCANNED[$k]:-0}" mount="${T_MOUNT_STATE[$k]:-unknown}" cycles="$cycle"
-    done
-    CUR_PROJECT="" CUR_ENV="" CUR_CYCLE=""
-
-    log_run INFO RUN_SUMMARY targets="$ntargets" cycles="$cycle" \
-        deployed="$tot_deployed" overwritten="$tot_overwritten" conflicts="$tot_conflicts" \
-        moved="$tot_moved" errors="$tot_errors"
+    log_run INFO RUN_SUMMARY cycles="$cycle" scanned="$RUN_SCANNED" \
+        deployed="$RUN_DEPLOYED" overwritten="$RUN_OVERWRITTEN" conflicts="$RUN_CONFLICTS" \
+        moved="$RUN_MOVED" errors="$RUN_ERRORS" mount="${MOUNT_STATE:-unknown}"
     log_run INFO END
 
-    # Exit code precedence: no usable target > deploy failure > source stuck.
+    # Exit code precedence: unusable source > deploy failure > source stuck.
     # Undelivered data outranks delivered-but-not-drained.
-    if (( ANY_TARGET_OK == 0 )); then
-        exit $EX_NOTARGET
+    if (( SOURCE_OK == 0 )); then
+        exit $EX_NOSOURCE
     elif (( ANY_DEPLOY_FAILED )); then
         exit $EX_DEPLOY
     elif (( ANY_SOURCE_STUCK )); then

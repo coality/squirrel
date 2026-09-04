@@ -13,9 +13,10 @@ guard exists. The [README](README.md) is the operator's guide.
 
 ## §1 — Scope
 
-file-deploy is a single cron-driven bash script watching one or more locally mounted
-source trees. Under each tree it locates directories with a given name (`input`
-by default), and for every file found there it runs the transaction of
+file-deploy is a single cron-driven bash script. **One configuration file
+describes one pair**: a source root and a deployment root. Under the source root
+it locates directories with a given name (`input` by default), and for every
+file found there it runs the transaction of
 [§5](#5--the-per-file-transaction): verified deployment, then removal from the
 source.
 
@@ -25,6 +26,10 @@ before                             after
 A/proj/input/report.xml            A/proj/input/archive/report.xml     (moved)
 B/proj/input/            (empty)   B/proj/input/report.xml          (deployed)
 ```
+
+To handle another pair, write another configuration file and give it its own
+run. There is no multi-target file: a configuration is the unit of isolation,
+of scheduling and of failure.
 
 Dependencies are bash ≥ 4.2, GNU coreutils/findutils and `flock`. No daemon, no
 systemd, no external service. Mounting the shares is out of scope: file-deploy
@@ -36,13 +41,12 @@ observes their state and refuses to act when in doubt.
 
 | Term | Definition |
 |---|---|
-| **Source (A)** | A target's `source_root`. file-deploy writes to it and deletes from it — the substantive change from earlier versions. |
-| **Deployment tree (B)** | A target's `deploy_root`. Mirrors the source layout and carries the *current* state of what has been delivered. It is not a version store. |
+| **Source (A)** | The configuration's `SOURCE_DIR`. file-deploy writes to it and deletes from it — the substantive change from earlier versions. |
+| **Deployment tree (B)** | The configuration's `DEPLOY_DIR`. Mirrors the source layout and carries the *current* state of what has been delivered. It is not a version store. |
 | **Pickup directory** | A directory actually scanned: a discovered `input` directory, or one of its direct subdirectories. It is the immediate parent of the files processed. |
 | **Local archive** | The `$LOCAL_ARCHIVE_DIR` directory (default `archive`) created *inside* the pickup directory. It receives every file taken out of the source, and is never scanned. |
-| **Target** | A `(project, env)` pair declared in `targets.tsv`, or an `EXTRA_DIRS` rule. Each target has its own state, logs and key. |
-| **Key** | `<project>__<env>` after the filter `[^A-Za-z0-9._-] → _`. Names the state files and the log directory. |
-| **Cycle** | One pass over one target. A run loops for up to `RUN_DURATION` seconds, waking each target every `scan_interval`. |
+| **Instance** | One configuration file, identified by `INSTANCE_ID`. It names the instance in the logs and in the CSV report, and the state, log and lock paths are derived from it — which is what makes two configurations structurally unable to share them. |
+| **Cycle** | One pass over the source. A run loops for up to `RUN_DURATION` seconds, scanning every `SCAN_INTERVAL`. |
 | **Deep pass** | A cycle that ignores the directory-mtime skip. Due every `DEEP_SCAN_INTERVAL` seconds. |
 
 ---
@@ -97,7 +101,7 @@ cycle, with no rediscovery.
 |---|---|---|
 | `$LOCAL_ARCHIVE_DIR` | Exact name, case-sensitive | All three walks: per-cycle scan, discovery walk, `fixed`-mode walk |
 | `EXCLUDE_DIR_PATTERNS` | Case-insensitive globs | Same — directory skipped and never descended |
-| The walk's own root | Never excluded by its own name | An `input` directory, or an `EXTRA_DIRS` rule's source |
+| The walk's own root | Never excluded by its own name | A discovered `input` directory |
 
 > **Why pruning the archive is normative.** The local archive is created *inside*
 > a scanned directory. Without this, every archived file would be seen again on
@@ -296,7 +300,7 @@ script provisions itself:
 | Deployed before, root exists and is non-empty | Pre-existing tree adopted (`DEPLOY_MARKER_ADOPTED`) |
 | Deployed before, root missing or empty | **Refused** (`DEPLOY_UNAVAILABLE`) — nothing written, nothing removed |
 
-"Deployed here before" is recorded by `state/<key>.deployed`, written on the
+"Deployed here before" is recorded by `STATE_DIR/deployed`, written on the
 first successful move.
 
 ### 8.2 Pickup-directory drainability
@@ -331,6 +335,9 @@ where a column exists.
 
 | Key | Default | Role |
 |---|---|---|
+| `SOURCE_DIR` | — | **Required.** Root searched for `input` directories |
+| `DEPLOY_DIR` | — | **Required.** Root receiving the mirror |
+| `INSTANCE_ID` | config base name | Identity; the state, log and lock paths derive from it |
 | `INPUT_DIR_NAME` | `"input"` | Exact names, comma-separated, matched literally |
 | `SCAN_INTERVAL` | `10` | Seconds between internal passes |
 | `RUN_DURATION` | `55` | Maximum duration of one run |
@@ -347,7 +354,7 @@ where a column exists.
 | `USE_DIR_MTIME_SKIP` | `true` | Skip a directory whose mtime has not moved |
 | `DEEP_SCAN_INTERVAL` | `300` | Seconds between passes ignoring that skip |
 | `EXCLUDE_DIR_PATTERNS` | `()` | Case-insensitive globs to ignore anywhere |
-| `EXTRA_DIRS` | `()` | Explicit source → destination rules |
+
 | `LOG_LEVEL` | `"INFO"` | `DEBUG` / `INFO` / `WARN` / `ERROR` |
 | `LOG_FORMAT` | `"text"` | `text` or `json` |
 | `LOG_CONSOLE` | `"auto"` | Mirror log lines to stderr: `auto` (when interactive), `always`, `never` |
@@ -355,6 +362,9 @@ where a column exists.
 | `LOG_ROTATE_KEEP` | `7` | Rotated files kept |
 | `AUDIT_LOG` | `true` | Per-target provenance trail |
 | `HEARTBEAT_INTERVAL` | `60` | Periodic summary; 0 = off |
+| `STATE_DIR` | `state/<INSTANCE_ID>` | Optional override — see [§10](#10--configuration-files-and-isolation) |
+| `LOG_DIR` | `logs/<INSTANCE_ID>` | Optional override |
+| `LOCK_FILE` | `run-<INSTANCE_ID>.lock` | Optional override |
 
 Command-line options: `--config FILE`, `--dry-run` (`-n`), `--once`,
 `--debug`, `--verbose` (`-v`), `--rediscover`, `--help`. `--dry-run`, `--once`,
@@ -370,49 +380,55 @@ delivers anything.
 
 ---
 
-## §10 — Declaring targets
+## §10 — Configuration files and isolation
 
-### `targets.tsv`
+One configuration file = one source/destination pair = one instance. Run it once
+per pair:
 
-One line per `(project, env)`, **tab-separated** — paths may therefore contain
-spaces. Use `-` or an empty field to inherit the global default.
-
-```
-# project ⇥ env ⇥ source_root ⇥ deploy_root ⇥ input_dir_name ⇥ scan_interval ⇥ enabled
-projectA	prod	/mnt/nas/projectA/prod	/mnt/nas/deploy/projectA/prod	input	10	true
-projectB	prod	/mnt/nas/projectB/prod	/mnt/nas/deploy/projectB/prod	-	-	true
+```sh
+file-deploy.sh --config /etc/file-deploy/compta-prod.conf
+file-deploy.sh --config /etc/file-deploy/rh-homol.conf
 ```
 
-A line without a tab falls back to whitespace splitting, which shifts every
-column following a value containing a space. The script reports it
-(`TARGET_EXTRA_FIELDS`, `TARGET_BAD_ENABLED`) rather than dropping the target
-silently, but tabs remain the only reliable form.
+`INSTANCE_ID` is the configuration's identity. It defaults to the file's base
+name (`compta-prod.conf` → `compta-prod`), accepts `[A-Za-z0-9._-]` only, and an
+invalid value is a configuration error (exit `1`).
 
-### `EXTRA_DIRS`
+Everything an instance owns hangs off it:
 
-To drain one specific directory to one specific destination, with no discovery.
-Each rule is `label ⇥ source ⇥ destination ⇥ depth`, where `depth` is `0`
-(direct files), `N` sublevels, or `-1` / `unlimited` for the whole subtree.
+| Path | Default |
+|---|---|
+| `STATE_DIR` | `<script dir>/state/<INSTANCE_ID>` |
+| `LOG_DIR` | `<script dir>/logs/<INSTANCE_ID>` |
+| `LOCK_FILE` | `<script dir>/run-<INSTANCE_ID>.lock` |
 
-These rules go through the **same engine**: the move, the local archive,
-stability, exclusions, the sentinel, and per-rule logs and audit trail. Their
-state lives under `<label>__extra`. They are additive: they run whether or not
-`targets.tsv` has any enabled target.
+That is the isolation mechanism, not a convenience: two configurations sharing a
+`STATE_DIR` would each mistake the other's caches and its "deployed here before"
+marker for their own, and a shared `LOCK_FILE` would make them serialise instead
+of running in parallel. The defaults make both impossible.
 
----
+The paths can still be overridden — to put them under `/var/lib` and `/var/log`,
+typically. A `STATE_DIR` already claimed by a different instance is then
+**refused at startup** (`STATE_DIR_CONFLICT`, exit `1`), before anything moves;
+`STATE_DIR/.instance` records the owner. A shared `LOCK_FILE` cannot be detected
+the same way — it just looks like a busy lock — so keep them distinct.
+
+`SOURCE_DIR` and `DEPLOY_DIR` are both required; a configuration missing either
+is refused (exit `1`).
 
 ## §11 — Persistent state
 
-Four files per target, under `state/`. **None is required for correctness.**
+Five files per instance, under `STATE_DIR`. **None is required for correctness.**
 
 | File | Content | If deleted |
 |---|---|---|
-| `<key>.deployed` | Empty marker, written on the first successful move | §8.1 loses its "we have deployed here before" signal, so a vanished destination looks like a first run |
-| `<key>.inputs.tsv` | Discovered `input` directory locations, preceded by a header signing the settings that shaped the walk | Rediscovery on the next cycle |
-| `<key>.leaves.tsv` | Settled mtimes per directory, with a format-version header | One full re-read cycle |
-| `<key>.deepscan` | Timestamp of the last deep pass | An immediate deep pass |
+| `.instance` | The `INSTANCE_ID` owning this directory | The next run reclaims it; the cross-instance guard of [§10](#10--configuration-files-and-isolation) is disarmed until then |
+| `deployed` | Empty marker, written on the first successful move | §8.1 loses its "we have deployed here before" signal, so a vanished destination looks like a first run |
+| `inputs.tsv` | Discovered `input` directory locations, preceded by a header signing the settings that shaped the walk | Rediscovery on the next cycle |
+| `leaves.tsv` | Settled mtimes per directory, with a format-version header | One full re-read cycle |
+| `deepscan` | Timestamp of the last deep pass | An immediate deep pass |
 
-The provenance record is `logs/<key>/audit.log`, not a state file: one line per
+The provenance record is `LOG_DIR/audit.log`, not a state file: one line per
 file that actually moved, carrying the outcome, the mirrored relative path, the
 archive path, the hash, the size, and — on an overwrite — the digest that was
 replaced. It rotates like the other logs.
@@ -437,15 +453,16 @@ two roots are logged once per run in the `TARGET` line.
 One structured line per event, as key/value text or JSON. Values that may
 contain tabs, newlines or `%` are escaped reversibly. Three destinations:
 
-- `logs/_run.log` — orchestration: start, targets loaded, heartbeat, summary.
-- `logs/<key>/operations.log` — everything concerning one target.
-- `logs/<key>/audit.log` — append-only trail, one line per file moved:
+- `LOG_DIR/file-deploy.log` — everything: startup, per-file events, heartbeat,
+  summary. One configuration means one target, so there is no second stream to
+  keep it apart from.
+- `LOG_DIR/audit.log` — append-only trail, one line per file moved:
   `action=` is the outcome (`DEPLOYED`, `DEPLOYED_OVERWRITE`,
   `DEPLOYED_IDENTICAL`), plus `relpath=`, `archive=`, `hash=`, `size=` and
   `prev_hash=` when an overwrite replaced something.
 
-Every line carries a `run=` correlating the execution; target lines also carry
-`project=`, `env=` and `cycle=`.
+Every line carries `run=` to correlate an execution and `instance=` to name the
+configuration; per-cycle lines also carry `cycle=`.
 
 ### Events to alert on
 
@@ -462,23 +479,25 @@ Every line carries a `run=` correlating the execution; target lines also carry
 | Code | Meaning | Expected action |
 |---|---|---|
 | `0` | Success | — |
-| `1` | Configuration error | Fix `file-deploy.conf` or `targets.tsv` |
-| `2` | No usable target | Check the source mounts |
+| `1` | Configuration error | Fix the configuration file |
+| `2` | The source is missing, unreadable or not writable | Check the source mount and its permissions |
 | `3` | Lock busy | None — expected on every cron tick |
 | `4` | A deployment write failed | Repair the destination |
 | `5` | File delivered but not removed from the source | Fix permissions on the pickup share |
 
-Precedence: no usable target, then deployment failure, then source stuck.
+Precedence: unusable source, then deployment failure, then source stuck.
 Undelivered data outranks delivered-but-not-drained.
 
 ---
 
 ## §13 — Execution
 
-A run acquires a non-blocking `flock` on `run.lock`, then loops for up to
-`RUN_DURATION` seconds, waking each target every `scan_interval`. A second
-instance exits immediately with `3`. One cron entry per minute therefore
-suffices to restart the loop if it died, without ever causing an overlap.
+A run acquires a non-blocking `flock` on the instance's `LOCK_FILE`, then loops
+for up to `RUN_DURATION` seconds, scanning every `SCAN_INTERVAL`. A second run of
+the *same* configuration exits immediately with `3`; a different configuration
+has a different lock and runs in parallel. One cron entry per minute per
+configuration therefore suffices to restart a loop that died, without ever
+causing an overlap.
 
 `--rediscover` drops a marker and exits: the running loop forces a full
 rediscovery and a deep pass on its next cycle.
@@ -496,7 +515,7 @@ rediscovery and a deep pass on its next cycle.
 | `leaves.tsv` cache | Carries a format version. The old cache is rejected — otherwise every pickup directory would look "unchanged" since the last copy-mode run and the backlog would not be drained. |
 | Old `ledger.tsv` | No longer read or written. Left on disk; delete it at leisure. |
 | Backlog in the source | **Every file still present will be deployed then removed**, in a single pass. That is the intended behaviour, but it must be a deliberate decision — rehearse with `DRY_RUN=true`. |
-| `targets.tsv` column 4 | Renamed `deploy_root`. Positional: no format change. |
+| `targets.tsv` | Gone. One configuration describes one pair; write one file per pair and run each. `EXTRA_DIRS` is gone with it — it was the escape hatch for exactly this, and it is now the whole model. |
 | Versioning | **B is no longer a version store.** A changed file now overwrites; history lives in the local archive. |
 | `REQUIRE_MOUNT` | Removed. It only ever selected a log level, never a behaviour; the source guard has always been unconditional. A leftover setting in `file-deploy.conf` is harmless and ignored. |
 
