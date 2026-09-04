@@ -286,6 +286,7 @@ row's key.
 |---|---|
 | Shared with file-dispatch | `filename`, `first_seen`, `file_date`, `destination`, `moved_at`, `status`, `retries`, `reason` |
 | Specific to a move | `relpath`, `instance`, `run_id`, `host`, `outcome`, `source_path`, `archive_path`, `pickup_dir`, `size_bytes`, `hash`, `prev_hash`, `source_created`, `age_at_pickup_s` |
+| After delivery | `target`, `still_present`, `last_check`, `transit_seconds` |
 
 `status` is the coarse state a dashboard filters on — `success`, `pending`,
 `failed` — and `outcome` refines it with the deployment verdict. `archive_path`
@@ -293,6 +294,42 @@ is the retrieval key: it is where the file actually is now. `prev_hash` chains
 to an earlier row's `hash`, so a self-join rebuilds a path's history.
 `source_created` is a real birth time and is **empty** unless the platform
 exposes one to Python — Linux does not — so build on `file_date`.
+
+### Following the file past delivery
+
+A deployment tree is a letterbox, not a resting place: another system comes and
+takes the files. That second half is not ours to instrument — but the file
+leaving is observable, and that is enough to answer "was this picked up, and how
+long did it sit there?".
+
+Each run looks at the deliveries still waiting. `target` is the exact path
+delivered — not `destination` + `filename`, because `ON_CONFLICT="version"`
+renames and probing the wrong path would answer about a file we never wrote.
+
+| Situation | `still_present` | `last_check` |
+|---|---|---|
+| Still there | `yes` | **advances every run** — "still there as of" |
+| Gone | `no` | **frozen** on the observation — the date it was consumed |
+
+Once `still_present` is `no` the row is never looked at again: the file is gone,
+there is nothing further to learn, and `last_check` must not drift.
+`transit_seconds` is `moved_at` → `last_check`, and is an **upper bound**: the
+file left at some point between the previous check and this one, so the
+resolution is the cron interval.
+
+A file the downstream system never takes is checked for ever — no bound, no
+extra setting. Two consequences follow. The "an idle run writes nothing"
+shortcut does not hold while a delivery is pending, since a touched row is a row
+to rewrite; and each run costs one existence check per pending row, on the
+share. Both are cheap while things are healthy, and both grow if the downstream
+system stops.
+
+The four columns are **appended, never inserted**, so a report written by an
+earlier version still loads with its missing columns reading empty, and a
+consumer reading by position is not broken. Rows from before carry no `target`
+and are left alone.
+
+### Settings
 
 `REPORT_SPLIT` partitions the published copy (`none` / `daily` / `monthly`): a
 row lives in exactly one file, so reading the whole folder is the report with

@@ -209,7 +209,7 @@ EXCLUDE_DIR_PATTERNS =
 #   first_seen        when the file was first seen (with milliseconds: it is
 #                     half of the row's key)
 #   file_date         the file's own mtime
-#   destination       where it was deployed; empty when the deploy was skipped
+#   destination       the directory it was deployed into; empty when skipped
 #   moved_at          when it was delivered; empty while it is not
 #   status            success | pending | failed  -- what a dashboard filters on
 #   retries           runs it took before succeeding
@@ -235,6 +235,33 @@ EXCLUDE_DIR_PATTERNS =
 #   age_at_pickup_s   how long the file waited before being taken -- a latency
 #                     KPI: a rising curve means SCAN_INTERVAL or MIN_STABLE_AGE
 #                     is too high, or the producer writes slowly.
+# ...then what happens AFTER delivery. A deployment tree is a letterbox, not a
+# resting place: another system comes and takes the files. We cannot see it
+# work, but we can see the file leave, and each run looks at the deliveries
+# still waiting.
+#   target            the exact path delivered. Not destination + filename:
+#                     ON_CONFLICT="version" renames, and probing the wrong path
+#                     would answer about a file we never wrote.
+#   still_present     yes | no -- is it still in the deployment tree? Empty when
+#                     nothing was delivered (a skipped deploy), and empty on
+#                     rows written before this existed: they carry no target and
+#                     are left alone.
+#   last_check        two regimes. While the file is there it ADVANCES every
+#                     run -- "still there as of". The run that finds it gone
+#                     FREEZES it on that instant, which turns it into the date
+#                     the file was observed consumed. Nothing looks at that row
+#                     again.
+#   transit_seconds   moved_at -> last_check, the time it sat in the deployment
+#                     tree. An UPPER BOUND by nature: it left at some point
+#                     between the previous check and this one, so the resolution
+#                     is the cron interval, not better.
+#
+# A file the downstream system never takes is checked for ever: no bound, no
+# extra setting. Two consequences to accept: the "an idle run writes nothing"
+# shortcut does not hold while a delivery is pending -- a touched row is a row
+# to rewrite -- and each run costs one existence check per pending row, on the
+# share. Cheap in the healthy case, where a row is pending for a run or two;
+# but if the downstream system stops, every run rewrites the report.
 #
 # "" disables the report entirely.
 REPORT_DIR = ""

@@ -202,11 +202,18 @@ its `retries` instead of being absent from the dataset.
 
 The first eight columns are file-dispatch's, unchanged: `filename`,
 `first_seen`, `file_date`, `destination`, `moved_at`, `status`, `retries`,
-`reason`. Then come the thirteen only a move can fill, among them
-`archive_path` (where the file actually is now, so you can retrieve it),
-`relpath` (identical on both sides, the natural join key), `prev_hash` (what an
-overwrite replaced) and `age_at_pickup_s` (a latency KPI). All documented in
+`reason`. Then come the ones only a move can fill, among them `archive_path`
+(where the file actually is now, so you can retrieve it), `relpath` (identical
+on both sides, the natural join key), `prev_hash` (what an overwrite replaced)
+and `age_at_pickup_s` (a latency KPI). All documented in
 [`file-deploy.conf.example`](file-deploy.conf.example).
+
+**The report also follows the file past delivery.** A deployment tree is a
+letterbox: another system comes and takes the files. Each run looks at what is
+still waiting, so `still_present` says whether it has been picked up and
+`transit_seconds` how long it sat there — without instrumenting anything
+downstream. `last_check` advances while the file is there and freezes on the run
+that finds it gone, which makes it the observed consumption date.
 
 In Power BI: **Get Data → Folder →** `REPORT_DIR` → **Combine & Transform**,
 filtering on `*.csv` so `report.state` is left alone. `REPORT_SPLIT = daily` or

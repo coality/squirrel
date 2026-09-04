@@ -980,6 +980,15 @@ class TestReport(Base):
         self.assertTrue(rows[0]["moved_at"])
         self.assertIn("input/archive/a.txt", rows[0]["archive_path"])
 
+    def test_new_columns_are_appended_never_inserted(self):
+        self.drop("input/a.txt")
+        self.with_report()
+        self.run_fd()
+        with open(self.published(), encoding="utf-8") as fh:
+            header = fh.readline().strip().split(",")
+        self.assertEqual(header[-4:],
+                         ["target", "still_present", "last_check", "transit_seconds"])
+
     def test_core_columns_are_the_shared_ones(self):
         self.drop("input/a.txt")
         self.with_report()
@@ -1042,9 +1051,23 @@ class TestReport(Base):
         self.assertEqual(sorted(r["filename"] for r in self.read()),
                          ["a.txt", "b.txt"])
 
-    def test_idle_run_rewrites_nothing(self):
+    def test_idle_run_rewrites_nothing_once_nothing_is_pending(self):
+        """The shortcut holds again once the downstream system has taken the file.
+
+        While a delivery is still sitting in the deployment tree its row is
+        touched every run -- that is the heartbeat, and the price of following
+        what happens after delivery.
+        """
         self.drop("input/a.txt")
         self.with_report()
+        self.run_fd()
+        # Pending: each run advances last_check, so the report is rewritten.
+        first = self.read()[0]["last_check"]
+        time.sleep(1.1)
+        self.run_fd()
+        self.assertNotEqual(self.read()[0]["last_check"], first, "heartbeat")
+        # Consumed: the row freezes, and idle runs go quiet again.
+        os.remove(os.path.join(self.dep, "input", "a.txt"))
         self.run_fd()
         before = dict((f, os.stat(os.path.join(self.rep(), f)).st_mtime_ns)
                       for f in os.listdir(self.rep()))
@@ -1089,6 +1112,84 @@ class TestReport(Base):
         self.assertEqual(len(rows), 2, "each delivery opens its own row")
         self.assertEqual(rows[1]["prev_hash"], rows[0]["hash"],
                          "a self-join rebuilds the history of a path")
+
+    def test_target_is_the_exact_path_delivered(self):
+        # destination is the directory, target the file: they differ as soon as
+        # a collision renames, and probing the wrong one would answer about a
+        # file we did not write.
+        self.drop("input/f.txt", "incoming\n")
+        os.makedirs(os.path.join(self.dep, "input"), exist_ok=True)
+        with open(os.path.join(self.dep, "input", "f.txt"), "w") as fh:
+            fh.write("already\n")
+        open(os.path.join(self.dep, ".file-deploy-root"), "a").close()
+        self.with_report(ON_CONFLICT="version")
+        self.run_fd()
+        row = self.read()[0]
+        self.assertTrue(row["target"].endswith(".txt"))
+        self.assertNotEqual(os.path.basename(row["target"]), "f.txt",
+                            "the versioned name, not the input name")
+        self.assertEqual(row["destination"], os.path.dirname(row["target"]))
+        self.assertTrue(os.path.exists(row["target"]))
+
+    def test_consumption_is_observed_and_then_frozen(self):
+        self.drop("input/a.txt")
+        self.with_report()
+        self.run_fd()
+        row = self.read()[0]
+        self.assertEqual(row["still_present"], "yes")
+        self.assertTrue(row["last_check"])
+        self.assertEqual(row["transit_seconds"], "")
+
+        # The downstream system takes it.
+        time.sleep(1.1)
+        os.remove(os.path.join(self.dep, "input", "a.txt"))
+        self.run_fd()
+        row = self.read()[0]
+        self.assertEqual(row["still_present"], "no")
+        self.assertTrue(int(row["transit_seconds"]) >= 1,
+                        "moved_at -> the run that noticed")
+        frozen = row["last_check"]
+
+        # Nothing looks at it again: last_check must not drift.
+        time.sleep(1.1)
+        self.run_fd()
+        self.run_fd()
+        row = self.read()[0]
+        self.assertEqual(row["last_check"], frozen, "frozen on the observation")
+        self.assertEqual(row["still_present"], "no")
+
+    def test_a_skipped_deploy_is_never_probed(self):
+        # ON_CONFLICT=skip delivers nothing, so there is no target to follow.
+        self.drop("input/f.txt", "incoming\n")
+        os.makedirs(os.path.join(self.dep, "input"), exist_ok=True)
+        with open(os.path.join(self.dep, "input", "f.txt"), "w") as fh:
+            fh.write("already\n")
+        open(os.path.join(self.dep, ".file-deploy-root"), "a").close()
+        self.with_report(ON_CONFLICT="skip")
+        self.run_fd()
+        row = self.read()[0]
+        self.assertEqual(row["outcome"], "DEPLOY_SKIPPED")
+        self.assertEqual(row["target"], "")
+        self.assertEqual(row["still_present"], "")
+
+    def test_rows_from_an_older_version_are_left_alone(self):
+        # No target column: not probed, and still_present stays empty.
+        self.drop("input/a.txt")
+        self.with_report()
+        self.run_fd()
+        import csv as _csv
+        state = os.path.join(self.rep(), "report.state")
+        with open(state, newline="") as fh:
+            rows = list(_csv.DictReader(fh))
+        for r in rows:
+            r["target"] = r["still_present"] = r["last_check"] = ""
+        with open(state, "w", newline="") as fh:
+            w = _csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+            w.writeheader(); w.writerows(rows)
+        self.run_fd()
+        row = self.read()[0]
+        self.assertEqual(row["still_present"], "")
+        self.assertEqual(row["last_check"], "")
 
     def test_rehearsal_writes_no_report(self):
         self.drop("input/a.txt")

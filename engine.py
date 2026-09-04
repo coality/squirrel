@@ -171,6 +171,10 @@ REPORT_COLUMNS = (
     "relpath", "instance", "run_id", "host", "outcome",
     "source_path", "archive_path", "pickup_dir",
     "size_bytes", "hash", "prev_hash", "source_created", "age_at_pickup_s",
+    # Appended, never inserted: a report written by an older version still
+    # loads, its missing columns simply read empty, and a consumer reading by
+    # position is not broken.
+    "target", "still_present", "last_check", "transit_seconds",
 )
 
 # A row's coarse state, shared with file-dispatch. `outcome` refines it with the

@@ -368,6 +368,19 @@ def iso(epoch):
         return ""
 
 
+def _elapsed(since, until):
+    """Whole seconds between two report timestamps, or "" if either is unusable.
+
+    An upper bound by nature: the file left at some point between the previous
+    check and this one, and the cron interval is the resolution.
+    """
+    try:
+        delta = datetime.fromisoformat(until) - datetime.fromisoformat(since or "")
+    except (ValueError, TypeError):
+        return ""
+    return str(max(0, int(delta.total_seconds())))
+
+
 def now_precise():
     """Same, with milliseconds.
 
@@ -503,6 +516,41 @@ class Runner(object):
         if status == "success":
             row["moved_at"] = iso(time.time())
         return key
+
+    def report_check_targets(self):
+        """Follow what the downstream system does with what we delivered.
+
+        A deployment tree is a letterbox, not a resting place: another system
+        comes and takes the files. We cannot see it work, but we can see the
+        file leave, and that is enough to answer the question asked after the
+        fact -- was this picked up, and how long did it sit there?
+
+        So each run looks at the deliveries still waiting. While the file is
+        there, last_check keeps moving: it reads as "still there as of". The run
+        that finds it gone freezes last_check on that instant, which turns it
+        into the date the file was observed consumed, and records how long it
+        had been waiting. Nothing looks at that row again -- the file is gone,
+        there is nothing further to learn, and last_check must not drift.
+
+        Rows written before this existed carry no target and are left alone.
+        """
+        if self._report is None or not self.cfg.REPORT_DIR or self.dry:
+            return
+        now = iso(time.time())
+        for key, row in self._report.items():
+            if row.get("status") != engine.STATUS_SUCCESS:
+                continue
+            if row.get("still_present") != "yes":
+                continue
+            target = row.get("target")
+            if not target:
+                continue
+            row["last_check"] = now
+            if not os.path.exists(target):
+                row["still_present"] = "no"
+                row["transit_seconds"] = _elapsed(row.get("moved_at"), now)
+            # Changed: spare it from retention, and make sure it is written.
+            self._report_seen.add(key)
 
     def report_save(self):
         """Write the state, then publish the CSV from it.
@@ -1268,9 +1316,17 @@ class Runner(object):
             self.log("INFO", outcome, relpath=relpath, size=size,
                      hash=digest[:8] + "…", archive=arch_rel)
             self.n_deployed += 1
+        delivered = "" if outcome == engine.DEPLOY_SKIPPED else dpath
         self.report_note(relpath, engine.STATUS_SUCCESS, outcome=outcome,
                          reason="", file_date=iso(mtime),
-                         destination=("" if outcome == engine.DEPLOY_SKIPPED else dpath),
+                         # destination is the directory, target the exact path
+                         # delivered -- they differ as soon as ON_CONFLICT
+                         # ="version" renames, and probing the wrong one would
+                         # answer about a file that is not the one we wrote.
+                         destination=(os.path.dirname(delivered) if delivered else ""),
+                         target=delivered,
+                         still_present=("yes" if delivered else ""),
+                         last_check=(iso(time.time()) if delivered else ""),
                          source_path=src, archive_path=archive_path or "",
                          pickup_dir=pickup, size_bytes=size, hash=digest,
                          prev_hash=prev or "",
@@ -1601,6 +1657,7 @@ def main(argv=None):
             break
         time.sleep(max(1, cfg.SCAN_INTERVAL))
     log.cycle = None
+    runner.report_check_targets()
     runner.report_save()
 
     log("INFO", "RUN_SUMMARY", cycles=cycle, scanned=runner.n_scanned,
