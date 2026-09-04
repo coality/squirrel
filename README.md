@@ -2,7 +2,7 @@
 
 Drain `input` directories on a mounted NAS share: **deploy** each file into a
 mirror tree, then **move it out** of the source into a local `archive/` beside
-where it came from. Cron-driven, single bash script, no dependencies to install.
+where it came from. Cron-driven, pure Python, no dependencies to install.
 
 > ⚠️ **file-deploy deletes from the source.** Rehearse every new configuration with
 > `DRY_RUN=true` before enabling it. A wrong `source_root` is not recoverable
@@ -28,24 +28,29 @@ operator's guide.
 
 ## Requirements
 
-Only basic, universally available Linux tools — nothing to install:
+**Python 3.9 or newer, standard library only** — nothing to install. Plus `cron`
+to schedule it.
 
-- `bash` >= 4.2
-- GNU coreutils: `stat`, `cp`, `mv`, `mkdir`, `date`, `sha256sum`
-- `find` (GNU findutils)
-- `flock` (util-linux)
-- `cron`
+```
+file-deploy.sh   thin launcher: picks the interpreter, hands off to deploy.py
+deploy.py        the whole program: CLI, lock, discovery, the transaction, logs
+engine.py        the pure core: config, conflict policy, naming rule, encoders
+```
 
-No systemd, no daemon, no external service. A locally mounted SMB/CIFS share is
-assumed to already exist; mounting it is out of scope.
+No daemon, no systemd, no external service. A locally mounted SMB/CIFS share is
+assumed to already exist; mounting it is out of scope. Set `FILE_DEPLOY_PYTHON`
+if `python3` on `PATH` is not the interpreter you want.
 
 ## Install
 
 ```sh
 cp file-deploy.conf.example compta-prod.conf
-# edit it to match your environment
+# edit it, then check it before it ever touches your files
+./file-deploy.sh --config compta-prod.conf --check
 ```
 
+`--check` validates the configuration, prints the resolved paths and scans
+nothing. It reports **every** problem at once rather than stopping at the first.
 `logs/` and `state/` are created on first run, namespaced by `INSTANCE_ID`.
 
 ## Configure
@@ -57,13 +62,14 @@ root. To handle another pair, write another file and give it its own run.
 cp file-deploy.conf.example compta-prod.conf
 ```
 
-The four settings that matter:
+The format is `NAME = value`, one per line, `#` for comments; quotes are
+optional and lists are comma-separated. Unknown names and bad values are refused.
 
-```sh
-INSTANCE_ID="compta-prod"                 # identity; everything hangs off it
-SOURCE_DIR="/mnt/nas/compta"              # root searched for input/ directories
-DEPLOY_DIR="/mnt/nas/deploy/compta"       # root receiving the mirror
-MIN_STABLE_AGE=10                         # safety: see below
+```
+INSTANCE_ID = compta-prod              # identity; everything hangs off it
+SOURCE_DIR  = /mnt/nas/compta          # root searched for input/ directories
+DEPLOY_DIR  = /mnt/nas/deploy/compta   # root receiving the mirror
+MIN_STABLE_AGE = 10                    # safety: see below
 ```
 
 `SOURCE_DIR` is a **root**, not the pickup directory: file-deploy looks under it
@@ -210,17 +216,20 @@ Nothing is written during a rehearsal, so `--dry-run` stays inert.
 
 ## Testing
 
-Pure-bash end-to-end suite, no external dependency:
+Standard library `unittest`, no external dependency:
 
 ```sh
-bash tests/run-e2e.sh
+python3 -m unittest discover -s tests -v
 ```
 
-It builds isolated sandboxes, runs the real script against them, and asserts on
-the filesystem, the logs and the exit codes. A non-zero exit means a test
-failed. The suite deliberately leads with the no-loss properties: an unwritable
-or unmounted destination, an unreadable file, a dry run and a mid-copy rewrite
-must all leave the source intact.
+`tests/test_engine.py` unit-tests the pure core — the naming rule, the conflict
+policy, the encoders, the configuration parser. `tests/test_e2e.py` builds
+isolated sandboxes, runs the real entry point as a subprocess and asserts on the
+filesystem, the logs and the exit codes.
+
+The suite deliberately leads with the no-loss properties: an unwritable or
+unmounted destination, an unreadable file, a rehearsal and a file rewritten
+mid-copy must all leave the source intact.
 
 ## License
 

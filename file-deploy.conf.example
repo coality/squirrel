@@ -1,10 +1,17 @@
 # file-deploy.conf — one configuration, one source, one destination.
 #
+# Syntax: NAME = value, one per line. Quotes are optional and only needed to
+# protect leading/trailing spaces; everything after an unquoted # is a comment.
+# Lists (INPUT_DIR_NAME, EXCLUDE_DIR_PATTERNS) are comma-separated.
+# Unknown names and bad values are refused -- run --check to see them all.
+#
 # Copy this file and adjust. To handle another source/destination pair, write
 # another configuration file and give it its own run:
 #
 #   file-deploy.sh --config /etc/file-deploy/compta-prod.conf
 #   file-deploy.sh --config /etc/file-deploy/rh-homol.conf
+#
+# Check a configuration before using it:  file-deploy.sh --config X.conf --check
 #
 # WARNING: this tool DELETES from the source. Rehearse with --dry-run first.
 
@@ -59,7 +66,7 @@ MIN_STABLE_AGE=10
 # archive path, without writing or deleting anything. --dry-run does the same
 # from the command line and is preferred: it cannot be left switched on by
 # accident. Whenever it is active the run logs DRY_RUN_ACTIVE at WARN.
-DRY_RUN=false
+DRY_RUN = no
 
 # Sentinel file at the root of DEPLOY_DIR. It is what tells a mounted deployment
 # share apart from a bare, unmounted mount point: without it, an unmounted
@@ -80,9 +87,8 @@ DEPLOY_MARKER=".file-deploy-root"
 LOCAL_ARCHIVE_DIR="archive"
 
 # Content hash, used to verify every copy before it is published and to name
-# archive entries. Single word, must accept a file path and print the digest
-# first (sha256sum, sha1sum, md5sum, b2sum...).
-HASH_CMD="sha256sum"
+# archive entries. Any algorithm hashlib knows: sha256, sha1, md5, blake2b...
+HASH_ALGO = sha256
 
 # ===========================================================================
 # What to do when the destination already holds a DIFFERENT file
@@ -153,7 +159,7 @@ DISCOVERY_INTERVAL=1800
 DISCOVERY_MAXDEPTH=0
 
 # Skip a directory whose mtime has not changed since the last pass.
-USE_DIR_MTIME_SKIP=true
+USE_DIR_MTIME_SKIP = yes
 # The skip above trusts the share to bump a directory's mtime when a file is
 # added. Every DEEP_SCAN_INTERVAL seconds one pass ignores the skip and lists
 # everything, which recovers a share that does not. It is cheap: a drained
@@ -164,8 +170,8 @@ DEEP_SCAN_INTERVAL=300
 # Directory-name patterns (case-insensitive globs) to ignore anywhere in the
 # tree. A matching directory is skipped and never descended into. Useful for a
 # producer's staging directories. Bash array; empty = off.
-EXCLUDE_DIR_PATTERNS=()
-# EXCLUDE_DIR_PATTERNS=('~*' '*.tmp' '*en_cours*')
+EXCLUDE_DIR_PATTERNS =
+# EXCLUDE_DIR_PATTERNS = "~*, *.tmp, *en_cours*"
 
 # ===========================================================================
 # CSV report, for BI tools
@@ -194,16 +200,15 @@ EXCLUDE_DIR_PATTERNS=()
 #   archive_path      absolute path of the local archive copy -- THIS is what you
 #                     use to retrieve the file afterwards
 #   size_bytes        integer
-#   hash              full digest of the content ($HASH_CMD)
+#   hash              full digest of the content (HASH_ALGO)
 #   prev_hash         digest that was already at the destination when there was a
 #                     collision; empty otherwise. It chains to an earlier row's
 #                     hash, so a self-join rebuilds a path's whole history.
 #   source_modified   the file's mtime. On Linux this is the closest thing to a
 #                     reliable "creation date" -- see below
-#   source_created    real birth time when the filesystem records one. ext4 and
-#                     xfs usually do; CIFS/SMB mounts usually do NOT, and the
-#                     column is then EMPTY. Check your share before building on
-#                     it (stat -c '%w' somefile); use source_modified instead.
+#   source_created    real birth time, and EMPTY unless the platform exposes one
+#                     to Python (macOS/BSD do; Linux does not, whatever the
+#                     filesystem). Treat it as a bonus: build on source_modified.
 #   age_at_pickup_s   how long the file sat in the pickup directory before being
 #                     taken (now - mtime). A latency KPI: a rising curve means
 #                     SCAN_INTERVAL or MIN_STABLE_AGE is too high, or the
@@ -227,14 +232,14 @@ REPORT_DELIMITER=","
 # ===========================================================================
 # Logging
 # ===========================================================================
-LOG_LEVEL="INFO"                # DEBUG | INFO | WARN | ERROR
-LOG_FORMAT="text"               # text (key=value) or json
-LOG_CONSOLE="auto"              # auto (mirror to the terminal when interactive)
-                                # | always | never
-LOG_ROTATE_MAX_BYTES=10485760   # rotate a log past 10 MB (0 = never)
-LOG_ROTATE_KEEP=7               # number of rotated files kept
-AUDIT_LOG=true                  # append-only trail of what moved
-HEARTBEAT_INTERVAL=60           # seconds between "still alive" summaries (0 = off)
+LOG_LEVEL      = INFO       # DEBUG | INFO | WARN | ERROR
+LOG_FORMAT     = text       # text (key=value) or json
+LOG_CONSOLE    = auto       # auto (mirror to the terminal when interactive)
+                            # | always | never
+LOG_MAX_BYTES  = 10485760   # rotate a log past 10 MB (0 = never)
+LOG_KEEP       = 7          # number of rotated files kept
+AUDIT_LOG      = yes        # append-only trail of what moved
+HEARTBEAT_INTERVAL = 60     # seconds between "still alive" summaries (0 = off)
 
 # ===========================================================================
 # Paths — optional

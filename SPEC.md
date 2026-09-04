@@ -1,6 +1,6 @@
 # file-deploy — move-mode specification
 
-**Revision 2** · bash ≥ 4.2 · 2026-09-03
+**Revision 3** · Python ≥ 3.9 · 2026-09-04
 
 file-deploy drains pickup directories on a mounted NAS share: it **deploys** each
 file into a mirror tree, then **moves it out** of the source, keeping it in a
@@ -13,7 +13,7 @@ guard exists. The [README](README.md) is the operator's guide.
 
 ## §1 — Scope
 
-file-deploy is a single cron-driven bash script. **One configuration file
+file-deploy is a cron-driven Python program. **One configuration file
 describes one pair**: a source root and a deployment root. Under the source root
 it locates directories with a given name (`input` by default), and for every
 file found there it runs the transaction of
@@ -31,8 +31,11 @@ To handle another pair, write another configuration file and give it its own
 run. There is no multi-target file: a configuration is the unit of isolation,
 of scheduling and of failure.
 
-Dependencies are bash ≥ 4.2, GNU coreutils/findutils and `flock`. No daemon, no
-systemd, no external service. Mounting the shares is out of scope: file-deploy
+Requires **Python 3.9 or newer and nothing else** — standard library only. The
+program is `deploy.py`; `engine.py` holds the parts that can be decided without
+touching the tree (configuration, conflict policy, naming rule, encoders), and
+`file-deploy.sh` is a thin launcher that only picks the interpreter. No daemon,
+no systemd, no external service. Mounting the shares is out of scope: file-deploy
 observes their state and refuses to act when in doubt.
 
 ---
@@ -125,7 +128,7 @@ writes in place, the mtime keeps moving and the age stays under the threshold.
 
 ### 2. Hash the source
 
-`$HASH_CMD` (default `sha256sum`) computes the digest used to verify the
+`HASH_ALGO` (default `sha256`) computes the digest used to verify the
 deployment, classify the collision, and name the archive entry.
 
 *Unreadable* → `HASH_FAILED`; never consumed. We do not delete what we could not
@@ -235,9 +238,9 @@ Columns: `run_id`, `deployed_at`, `project`, `env`, `outcome`, `file_name`,
 `pickup_dir`, `host`.
 
 `archive_path` is the retrieval key: it is where the file actually is now.
-`source_created` is a real birth time and is **empty** on filesystems that do
-not record one — CIFS/SMB usually does not, so `source_modified` is the field to
-build on. `age_at_pickup_s` is `now − mtime` at pickup, a latency measure of how
+`source_created` is a real birth time and is **empty** unless the platform
+exposes one to Python — macOS and the BSDs do, **Linux does not, whatever the
+filesystem**. Treat it as a bonus and build on `source_modified`. `age_at_pickup_s` is `now − mtime` at pickup, a latency measure of how
 long a file waited before being taken.
 
 ### In the local archive
@@ -347,7 +350,7 @@ where a column exists.
 | `REPORT_DIR` | `""` | Directory receiving the daily CSV of everything that moved; `""` disables it |
 | `REPORT_DELIMITER` | `","` | CSV field separator (`";"` for a French-locale Excel/Power BI) |
 | `DEPLOY_MARKER` | `".file-deploy-root"` | Deployment-root sentinel |
-| `HASH_CMD` | `"sha256sum"` | Hash command, single word |
+| `HASH_ALGO` | `"sha256"` | Any algorithm `hashlib` knows |
 | `DRY_RUN` | `false` | Inert rehearsal: no write, no delete |
 | `DISCOVERY_INTERVAL` | `1800` | Seconds between full rediscoveries |
 | `DISCOVERY_MAXDEPTH` | `0` | Depth cap; 0 = unlimited |
@@ -358,18 +361,24 @@ where a column exists.
 | `LOG_LEVEL` | `"INFO"` | `DEBUG` / `INFO` / `WARN` / `ERROR` |
 | `LOG_FORMAT` | `"text"` | `text` or `json` |
 | `LOG_CONSOLE` | `"auto"` | Mirror log lines to stderr: `auto` (when interactive), `always`, `never` |
-| `LOG_ROTATE_MAX_BYTES` | `10485760` | Rotate past this; 0 = never |
-| `LOG_ROTATE_KEEP` | `7` | Rotated files kept |
+| `LOG_MAX_BYTES` | `10485760` | Rotate past this; 0 = never |
+| `LOG_KEEP` | `7` | Rotated files kept |
 | `AUDIT_LOG` | `true` | Per-target provenance trail |
 | `HEARTBEAT_INTERVAL` | `60` | Periodic summary; 0 = off |
 | `STATE_DIR` | `state/<INSTANCE_ID>` | Optional override — see [§10](#10--configuration-files-and-isolation) |
 | `LOG_DIR` | `logs/<INSTANCE_ID>` | Optional override |
 | `LOCK_FILE` | `run-<INSTANCE_ID>.lock` | Optional override |
 
-Command-line options: `--config FILE`, `--dry-run` (`-n`), `--once`,
-`--debug`, `--verbose` (`-v`), `--rediscover`, `--help`. `--dry-run`, `--once`,
-`--debug` and `--verbose` are applied *after* the configuration is sourced, so a
-flag cannot be overridden by the file.
+The file is `NAME = value`, one per line, `#` for comments; quotes are optional
+and lists are comma-separated. An unknown name or an unusable value is a
+configuration error, never a guess, and **every** problem is collected so one
+`--check` reports the lot.
+
+Command-line options: `--config FILE` (`-c`), `--dry-run` (`-n`), `--once`,
+`--check`, `--rediscover`, `--debug`, `--verbose` (`-v`), `--help`. `--dry-run`,
+`--once`, `--debug` and `--verbose` are applied *after* the file is read, so a
+flag cannot be overridden by it. `--check` validates, prints the resolved paths
+and scans nothing.
 
 A rehearsal is inert in both directions: it writes nothing to the source or the
 deployment tree, and it records nothing that would change a later run — no

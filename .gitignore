@@ -1,13 +1,16 @@
 # Runtime state and logs (never versioned)
 logs/
 state/
-run.lock
+run-*.lock
 
 # Real configuration (only the *.example files are versioned)
 file-deploy.conf
-targets.tsv
 *.local.conf
 
 # Test scratch
 tests/tmp/
 *.tmp
+
+# Python
+__pycache__/
+*.py[co]
