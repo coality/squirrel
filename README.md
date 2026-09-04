@@ -1,303 +1,156 @@
-# squirrel
+# file-deploy
 
-Copy files dropped into `input` directories on a mounted NAS share into a mirror
-archive tree — **exactly once**, with content-hash deduplication. Driven by cron.
+Drain `input` directories on a mounted NAS share: **deploy** each file into a
+mirror tree, then **move it out** of the source into a local `archive/` beside
+where it came from. Cron-driven, single bash script, no dependencies to install.
 
-The source tree is treated as **strictly read-only**: the script only reads and
-copies, it never modifies or deletes a source file.
+> ⚠️ **file-deploy deletes from the source.** Rehearse every new configuration with
+> `DRY_RUN=true` before enabling it. A wrong `source_root` is not recoverable
+> from the logs.
 
-## Features
+```
+before                             after
+─────────────────────────────      ────────────────────────────────────────────
+A/proj/input/report.xml            A/proj/input/archive/report.xml     (moved)
+B/proj/input/            (empty)   B/proj/input/report.xml          (deployed)
+```
 
-- **Multi-target**: many `(project, environment)` pairs, each with its own
-  source and archive roots, described in a simple tab-separated `targets.tsv`.
-- **Exact mirror**: a file at `<source>/a/b/input/test.xml` is copied to
-  `<archive>/a/b/input/test.xml`.
-- **Extra directories**: besides the discovered `input` trees, archive one or
-  more **specific directories to specific destinations** (no discovery, per-rule
-  depth) via `EXTRA_DIRS` — see [Extra directories](#extra-directories-specific-source--destination).
-- **What is collected**: for each `input` directory, the files **directly inside it**
-  *and* the files **directly inside its direct sub-directories** (e.g.
-  `input/supplier/`). Deeper levels are never scanned — `input/supplier/archive/`
-  is ignored. Sub-directories are re-checked every cycle (a new one is picked up
-  immediately); new `input` directories themselves are found at discovery
-  (`DISCOVERY_INTERVAL` or `--rediscover`). Directories whose name matches
-  `EXCLUDE_DIR_PATTERNS` (case-insensitive globs) are skipped entirely and never
-  descended into.
-- **Archive once, dedup by hash**:
-  - never seen → copied under its own name;
-  - same name **and** same content hash → nothing to do;
-  - same name, **different** content → copied as `test_YYYYMMDD_HHMMSS.xml`
-    (the previous archived version is kept).
-- **In-progress safe**: a file is archived only once it has been stable for
-  `MIN_STABLE_AGE` seconds, so partially written files are never archived.
-- **Minimal disk I/O**: input directory locations are cached and only
-  rediscovered periodically; a directory whose modification time has not
-  changed is skipped without listing it.
-- **Production logging, per target**: one operations log and one append-only
-  audit log per target, with correlation ids, rotation, text or JSON output.
-- **Safe concurrency**: an internal `flock` prevents overlapping cron runs.
+- **A** — the source share. Files land in `input` directories; file-deploy drains
+  them. What it takes out is not deleted, it is renamed one level down into
+  `archive/`.
+- **B** — the deployment tree. Mirrors the source layout and holds the
+  **current** state: a changed file overwrites, and says so. Version history
+  lives in A's `archive/`, not here.
+
+**[SPEC.md](SPEC.md) is the normative reference** — the per-file transaction, the
+failure matrix, the guards and every configuration key. This README is the
+operator's guide.
 
 ## Requirements
 
-Only very basic, universally available Linux tools — **nothing to install**:
+Only basic, universally available Linux tools — nothing to install:
 
-- `bash` >= 4
+- `bash` >= 4.2
 - GNU coreutils: `stat`, `cp`, `mv`, `mkdir`, `date`, `sha256sum`
-- `find` (GNU findutils, or any compatible implementation)
+- `find` (GNU findutils)
 - `flock` (util-linux)
 - `cron`
 
-Works the same on RedHat/CentOS/Rocky, Debian/Ubuntu, Slackware, SUSE, Arch, …
-No systemd, no external services. A locally mounted SMB/CIFS share is assumed to
-already exist (mounting the share is out of scope).
+No systemd, no daemon, no external service. A locally mounted SMB/CIFS share is
+assumed to already exist; mounting it is out of scope.
 
 ## Install
 
 ```sh
-cp squirrel.conf.example squirrel.conf
-cp targets.tsv.example targets.tsv
-mkdir -p logs state          # created on first run too, but the cron line below writes to logs/
-# edit squirrel.conf and targets.tsv to match your environment
+cp file-deploy.conf.example file-deploy.conf
+cp targets.tsv.example  targets.tsv
+# edit both to match your environment
 ```
 
-## Configuration
+`logs/` and `state/` are created on first run.
 
-### `squirrel.conf`
+## Configure
 
-Global defaults, sourced by the script. See `squirrel.conf.example` for the
-full list. Most-used options:
+Two files, both documented inline:
 
-| Option | Default | Meaning |
-|---|---|---|
-| `INPUT_DIR_NAME` | `input` | exact name(s) of the scanned directory; several allowed, space/comma-separated (case-sensitive, no globs), e.g. `"input Input input_"` |
-| `SCAN_INTERVAL` | `10` | seconds between internal passes |
-| `RUN_DURATION` | `55` | max seconds per cron run (keep < 60) |
-| `MIN_STABLE_AGE` | `5` | min file age before it is archived |
-| `REQUIRE_MOUNT` | `true` | skip a target whose source is missing/unreadable |
-| `DISCOVERY_INTERVAL` | `1800` | seconds between full-tree rediscoveries |
-| `DISCOVERY_MAXDEPTH` | `0` | cap the discovery walk depth (0 = unlimited) |
-| `USE_DIR_MTIME_SKIP` | `true` | skip directories whose mtime is unchanged |
-| `EXCLUDE_DIR_PATTERNS` | `()` | dir-name globs (case-insensitive) to ignore anywhere, e.g. `('*archived*')` |
-| `EXTRA_DIRS` | `()` | explicit `label⇥source⇥destination⇥depth` rules (see [Extra directories](#extra-directories-specific-source--destination)) |
-| `HASH_CMD` | `sha256sum` | content hash command |
-| `DRY_RUN` | `false` | simulate without writing anything |
-| `LOG_LEVEL` | `INFO` | `DEBUG`/`INFO`/`WARN`/`ERROR` |
-| `LOG_FORMAT` | `text` | `text` or `json` |
-| `LOG_ROTATE_MAX_BYTES` | `10485760` | rotate a log past this size (0 = never) |
-| `LOG_ROTATE_KEEP` | `7` | rotated files kept |
+- **`file-deploy.conf`** — global defaults. Every key is explained in
+  [`file-deploy.conf.example`](file-deploy.conf.example); the full table is in
+  [SPEC.md §9](SPEC.md#9--configuration).
+- **`targets.tsv`** — one **tab-separated** line per `(project, env)`:
 
-### `targets.tsv`
+  ```
+  project ⇥ env ⇥ source_root ⇥ deploy_root ⇥ input_dir_name ⇥ scan_interval ⇥ enabled
+  ```
 
-One line per `(project, environment)`, **tab-separated** (so paths may contain
-spaces). Use `-` or an empty field to inherit the global default. Lines starting
-with `#` are comments.
+  Use `-` to inherit the global default. Tabs matter: a space-aligned line is
+  split on whitespace, which shifts every column after a value containing one.
 
-```
-# project   env    source_root                 archive_root                       input_dir_name  scan_interval  enabled
-projectA     prod   /mnt/nas/projectA/prod      /mnt/nas/archive/projectA/prod     input           10             true
-projectB     prod   /mnt/nas/projectB/prod      /mnt/nas/archive/projectB/prod     -               -              true
-```
+The three settings worth deciding before you start:
 
-- Required columns: `project`, `env`, `source_root`, `archive_root`.
-- Optional (inherit the default if `-`): `input_dir_name`, `scan_interval`, `enabled`.
-  `input_dir_name` may list **several exact names** (space- or comma-separated,
-  case-sensitive, no globs), e.g. `input Input input_` — a directory is scanned
-  if its name matches any of them.
-- `project`/`env` also name the per-target state and logs, and appear as
-  correlation fields in every log line.
+| Setting | Why it matters |
+|---|---|
+| `MIN_STABLE_AGE` | **Safety.** A file is only taken once untouched for this long. `0` is safe only if every producer writes elsewhere and renames into place — most NAS producers do not. See [SPEC.md §8.3](SPEC.md#83-stability-and-in-place-writes). |
+| `LOCAL_ARCHIVE_DIR` | Name of the archive created beside each drained file (default `archive`). It is matched exactly and pruned from every walk, so a directory of that name is never deployed. Rename it if that collides with a real directory in your tree. |
+| `DEPLOY_MARKER` | Sentinel guarding each `deploy_root`. Leave it on: it is what stops an unmounted destination from draining your source into nothing. |
 
-### Extra directories (specific source → destination)
-
-`targets.tsv` describes trees to *scan* for `input` directories. When you instead
-want to archive **one specific directory to one specific place** — with no
-discovery — declare it in `EXTRA_DIRS` in `squirrel.conf`. Each rule is a
-tab-separated array element (paths may contain spaces):
-
-```
-label ⇥ source ⇥ destination ⇥ depth
-```
+## Rehearse, then enable
 
 ```sh
-EXTRA_DIRS=(
-  $'reports\t/mnt/nas/app/reports\t/mnt/nas/archive/reports\t2'
-  $'daily\t/mnt/nas/daily out\t/mnt/nas/archive/daily\t0'
-  $'exports\t/mnt/nas/app/exports\t/mnt/nas/archive/exports\tunlimited'
-)
+# 1. see what would happen, without writing or deleting anything
+./file-deploy.sh --config file-deploy.conf --once --debug   # with DRY_RUN=true
+
+# 2. read every WOULD_MOVE line: source, target, archive path
+grep WOULD_MOVE logs/*/operations.log
+
+# 3. set DRY_RUN=false and run one pass for real
+./file-deploy.sh --config file-deploy.conf --once --verbose
 ```
 
-- **`label`** — the rule's identity. Its ledger and logs live under
-  `<label>__extra` (`state/<label>__extra.ledger.tsv`, `logs/<label>__extra/`),
-  exactly like a `(project, env)` target. Must be unique.
-- **`source`** — the exact directory to archive (a fixed path; no `input` lookup).
-- **`destination`** — where content is mirrored: `<source>/sub/f` →
-  `<destination>/sub/f`.
-- **`depth`** — how deep to go: `0` = only files directly in `source`; `N` = also
-  `N` sub-levels deep (`1` matches the `input` scanner); `-1` (or `unlimited` /
-  `inf` / `all`) = the whole subtree. Empty or `-` defaults to `1`.
-
-Extra directories go through the **same engine** as targets — content-hash
-deduplication, timestamped versioning, `MIN_STABLE_AGE` stability,
-`EXCLUDE_DIR_PATTERNS`, `DRY_RUN`, per-rule operations/audit logs and the mount
-guard — and appear in `HEARTBEAT` / `RUN_SUMMARY` alongside regular targets. They
-are **additive**: they run whether or not `targets.tsv` has any enabled target.
-
-## How it works
-
-Each cron run acquires the lock, then loops for up to `RUN_DURATION` seconds,
-scanning every enabled target once per `SCAN_INTERVAL`. For each target it:
-
-1. locates the `input` directories (cached; full-tree walk only every
-   `DISCOVERY_INTERVAL`, pruned at each input so it never walks their subtrees —
-   a new `input` dir is seen at the next rediscovery or via `--rediscover`);
-2. each cycle, one bulk directory read per `input` returns the input and its
-   direct sub-directories with their mtimes in a single round-trip; unchanged
-   dirs are skipped, the rest have their direct files listed (each file lands in
-   the mirror under `…/input/…` or `…/input/<subdir>/…`). A new sub-directory is
-   picked up on the next cycle;
-3. for each file: skips it if too recent (stability), or already archived
-   (per-target ledger); otherwise hashes it and copies new content into the
-   mirror (base name, or a timestamped version), appending to the ledger and
-   the audit log.
-
-Copies are atomic (`cp` to a temporary name, then `mv`), so an interrupted run
-never leaves a partial archive file. The source is never written to.
-
-### Capture reliability
-
-This tool is a passive, read-only poller: it captures a file only while the file
-is still present. Whether every file is archived before an external consumer
-removes it depends on timing:
-
-- The scanner runs **continuously** (an internal loop every `SCAN_INTERVAL`
-  seconds), so a new file is seen within roughly one `SCAN_INTERVAL` — there is
-  no per-minute gap.
-- If files are written **atomically** (temp then rename/mv into `input`), set
-  `MIN_STABLE_AGE=0` so there is no extra delay before archiving.
-- Capture is reliable as long as a file stays in `input` longer than one
-  `SCAN_INTERVAL` before the consumer moves it. With `SCAN_INTERVAL=2` and a
-  consumer that sweeps every ~30 minutes, even a file dropped a few seconds
-  before a sweep is captured.
-- Idle passes only `stat` each input directory (no listing, no file reads, no
-  tree walk), so scanning every couple of seconds stays cheap even over a NAS.
-- The directory-mtime skip **assumes the NAS updates a directory's modification
-  time when a file is added**. Most SMB/CIFS servers do; verify it on your share,
-  or set `USE_DIR_MTIME_SKIP=false` (lists every directory each pass — a bit more
-  I/O but immune to that assumption).
-- If new `input` directories can appear over time, set `DISCOVERY_INTERVAL` well
-  below the consumer's cycle; if the set is fixed, it can stay high.
-
-Because `input` is never written to, the tool cannot hold a file: this is
-best-effort capture. A file whose entire lifetime is shorter than one
-`SCAN_INTERVAL` can still be missed; a hard guarantee would require archiving in
-the critical path (before the consumer can take the file).
-
-### State
-
-Per target, under `state/`:
-
-- `<project>__<env>.ledger.tsv` — one line per archived version
-  (`relpath, size, mtime, hash, archive_target, archived_at`). It is the source
-  of truth for "already archived".
-- `<project>__<env>.inputdirs.tsv` — cached input directory locations and their
-  last settled mtime.
-
-If an archived file is deleted by hand, the ledger still considers it archived
-and will not re-copy it. To force re-archiving, remove the matching ledger
-line(s) for that relative path (or delete the ledger to re-archive everything).
-
-### Forcing rediscovery
-
-Input directory locations are only refreshed every `DISCOVERY_INTERVAL`. To pick
-up a newly created `input` directory immediately (without waiting), run:
-
-```sh
-./squirrel.sh --rediscover --config squirrel.conf
-```
-
-This drops a marker that the running scanner detects on its next cycle and then
-does a full-tree rediscovery for every target. It does not start a scan and exits
-right away, so it is safe to run while the scanner is active.
+Check the result: the pickup directory holds only `archive/`, the deployment
+tree mirrors it, and `state/<project>__<env>.deployed` exists.
 
 ## Run with cron
 
-The scanner runs **continuously** (internal loop scanning every `SCAN_INTERVAL`),
-so there is no gap between minutes. A single cron entry every minute is a
-**watchdog**: if the process ever dies (crash, reboot) the next tick restarts it,
-while the internal `flock` guarantees only one instance runs. No root, no systemd.
-
-Replace `/opt/squirrel` with your install directory:
+The scanner runs **continuously** — an internal loop scanning every
+`SCAN_INTERVAL` — so there is no gap between minutes. One cron entry per minute
+acts as a **watchdog**: if the process dies the next tick restarts it, and the
+internal `flock` guarantees a single instance. No root, no systemd.
 
 ```cron
-* * * * * /opt/squirrel/squirrel.sh --config /opt/squirrel/squirrel.conf >> /opt/squirrel/logs/cron.err 2>&1
+* * * * * /opt/file-deploy/file-deploy.sh --config /opt/file-deploy/file-deploy.conf >> /opt/file-deploy/logs/cron.err 2>&1
 ```
 
-With `RUN_DURATION` set high (e.g. 24 h) the loop runs continuously and recycles
-about once a day; the once-a-day restart gap is negligible next to a consumer
-that sweeps every ~30 minutes. The every-minute `LOCK_BUSY` from the watchdog is
-expected and logged only at `DEBUG`.
+With `RUN_DURATION` set high (e.g. 24 h) the loop recycles about once a day. The
+every-minute `LOCK_BUSY` from the watchdog is expected and logged at `DEBUG`
+only. `cron.err` should stay empty; anything in it is a real crash.
 
-## Logs & troubleshooting
-
-**Quick diagnosis** — do a single pass with everything printed to the terminal:
-
-```sh
-./squirrel.sh --config squirrel.conf --debug --once
-```
-
-It prints the resolved paths, the effective configuration, every target's
-`source`/`archive`, and exactly why nothing is being archived. When a source
-cannot be scanned it logs, for example:
+## Logs and troubleshooting
 
 ```
-event=MOUNT_MISSING src=".../homologation/Avanteam" reason="path does not exist" deepest_existing="/cifs/aldnas" require_mount="true"
+logs/_run.log                        orchestration: start, targets, heartbeat, summary
+logs/<project>__<env>/operations.log everything about one target
+logs/<project>__<env>/audit.log      append-only trail of what moved, with outcome and hashes
 ```
 
-- `reason` — what failed: missing / not a directory / not readable / not searchable.
-- `deepest_existing` — how far the path resolves: if it stops at `/cifs`, the
-  share is not mounted; if it resolves deep but the last component is wrong, it is
-  a path typo.
+Every line carries `run=` to correlate an execution, and target lines carry
+`project=`, `env=` and `cycle=`. `LOG_FORMAT=json` emits the same fields as JSON.
 
-Other useful signals: `NO_INPUT_DIRS` (source is fine but no directory named
-`input` was found under it) and the periodic `HEARTBEAT` (`mount_missing=` shows a
-loop that is stuck rather than archiving).
+**Nothing is being deployed?** Run `--once --debug`, which turns on every event
+and mirrors it to the terminal. The likely answers, in order:
 
-Log files:
+| Event | Meaning |
+|---|---|
+| `MOUNT_MISSING` | The source is not there. `deepest_existing=` shows how far the path resolves before it breaks — an unmounted share resolves shallow. |
+| `NO_INPUT_DIRS` | The source is fine but no directory matches `input_dir_name`. Names are exact, case-sensitive and comma-separated. |
+| `DEPLOY_UNAVAILABLE` | The deployment root is missing or empty and the sentinel is gone. Treated as an unmounted share: nothing written, nothing removed. |
+| `SOURCE_NOT_WRITABLE` | A pickup directory lacks `w+x`. file-deploy refuses to deploy out of a directory it cannot then drain. |
+| `SKIP_UNSTABLE` | The file is younger than `MIN_STABLE_AGE`. |
+| `SKIP_DIR_UNCHANGED` | The directory mtime has not moved. A deep pass (`DEEP_SCAN_INTERVAL`) recovers a share that fails to update it. |
 
-- `logs/<project>__<env>/operations.log` — per-target operational log.
-- `logs/<project>__<env>/audit.log` — per-target append-only archive trail.
-- `logs/_run.log` — orchestration events (`START`, `PATHS`, `CONFIG`, `TARGET`,
-  `TARGETS_LOADED`, `HEARTBEAT`, `RUN_SUMMARY`, `END`, `LOCK_BUSY`).
-- `logs/cron.err` — raw stderr captured by cron (last-resort safety net).
+**Alert on** `DEPLOY_UNAVAILABLE`, `DEPLOY_FAILED`, `SOURCE_STUCK`,
+`SOURCE_NOT_WRITABLE` and `MOUNT_MISSING`, and on `errors=` in `RUN_SUMMARY`.
 
-`LOG_CONSOLE=auto` mirrors every line to the terminal when run interactively (set
-`always`/`never` to force it); `LOG_LEVEL=DEBUG` adds per-file and per-directory
-detail. Every operational line carries `run`, `project`, `env`, `cycle` ids.
+Exit codes: `0` success · `1` config error · `2` no usable target · `3` lock
+busy (expected from the watchdog) · `4` a deployment write failed · `5` a file
+was deployed but could not leave the source. **`4` means data was not
+delivered; `5` means it was delivered but the source is filling up.** Both
+deserve their own alert.
 
-Event glossary: `START`, `PATHS`, `CONFIG`, `CONFIG_NOT_FOUND`, `TARGET`,
-`TARGETS_LOADED`, `TARGET_DISABLED`, `TARGET_MALFORMED`, `TARGET_DUPLICATE`,
-`EXTRA_MALFORMED`, `EXTRA_BAD_DEPTH`, `EXTRA_DUPLICATE`,
-`TARGET_BEGIN`, `MOUNT_MISSING`, `MOUNT_OK`, `DISCOVERY`, `EXCLUDED_DIR`,
-`NO_INPUT_DIRS`, `FORCE_REDISCOVER`, `SKIP_DIR_UNCHANGED`, `DIR_RESCAN`, `SKIP_UNSTABLE`,
-`SKIP_LEDGER`, `SKIP_SAME_HASH`, `COPIED`, `VERSIONED`, `COPY_FAILED`,
-`LEDGER_CORRUPT`, `HEARTBEAT`, `CYCLE_SUMMARY`, `TARGET_SUMMARY`.
+`--rediscover` drops a marker and exits; the running loop re-walks the source and
+forces a deep pass on its next cycle.
 
-Exit codes: `0` success · `1` configuration error · `2` no usable target ·
-`3` lock busy (another run is active) · `4` at least one archive copy failed.
+## Operating notes
 
-## Production notes
-
-- **Run it in homologation first.** Point a homolog target at the real NAS mount
-  and watch `logs/` for at least one full consumer cycle before enabling any
-  production target.
-- **Verify the directory-mtime assumption** on your actual share (drop a file,
-  check the parent directory's mtime changed). If in doubt, run with
-  `USE_DIR_MTIME_SKIP=false`.
-- **The archive only grows** — nothing is ever deleted. Monitor archive disk
-  usage; the per-target ledger and `audit.log` grow over time too.
-- **Monitor errors**: alert on `COPY_FAILED`, `MOUNT_MISSING` and `LEDGER_CORRUPT`
-  in the logs, and on `errors=` in `RUN_SUMMARY` / `CYCLE_SUMMARY`.
-- **Permissions**: the cron user needs read access to the NAS mount and write
-  access to each `archive_root`. No root required.
+- **The local archives grow without bound**, on the *source* share, and nothing
+  purges them. That is deliberate, but the pickup shares need a retention policy
+  of their own. Monitor their disk usage alongside the deployment tree.
+- **file-deploy is the consumer.** Nothing else should be removing files from
+  `input`; if something does, file-deploy simply never sees those files.
+- **Permissions**: the cron user needs read access to the source, **write**
+  access to each pickup directory (unlinking a file needs `w+x` on its parent)
+  and to each `deploy_root`. No root required.
+- **State lives in `state/`** and none of it is required for correctness — see
+  [SPEC.md §11](SPEC.md#11--persistent-state).
 
 ## Testing
 
@@ -308,7 +161,10 @@ bash tests/run-e2e.sh
 ```
 
 It builds isolated sandboxes, runs the real script against them, and asserts on
-the filesystem, the logs and the exit codes. A non-zero exit means a test failed.
+the filesystem, the logs and the exit codes. A non-zero exit means a test
+failed. The suite deliberately leads with the no-loss properties: an unwritable
+or unmounted destination, an unreadable file, a dry run and a mid-copy rewrite
+must all leave the source intact.
 
 ## License
 

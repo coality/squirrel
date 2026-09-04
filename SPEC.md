@@ -1,322 +1,318 @@
-# Squirrel — spécification du mode déplacement
+# file-deploy — move-mode specification
 
-**Révision 2** · bash ≥ 4.2 · 2026-09-03
+**Revision 2** · bash ≥ 4.2 · 2026-09-03
 
-Squirrel draine des répertoires de dépôt sur un partage NAS monté : il **déploie**
-chaque fichier dans une arborescence miroir, puis le **retire** de la source en le
-conservant dans une archive locale.
+file-deploy drains pickup directories on a mounted NAS share: it **deploys** each
+file into a mirror tree, then **moves it out** of the source, keeping it in a
+local archive.
 
-Ce document est normatif : il décrit ce que l'implémentation fait, et pourquoi chaque
-garde existe. Il complète le [README](README.md), qui reste le guide d'installation et
-d'exploitation.
-
----
-
-## §1 — Portée
-
-Squirrel est un script bash unique, piloté par cron, qui surveille un ou plusieurs
-arbres source montés localement. Sous chaque arbre il localise les répertoires portant
-un nom donné (`input` par défaut), et pour chaque fichier qui s'y trouve il exécute la
-transaction décrite en [§5](#5--la-transaction-par-fichier) : déploiement vérifié, puis
-retrait de la source.
-
-```
-avant                              après
-─────────────────────────────      ──────────────────────────────────────────
-A/proj/input/report.xml            A/proj/input/archive/report.xml   (déplacé)
-B/proj/input/            (vide)    B/proj/input/report.xml           (déployé)
-```
-
-L'outil ne dépend que de bash ≥ 4.2, des coreutils/findutils GNU et de `flock`. Pas de
-démon, pas de systemd, pas de service externe. Le montage des partages est hors
-périmètre : squirrel constate, il ne monte pas.
+This document is normative — it states what the implementation does and why each
+guard exists. The [README](README.md) is the operator's guide.
 
 ---
 
-## §2 — Termes
+## §1 — Scope
 
-| Terme | Définition |
+file-deploy is a single cron-driven bash script watching one or more locally mounted
+source trees. Under each tree it locates directories with a given name (`input`
+by default), and for every file found there it runs the transaction of
+[§5](#5--the-per-file-transaction): verified deployment, then removal from the
+source.
+
+```
+before                             after
+─────────────────────────────      ────────────────────────────────────────────
+A/proj/input/report.xml            A/proj/input/archive/report.xml     (moved)
+B/proj/input/            (empty)   B/proj/input/report.xml          (deployed)
+```
+
+Dependencies are bash ≥ 4.2, GNU coreutils/findutils and `flock`. No daemon, no
+systemd, no external service. Mounting the shares is out of scope: file-deploy
+observes their state and refuses to act when in doubt.
+
+---
+
+## §2 — Terms
+
+| Term | Definition |
 |---|---|
-| **Source (A)** | La racine `source_root` d'une cible. Squirrel y écrit et y supprime — c'est le changement de fond par rapport aux versions antérieures. |
-| **Déploiement (B)** | La racine `deploy_root`. Miroir de l'arborescence source, portant l'état *courant* de ce qui a été livré. Ce n'est pas un magasin de versions. |
-| **Répertoire de dépôt** | Un répertoire effectivement scanné : un répertoire `input` découvert, ou l'un de ses sous-répertoires directs. C'est le parent immédiat des fichiers traités. |
-| **Archive locale** | Le répertoire `$LOCAL_ARCHIVE_DIR` (défaut `archive`) créé *dans* le répertoire de dépôt. Il reçoit chaque fichier retiré de la source, et n'est jamais scanné. |
-| **Cible** | Un couple `(project, env)` déclaré dans `targets.tsv`, ou une règle `EXTRA_DIRS`. Chaque cible a son état, ses journaux et sa clé. |
-| **Clé** | `<project>__<env>` après passage au filtre `[^A-Za-z0-9._-] → _`. Nomme les fichiers d'état et le répertoire de journaux. |
-| **Cycle** | Un passage sur une cible. Une exécution boucle jusqu'à `RUN_DURATION` secondes, en réveillant chaque cible tous les `scan_interval`. |
-| **Passe profonde** | Un cycle qui ignore l'optimisation de saut par mtime de répertoire. Déclenchée tous les `DEEP_SCAN_INTERVAL` secondes. |
+| **Source (A)** | A target's `source_root`. file-deploy writes to it and deletes from it — the substantive change from earlier versions. |
+| **Deployment tree (B)** | A target's `deploy_root`. Mirrors the source layout and carries the *current* state of what has been delivered. It is not a version store. |
+| **Pickup directory** | A directory actually scanned: a discovered `input` directory, or one of its direct subdirectories. It is the immediate parent of the files processed. |
+| **Local archive** | The `$LOCAL_ARCHIVE_DIR` directory (default `archive`) created *inside* the pickup directory. It receives every file taken out of the source, and is never scanned. |
+| **Target** | A `(project, env)` pair declared in `targets.tsv`, or an `EXTRA_DIRS` rule. Each target has its own state, logs and key. |
+| **Key** | `<project>__<env>` after the filter `[^A-Za-z0-9._-] → _`. Names the state files and the log directory. |
+| **Cycle** | One pass over one target. A run loops for up to `RUN_DURATION` seconds, waking each target every `scan_interval`. |
+| **Deep pass** | A cycle that ignores the directory-mtime skip. Due every `DEEP_SCAN_INTERVAL` seconds. |
 
 ---
 
 ## §3 — Invariant
 
-> **Un fichier ne quitte jamais la source à moins d'être durablement présent, vérifié
-> par hachage, à la fois dans l'archive locale et dans l'arborescence de déploiement.**
+> **A file never leaves the source unless it is durably present, hash-verified,
+> in both the local archive and the deployment tree.**
 
-Corollaires :
+Corollaries:
 
-- **Une seule opération irréversible par fichier.** Le retrait de la source est un
-  `rename(2)` vers l'archive locale — atomique, même système de fichiers, même inode.
-  La copie archivée ne peut donc être ni tronquée ni corrompue : il n'y a rien à
-  vérifier après coup.
-- **Le retrait est la dernière étape.** Retirer avant de déployer rendrait un échec de
-  déploiement irrécupérable : il ne resterait rien dans le répertoire de dépôt pour
-  réessayer.
-- **Toute reprise est idempotente.** Une interruption laisse le fichier dans son
-  répertoire de dépôt. Le cycle suivant redéploie un contenu identique au même chemin
-  et retente le même `rename`, dont le nom cible est une fonction pure du nom, de la
-  mtime et du hachage. Aucune reprise ne peut inventer un chemin, donc rien ne
-  s'accumule.
-- **L'état « archivé mais pas déployé » n'existe pas.** Il est structurellement
-  impossible, l'archivage étant postérieur au déploiement.
-
----
-
-## §4 — Sélection
-
-### Découverte
-
-Une marche complète localise les répertoires dont le nom figure dans `input_dir_name`.
-Elle **élague à chaque correspondance** : elle ne descend jamais dans un répertoire
-d'entrée, donc ne parcourt pas les sous-arbres volumineux. Elle n'est relancée que si le
-cache est absent, plus vieux que `DISCOVERY_INTERVAL`, si sa signature a changé, ou sur
-`--rediscover`.
-
-Les noms sont séparés par des **virgules uniquement** — un nom peut contenir des
-espaces — et sont mis en correspondance **littéralement** : les métacaractères `*`, `?`
-et `[` sont échappés avant d'atteindre `find -name`. La casse est significative.
-
-### Profondeur
-
-Pour chaque répertoire d'entrée, une seule lecture en masse retourne le répertoire
-lui-même et ses sous-répertoires directs avec leurs mtimes. Les fichiers pris sont ceux
-**directement dans** le répertoire d'entrée et **directement dans** chacun de ses
-sous-répertoires directs. Rien au-delà. Un nouveau sous-répertoire est vu au cycle
-suivant, sans redécouverte.
-
-### Élagage
-
-| Règle | Correspondance | Portée |
-|---|---|---|
-| `$LOCAL_ARCHIVE_DIR` | Nom exact, sensible à la casse | Les trois parcours : scan par cycle, marche de découverte, marche du mode `fixed` |
-| `EXCLUDE_DIR_PATTERNS` | Globs insensibles à la casse | Idem — répertoire sauté et jamais descendu |
-| Racine du parcours | Jamais exclue par son propre nom | Un répertoire d'entrée, ou la source d'une règle `EXTRA_DIRS` |
-
-> **Pourquoi l'élagage de l'archive est normatif.** L'archive locale est créée *dans* un
-> répertoire scanné. Sans cet élagage, chaque fichier archivé serait re-vu au cycle
-> suivant sous un chemin relatif différent, redéployé, puis retiré de la source —
-> détruisant précisément l'archive que la fonctionnalité existe pour constituer. La
-> correspondance est exacte : un répertoire nommé `archived` reste du contenu déployable.
+- **One irreversible operation per file.** Removal from the source is a
+  `rename(2)` into the local archive — atomic, same filesystem, same inode. The
+  archived copy therefore cannot be truncated or corrupt: there is nothing to
+  verify after the fact.
+- **Removal is the last step.** Removing before deploying would make a
+  deployment failure unrecoverable: nothing would be left in the pickup
+  directory to retry from.
+- **Every retry is idempotent.** An interruption leaves the file in its pickup
+  directory. The next cycle re-deploys identical content to the same path and
+  re-attempts the same `rename`, whose target name is a pure function of the
+  name, mtime and hash. No retry can invent a path, so nothing accumulates.
+- **The state "archived but not deployed" cannot exist.** It is structurally
+  impossible, archiving being posterior to deployment.
 
 ---
 
-## §5 — La transaction par fichier
+## §4 — Selection
 
-Séquence normative. L'ordre est l'argument de sûreté ; il n'est pas négociable.
+### Discovery
 
-### 1. Stabilité
+A full walk locates directories whose name appears in `input_dir_name`. It
+**prunes at every match**: it never descends into a pickup tree, so it does not
+walk the large subtrees. It re-runs only when the cache is absent, older than
+`DISCOVERY_INTERVAL`, when its signature changed, or on `--rediscover`.
 
-Le fichier est ignoré tant que `now − mtime < MIN_STABLE_AGE`. Pendant qu'un producteur
-écrit en place, la mtime avance et l'âge reste sous le seuil.
+Names are separated by **commas only** — a name may contain spaces — and are
+matched **literally**: the metacharacters `*`, `?` and `[` are escaped before
+reaching `find -name`. Case is significant.
 
-*Trop récent* → laissé en place, répertoire marqué non stabilisé, réessayé au cycle
-suivant.
+### Depth
 
-### 2. Hachage de la source
+For each `input` directory, a single bulk read returns the directory itself and
+its direct subdirectories with their mtimes. The files taken are those
+**directly inside** the `input` directory and **directly inside** each of its
+direct subdirectories. Nothing deeper. A new subdirectory is seen on the next
+cycle, with no rediscovery.
 
-`$HASH_CMD` (défaut `sha256sum`) calcule l'empreinte qui servira à vérifier le
-déploiement, à classer la collision, et à nommer l'entrée d'archive.
+### Pruning
 
-*Illisible* → `HASH_FAILED` ; jamais consommé. On ne supprime pas ce qu'on n'a pas pu
-lire.
-
-### 3. Déploiement, vérifié avant publication
-
-Copie vers un temporaire caché `.<nom>.squirrel-tmp.$$` voisin de la cible,
-**re-hachage du temporaire**, puis `mv` en place. Vérifier avant de renommer garantit
-qu'une copie corrompue ne devient jamais visible et n'écrase jamais un fichier déjà
-correct.
-
-*Échec* → `DEPLOY_FAILED` ; temporaire supprimé, ce qui était déployé reste intact,
-source conservée.
-
-### 4. Re-vérification de la source
-
-`(size, mtime)` est relu et comparé à la valeur de l'étape 1. S'il a changé, ce qui
-vient d'être déployé est l'instantané d'un fichier à demi écrit.
-
-*Modifié* → `SOURCE_CHANGED_DURING_COPY` ; déployé mais **non consommé**. Le cycle
-suivant converge sur le contenu final.
-
-### 5. Commit — retrait de la source
-
-`rename(2)` du fichier vers l'archive locale. **Unique opération irréversible de la
-séquence**, unique instant où A change, et atomique. Si `LOCAL_ARCHIVE_DIR` est vide,
-c'est un `rm`.
-
-*Échec* → `SOURCE_STUCK`, sortie `5` ; le fichier reste, déployé. Chaque reprise est un
-no-op côté B suivi d'un nouveau `rename`.
-
-### Sûreté au crash
-
-| Interruption | État immédiat | Cycle suivant |
+| Rule | Match | Applies to |
 |---|---|---|
-| Entre 3 et 5 | Déployé ; fichier encore dans le dépôt | Redéploiement d'un contenu identique (`DEPLOYED_IDENTICAL`), puis `rename`. Aucun doublon. |
-| Pendant le `rename` | Atomique : il a eu lieu, ou pas | Rien à réconcilier |
-| Après 5 | Déployé et archivé, source vidée | Rien à faire |
+| `$LOCAL_ARCHIVE_DIR` | Exact name, case-sensitive | All three walks: per-cycle scan, discovery walk, `fixed`-mode walk |
+| `EXCLUDE_DIR_PATTERNS` | Case-insensitive globs | Same — directory skipped and never descended |
+| The walk's own root | Never excluded by its own name | An `input` directory, or an `EXTRA_DIRS` rule's source |
 
-Il n'existe aucune interruption laissant le fichier absent à la fois de la source et de
-l'archive.
+> **Why pruning the archive is normative.** The local archive is created *inside*
+> a scanned directory. Without this, every archived file would be seen again on
+> the next cycle under a different relative path, deployed a second time, then
+> removed from the source — destroying exactly the archive the feature exists to
+> build. The match is exact: a directory named `archived` stays deployable
+> content.
 
 ---
 
-## §6 — Nommage
+## §5 — The per-file transaction
 
-### Dans l'arborescence de déploiement
+Normative sequence. The order *is* the safety argument; it is not negotiable.
 
-Le chemin est le miroir exact : `A/<rel>` → `B/<rel>`, où `<rel>` est relatif à
-`source_root` et inclut donc le segment `input`. **Aucune version horodatée n'est jamais
-créée dans B.**
+### 1. Stability
 
-| État de la destination | Action | Événement |
+The file is ignored while `now − mtime < MIN_STABLE_AGE`. While a producer
+writes in place, the mtime keeps moving and the age stays under the threshold.
+
+*Too recent* → left in place, directory marked unsettled, retried next cycle.
+
+### 2. Hash the source
+
+`$HASH_CMD` (default `sha256sum`) computes the digest used to verify the
+deployment, classify the collision, and name the archive entry.
+
+*Unreadable* → `HASH_FAILED`; never consumed. We do not delete what we could not
+read.
+
+### 3. Deploy, verified before publication
+
+Copy to a hidden temporary `.<name>.file-deploy-tmp.$$` beside the target,
+**re-hash the temporary**, then `mv` into place. Verifying before renaming
+guarantees a corrupt copy never becomes visible and never clobbers a file that
+was already correct.
+
+*Failure* → `DEPLOY_FAILED`; temporary removed, whatever was deployed stays
+intact, source kept.
+
+### 4. Re-check the source
+
+`(size, mtime)` is read again and compared to step 1. If it changed, what was
+just deployed is a snapshot of a half-written file.
+
+*Changed* → `SOURCE_CHANGED_DURING_COPY`; deployed but **not consumed**. The
+next cycle converges on the final content.
+
+### 5. Commit — removal from the source
+
+`rename(2)` of the file into the local archive. **The only irreversible
+operation of the sequence**, the only instant at which A changes, and atomic. If
+`LOCAL_ARCHIVE_DIR` is empty it is an `rm` instead.
+
+*Failure* → `SOURCE_STUCK`, exit `5`; the file stays, deployed. Every retry is a
+no-op on the B side followed by another `rename`.
+
+### Crash safety
+
+| Interruption | Immediate state | Next cycle |
 |---|---|---|
-| Absente | Écrite | `DEPLOYED` |
-| Présente, contenu différent | Écrasée, les deux empreintes journalisées | `DEPLOYED_OVERWRITE` |
-| Présente, contenu identique | Rien réécrit — mais le fichier source est **quand même** archivé et retiré | `DEPLOYED_IDENTICAL` |
+| Between 3 and 5 | Deployed; file still in the pickup directory | Re-deploy of identical content (`DEPLOYED_IDENTICAL`), then `rename`. No duplicate. |
+| During the `rename` | Atomic: it happened, or it did not | Nothing to reconcile |
+| After 5 | Deployed and archived, source drained | Nothing to do |
 
-> **Pourquoi le cas identique n'est pas un saut.** Sauter un fichier parce que la
-> destination est déjà à jour le laisserait indéfiniment dans son répertoire de dépôt.
-> Un fichier redéposé à l'identique doit être drainé comme les autres.
+No interruption leaves the file absent from both the source and the archive.
 
-### Dans l'archive locale
+---
 
-Le nom cible est une **fonction pure** de `(nom de base, mtime source, hachage)` —
-jamais de l'horloge murale — afin que toute reprise vise exactement le même chemin.
+## §6 — Naming
 
-| Condition | Nom retenu |
+### In the deployment tree
+
+The path is an exact mirror: `A/<rel>` → `B/<rel>`, where `<rel>` is relative to
+`source_root` and therefore includes the `input` segment. **No timestamped
+version is ever created in B.**
+
+| Destination state | Action | Event |
+|---|---|---|
+| Absent | Written | `DEPLOYED` |
+| Present, different content | Overwritten, both digests logged | `DEPLOYED_OVERWRITE` |
+| Present, identical content | Nothing rewritten — but the source file is **still** archived and removed | `DEPLOYED_IDENTICAL` |
+
+> **Why the identical case is not a skip.** Skipping a file because the
+> destination is already current would leave it in its pickup directory
+> indefinitely. A file re-dropped unchanged must be drained like any other.
+
+### In the local archive
+
+The target name is a **pure function** of `(base name, source mtime, hash)` —
+never of the wall clock — so that every retry resolves to the same path.
+
+| Condition | Name used |
 |---|---|
-| Nom libre | `archive/report.xml` |
-| Pris, contenu identique | Réutilisé tel quel — aucune copie créée (`ARCHIVE_REUSED`) |
-| Pris, contenu différent | `archive/report_<AAAAMMJJ_HHMMSS>.xml`, horodatage issu de la mtime source |
-| Celui-ci aussi pris, contenu différent | `archive/report_<stamp>_<hash8>.xml` |
+| Name free | `archive/report.xml` |
+| Taken, identical content | Reused as is — no copy created (`ARCHIVE_REUSED`) |
+| Taken, different content | `archive/report_<YYYYMMDD_HHMMSS>.xml`, stamp derived from the source mtime |
+| That one also taken, different content | `archive/report_<stamp>_<hash8>.xml` |
 
 ---
 
-## §7 — Matrice de défaillance
+## §7 — Failure matrix
 
-| Événement | Niv. | Cause | Fichier dans A | Dans B | Sortie | Suite |
+| Event | Level | Cause | File in A | In B | Exit | Then |
 |---|---|---|---|---|---|---|
-| `MOUNT_MISSING` | ERROR | Source absente, illisible ou non inscriptible | Intact | — | 2 | Cible sautée ; discret sur répétition |
-| `DEPLOY_UNAVAILABLE` | ERROR | Sentinelle absente et racine de déploiement vide ou absente | **Intact** | Rien écrit | 4 | Cible entière refusée avant tout octet |
-| `SOURCE_NOT_WRITABLE` | WARN | Répertoire de dépôt sans `w+x` | **Intact** | Rien écrit | 5 | Répertoire entier sauté |
-| `FILE_VANISHED` | WARN | Disparu entre le listage et le `stat` | Absent | — | 0 | Rien à faire |
-| `META_UNREADABLE` | WARN | Taille ou mtime aberrante | Conservé | — | 0 | Réessayé à chaque cycle |
-| `SKIP_UNSTABLE` | DEBUG | Plus jeune que `MIN_STABLE_AGE` | Conservé | — | 0 | Réessayé |
-| `HASH_FAILED` | WARN | Fichier illisible | **Conservé** | — | 0 | Réessayé ; jamais consommé |
-| `DEPLOY_FAILED` | ERROR | `stage=mkdir\|cp\|verify\|mv` | **Conservé** | Version précédente intacte | 4 | Réessayé, temporaire nettoyé |
-| `SOURCE_CHANGED_DURING_COPY` | WARN | Écrivain en course avec la copie | **Conservé** | Instantané partiel | 0 | Converge sur le contenu final |
-| `ARCHIVE_DIR_FAILED` | ERROR | Création de l'archive locale impossible | **Conservé** | Déployé | 5 | Réessayé |
-| `SOURCE_STUCK` | ERROR | `rename` vers l'archive refusé | **Conservé** | Déployé | 5 | Reprise idempotente, sans doublon |
+| `MOUNT_MISSING` | ERROR | Source absent, unreadable or not writable | Intact | — | 2 | Target skipped; quiet on repeat |
+| `DEPLOY_UNAVAILABLE` | ERROR | Sentinel absent and deployment root empty or missing | **Intact** | Nothing written | 4 | Whole target refused before any byte |
+| `SOURCE_NOT_WRITABLE` | WARN | Pickup directory without `w+x` | **Intact** | Nothing written | 5 | Whole directory skipped |
+| `FILE_VANISHED` | WARN | Gone between listing and `stat` | Absent | — | 0 | Nothing to do |
+| `META_UNREADABLE` | WARN | Nonsensical size or mtime | Kept | — | 0 | Retried every cycle |
+| `SKIP_UNSTABLE` | DEBUG | Younger than `MIN_STABLE_AGE` | Kept | — | 0 | Retried |
+| `HASH_FAILED` | WARN | Unreadable file | **Kept** | — | 0 | Retried; never consumed |
+| `DEPLOY_FAILED` | ERROR | `stage=mkdir\|cp\|verify\|mv` | **Kept** | Previous version intact | 4 | Retried, temporary cleaned up |
+| `SOURCE_CHANGED_DURING_COPY` | WARN | Writer racing the copy | **Kept** | Partial snapshot | 0 | Converges on the final content |
+| `ARCHIVE_DIR_FAILED` | ERROR | Local archive cannot be created | **Kept** | Deployed | 5 | Retried |
+| `SOURCE_STUCK` | ERROR | `rename` into the archive refused | **Kept** | Deployed | 5 | Idempotent retry, no duplicate |
 
-> **Lecture opérationnelle.** `4` signifie « la donnée n'est pas livrée » : la
-> destination est cassée. `5` signifie « livrée, mais la source se remplit » : ce sont
-> des droits à corriger sur le partage de dépôt. Les deux méritent des alertes
-> distinctes.
+> **Operational reading.** `4` means "the data was not delivered": the
+> destination is broken. `5` means "delivered, but the source is filling up":
+> permissions to fix on the pickup share. Both deserve their own alert.
 
-Tout échec laissant un fichier dans un répertoire de dépôt marque ce répertoire comme
-**non stabilisé**, donc jamais mémorisé comme inchangé : il est relu à chaque cycle
-jusqu'à résolution. Le *journal*, lui, est dédupliqué à une ligne par exécution et par
-fichier.
+Any failure leaving a file in a pickup directory marks that directory
+**unsettled**, so it is never recorded as unchanged: it is re-read every cycle
+until resolved. The *log*, in contrast, is deduplicated to one line per run per
+file.
 
 ---
 
-## §8 — Gardes
+## §8 — Guards
 
-### 8.1 Sentinelle de la racine de déploiement
+### 8.1 Deployment-root sentinel
 
-Une destination démontée est le pire mode de défaillance : `mkdir -p` peuplerait
-joyeusement le point de montage local, chaque fichier serait ensuite retiré de la source
-à cause de cela, et au remontage l'arborescence serait vide et les sources parties —
-avec un code de sortie `0`.
+An unmounted destination is the worst failure mode: `mkdir -p` would happily
+populate the local mount point, every file would then be removed from the source
+because of it, and on remount the tree would be empty and the sources gone —
+with exit code `0`.
 
-Chaque `deploy_root` porte donc un fichier sentinelle `$DEPLOY_MARKER`, que le script
-provisionne lui-même :
+Each `deploy_root` therefore carries a sentinel file `$DEPLOY_MARKER`, which the
+script provisions itself:
 
-| Situation | Décision |
+| Situation | Decision |
 |---|---|
-| Sentinelle présente | Fonctionnement normal |
-| Sentinelle héritée `.squirrel-archive-root` | Acceptée et mise à niveau (`DEPLOY_MARKER_MIGRATED`) |
-| Aucun ledger (première exécution) | Racine et sentinelle créées (`DEPLOY_MARKER_CREATED`) |
-| Ledger rempli, racine existante et non vide | Arborescence adoptée (`DEPLOY_MARKER_ADOPTED`) |
-| Ledger rempli, racine absente ou vide | **Refus** (`DEPLOY_UNAVAILABLE`) — rien écrit, rien retiré |
+| Sentinel present | Normal operation |
+| Never deployed here yet | Root and sentinel created (`DEPLOY_MARKER_CREATED`) |
+| Deployed before, root exists and is non-empty | Pre-existing tree adopted (`DEPLOY_MARKER_ADOPTED`) |
+| Deployed before, root missing or empty | **Refused** (`DEPLOY_UNAVAILABLE`) — nothing written, nothing removed |
 
-### 8.2 Drainabilité du répertoire de dépôt
+"Deployed here before" is recorded by `state/<key>.deployed`, written on the
+first successful move.
 
-Avant de traiter le moindre fichier, le répertoire doit être `w+x` : délier un fichier
-exige ces droits sur son *parent*, indépendamment du mode du fichier. À défaut, le
-répertoire entier est sauté. Déployer depuis un répertoire qu'on ne peut pas vider
-redéploierait les mêmes fichiers à chaque cycle, indéfiniment.
+### 8.2 Pickup-directory drainability
 
-### 8.3 Stabilité et écriture en place
+Before any file is processed, the directory must be `w+x`: unlinking a file
+requires those rights on its *parent*, whatever the file's own mode. Otherwise
+the whole directory is skipped. Deploying out of a directory that cannot be
+drained would re-deploy the same files every cycle, forever.
 
-`MIN_STABLE_AGE=0` n'est sûr que si **tous** les producteurs publient atomiquement —
-écriture ailleurs, puis renommage dans le répertoire de dépôt. Les producteurs NAS
-courants (copie par l'explorateur Windows, clients SMB, `rsync` sans `--partial-dir`,
-scanners, exports ERP) ne le font généralement pas.
+### 8.3 Stability and in-place writes
 
-> **Ce qui a changé avec le mode déplacement.** Sous un outil de copie seule, prendre un
-> fichier à demi écrit produisait une copie inutile et l'original restait : la passe
-> suivante réparait. Ici, l'instantané tronqué est déployé et la source déplacée — sous
-> Linux le descripteur ouvert de l'écrivain suit l'inode, donc le fichier *complet*
-> atterrit discrètement dans `archive/`, qui n'est jamais déployé.
+`MIN_STABLE_AGE=0` is safe only if **every** producer publishes atomically —
+writes elsewhere, then renames into the pickup directory. Common NAS producers
+(Windows Explorer copies, SMB clients, `rsync` without `--partial-dir`,
+scanners, ERP exports) generally do not.
 
-L'étape 4 de [§5](#5--la-transaction-par-fichier) est le filet : `MIN_STABLE_AGE` est le
-bouton de réglage, la re-vérification est la garantie.
+> **What changed with move mode.** Under a copy-only tool, picking up a
+> half-written file produced a junk copy and the original stayed put: the next
+> pass healed it. Here the truncated snapshot is deployed and the source is
+> moved away — on Linux the writer's open descriptor follows the inode, so the
+> *complete* file quietly lands in `archive/`, which is never deployed.
+
+Step 4 of [§5](#5--the-per-file-transaction) is the backstop: `MIN_STABLE_AGE`
+is the tuning knob, the re-check is the guarantee.
 
 ---
 
 ## §9 — Configuration
 
-`squirrel.conf`, sourcé par le script. Toute valeur est surchargeable par cible lorsque
-la colonne existe.
+`file-deploy.conf`, sourced by the script. Any value is overridable per target
+where a column exists.
 
-| Clé | Défaut | Rôle |
+| Key | Default | Role |
 |---|---|---|
-| `INPUT_DIR_NAME` | `"input"` | Noms exacts, séparés par virgules, mis en correspondance littéralement |
-| `SCAN_INTERVAL` | `10` | Secondes entre deux passes internes |
-| `RUN_DURATION` | `55` | Durée maximale d'une exécution |
-| `MIN_STABLE_AGE` | `5` | **Réglage de sûreté** — voir §8.3 |
-| `LOCAL_ARCHIVE_DIR` | `"archive"` | Nom de l'archive locale ; `""` la désactive |
-| `DEPLOY_MARKER` | `".squirrel-deploy-root"` | Sentinelle de la racine de déploiement |
-| `REQUIRE_MOUNT` | `true` | Niveau de journal si la source est indisponible |
-| `HASH_CMD` | `"sha256sum"` | Commande de hachage, mot unique |
-| `DRY_RUN` | `false` | Répétition inerte : ni écriture, ni suppression |
-| `DISCOVERY_INTERVAL` | `1800` | Secondes entre deux redécouvertes complètes |
-| `DISCOVERY_MAXDEPTH` | `0` | Plafond de profondeur ; 0 = illimité |
-| `USE_DIR_MTIME_SKIP` | `true` | Saute un répertoire dont la mtime n'a pas bougé |
-| `DEEP_SCAN_INTERVAL` | `300` | Secondes entre deux passes ignorant ce saut |
-| `EXCLUDE_DIR_PATTERNS` | `()` | Globs insensibles à la casse à ignorer partout |
-| `EXTRA_DIRS` | `()` | Règles explicites source → destination |
+| `INPUT_DIR_NAME` | `"input"` | Exact names, comma-separated, matched literally |
+| `SCAN_INTERVAL` | `10` | Seconds between internal passes |
+| `RUN_DURATION` | `55` | Maximum duration of one run |
+| `MIN_STABLE_AGE` | `5` | **Safety setting** — see §8.3 |
+| `LOCAL_ARCHIVE_DIR` | `"archive"` | Name of the local archive; `""` disables it |
+| `DEPLOY_MARKER` | `".file-deploy-root"` | Deployment-root sentinel |
+| `HASH_CMD` | `"sha256sum"` | Hash command, single word |
+| `DRY_RUN` | `false` | Inert rehearsal: no write, no delete |
+| `DISCOVERY_INTERVAL` | `1800` | Seconds between full rediscoveries |
+| `DISCOVERY_MAXDEPTH` | `0` | Depth cap; 0 = unlimited |
+| `USE_DIR_MTIME_SKIP` | `true` | Skip a directory whose mtime has not moved |
+| `DEEP_SCAN_INTERVAL` | `300` | Seconds between passes ignoring that skip |
+| `EXCLUDE_DIR_PATTERNS` | `()` | Case-insensitive globs to ignore anywhere |
+| `EXTRA_DIRS` | `()` | Explicit source → destination rules |
 | `LOG_LEVEL` | `"INFO"` | `DEBUG` / `INFO` / `WARN` / `ERROR` |
-| `LOG_FORMAT` | `"text"` | `text` ou `json` |
-| `LOG_ROTATE_MAX_BYTES` | `10485760` | Rotation au-delà ; 0 = jamais |
-| `LOG_ROTATE_KEEP` | `7` | Fichiers tournés conservés |
-| `AUDIT_LOG` | `true` | Piste d'audit par cible |
-| `HEARTBEAT_INTERVAL` | `60` | Résumé périodique ; 0 = désactivé |
+| `LOG_FORMAT` | `"text"` | `text` or `json` |
+| `LOG_CONSOLE` | `"auto"` | Mirror log lines to stderr: `auto` (when interactive), `always`, `never` |
+| `LOG_ROTATE_MAX_BYTES` | `10485760` | Rotate past this; 0 = never |
+| `LOG_ROTATE_KEEP` | `7` | Rotated files kept |
+| `AUDIT_LOG` | `true` | Per-target provenance trail |
+| `HEARTBEAT_INTERVAL` | `60` | Periodic summary; 0 = off |
 
-Options de ligne de commande : `--config FILE`, `--rediscover`, `--debug`, `--once`,
-`--verbose`, `--help`. `--debug`, `--once` et `--verbose` sont appliqués *après* le
-sourcing de la configuration : un drapeau ne peut pas être écrasé par le fichier.
+Command-line options: `--config FILE`, `--rediscover`, `--debug`, `--once`,
+`--verbose`, `--help`. `--debug`, `--once` and `--verbose` are applied *after*
+the configuration is sourced, so a flag cannot be overridden by the file.
 
 ---
 
-## §10 — Déclaration des cibles
+## §10 — Declaring targets
 
 ### `targets.tsv`
 
-Une ligne par couple `(project, env)`, **séparée par des tabulations** — les chemins
-peuvent donc contenir des espaces. Utiliser `-` ou un champ vide pour hériter du défaut
-global.
+One line per `(project, env)`, **tab-separated** — paths may therefore contain
+spaces. Use `-` or an empty field to inherit the global default.
 
 ```
 # project ⇥ env ⇥ source_root ⇥ deploy_root ⇥ input_dir_name ⇥ scan_interval ⇥ enabled
@@ -324,128 +320,134 @@ projectA	prod	/mnt/nas/projectA/prod	/mnt/nas/deploy/projectA/prod	input	10	true
 projectB	prod	/mnt/nas/projectB/prod	/mnt/nas/deploy/projectB/prod	-	-	true
 ```
 
-Une ligne sans tabulation retombe sur un découpage par espaces, ce qui décale toute
-colonne suivant une valeur en contenant. Le script le signale (`TARGET_EXTRA_FIELDS`,
-`TARGET_BAD_ENABLED`) plutôt que d'abandonner la cible en silence, mais les tabulations
-restent la seule forme fiable.
+A line without a tab falls back to whitespace splitting, which shifts every
+column following a value containing a space. The script reports it
+(`TARGET_EXTRA_FIELDS`, `TARGET_BAD_ENABLED`) rather than dropping the target
+silently, but tabs remain the only reliable form.
 
 ### `EXTRA_DIRS`
 
-Pour drainer un répertoire précis vers une destination précise, sans découverte. Chaque
-règle est `label ⇥ source ⇥ destination ⇥ depth`, où `depth` vaut `0` (fichiers
-directs), `N` sous-niveaux, ou `-1` / `unlimited` pour tout le sous-arbre.
+To drain one specific directory to one specific destination, with no discovery.
+Each rule is `label ⇥ source ⇥ destination ⇥ depth`, where `depth` is `0`
+(direct files), `N` sublevels, or `-1` / `unlimited` for the whole subtree.
 
-Ces règles passent par le **même moteur** : déplacement, archive locale, stabilité,
-exclusions, sentinelle, journaux et audit par règle. Leur état vit sous
-`<label>__extra`. Elles sont additives : elles s'exécutent même si `targets.tsv` n'a
-aucune cible active.
+These rules go through the **same engine**: the move, the local archive,
+stability, exclusions, the sentinel, and per-rule logs and audit trail. Their
+state lives under `<label>__extra`. They are additive: they run whether or not
+`targets.tsv` has any enabled target.
 
 ---
 
-## §11 — État persistant
+## §11 — Persistent state
 
-Quatre fichiers par cible, sous `state/`. **Aucun n'est requis pour la correction.**
+Four files per target, under `state/`. **None is required for correctness.**
 
-| Fichier | Contenu | Si supprimé |
+| File | Content | If deleted |
 |---|---|---|
-| `<clé>.ledger.tsv` | Journal de provenance en ajout seul : une ligne par fichier déplacé (`relpath, size, mtime, hash, cible, date`) | Aucun effet, sauf que §8.1 perd son signal « on a déjà écrit ici » |
-| `<clé>.inputs.tsv` | Emplacements des répertoires d'entrée, précédés d'un en-tête signant les réglages qui ont façonné la marche | Redécouverte au cycle suivant |
-| `<clé>.leaves.tsv` | mtimes stabilisées par répertoire, avec en-tête de version de format | Un cycle de relecture complète |
-| `<clé>.deepscan` | Horodatage de la dernière passe profonde | Une passe profonde immédiate |
+| `<key>.deployed` | Empty marker, written on the first successful move | §8.1 loses its "we have deployed here before" signal, so a vanished destination looks like a first run |
+| `<key>.inputs.tsv` | Discovered `input` directory locations, preceded by a header signing the settings that shaped the walk | Rediscovery on the next cycle |
+| `<key>.leaves.tsv` | Settled mtimes per directory, with a format-version header | One full re-read cycle |
+| `<key>.deepscan` | Timestamp of the last deep pass | An immediate deep pass |
 
-> **Le ledger ne pilote aucune décision.** C'est un enregistrement, pas un index. Les
-> versions antérieures l'utilisaient pour décider si un fichier avait déjà été traité ;
-> avec la sémantique de déplacement c'est un piège : un fichier sauté sur la foi d'une
-> entrée n'est jamais copié, donc jamais retiré, et reste indéfiniment dans son
-> répertoire de dépôt. La question « la destination porte-t-elle déjà ce contenu ? » se
-> règle en hachant la destination — la seule réponse qui survive à un crash. Un ledger
-> corrompu est donc sans effet sur la livraison.
+The provenance record is `logs/<key>/audit.log`, not a state file: one line per
+file that actually moved, carrying the outcome, the mirrored relative path, the
+archive path, the hash, the size, and — on an overwrite — the digest that was
+replaced. It rotates like the other logs.
+
+There is deliberately no separate "target" field: the deployment tree mirrors the
+source, so the relative path is identical on both sides by construction, and the
+two roots are logged once per run in the `TARGET` line.
+
+> **Nothing in `state/` drives a correctness decision.** Earlier versions kept a
+> ledger used to decide whether a file had already been handled; with move
+> semantics that is a trap — a file skipped on the strength of a ledger entry is
+> never copied, therefore never removed, and stays in its pickup directory
+> forever. "Does the destination already hold this content?" is answered by
+> hashing the destination, the only answer that survives a crash.
 
 ---
 
-## §12 — Observabilité
+## §12 — Observability
 
-### Journaux
+### Logs
 
-Une ligne structurée par événement, en texte clé/valeur ou en JSON. Les valeurs pouvant
-contenir des tabulations, retours à la ligne ou `%` sont encodées de façon réversible.
-Trois destinations :
+One structured line per event, as key/value text or JSON. Values that may
+contain tabs, newlines or `%` are escaped reversibly. Three destinations:
 
-- `logs/_run.log` — événements d'orchestration : démarrage, cibles chargées, battement
-  de cœur, résumé.
-- `logs/<clé>/operations.log` — tout ce qui concerne une cible.
-- `logs/<clé>/audit.log` — piste en ajout seul, `action=MOVED`, tournée comme les
-  autres.
+- `logs/_run.log` — orchestration: start, targets loaded, heartbeat, summary.
+- `logs/<key>/operations.log` — everything concerning one target.
+- `logs/<key>/audit.log` — append-only trail, one line per file moved:
+  `action=` is the outcome (`DEPLOYED`, `DEPLOYED_OVERWRITE`,
+  `DEPLOYED_IDENTICAL`), plus `relpath=`, `archive=`, `hash=`, `size=` and
+  `prev_hash=` when an overwrite replaced something.
 
-Chaque ligne porte un `run=` corrélant l'exécution, et les lignes de cible portent
-`project=`, `env=` et `cycle=`.
+Every line carries a `run=` correlating the execution; target lines also carry
+`project=`, `env=` and `cycle=`.
 
-### Événements à surveiller
+### Events to alert on
 
-| Événement | Signification opérationnelle |
+| Event | Operational meaning |
 |---|---|
-| `DEPLOY_UNAVAILABLE` | La destination n'est pas là. Rien ne circule. |
-| `DEPLOY_FAILED` | Écriture refusée. La donnée n'est pas livrée. |
-| `SOURCE_STUCK` | Livré, mais la source ne se vide pas. |
-| `SOURCE_NOT_WRITABLE` | Un répertoire entier ne peut pas être drainé. |
-| `MOUNT_MISSING` | Source indisponible ; le journal donne l'ancêtre existant le plus profond. |
+| `DEPLOY_UNAVAILABLE` | The destination is not there. Nothing is moving. |
+| `DEPLOY_FAILED` | Write refused. The data is not delivered. |
+| `SOURCE_STUCK` | Delivered, but the source is not draining. |
+| `SOURCE_NOT_WRITABLE` | A whole directory cannot be drained. |
+| `MOUNT_MISSING` | Source unavailable; the log gives the deepest existing ancestor. |
 
-### Codes de sortie
+### Exit codes
 
-| Code | Signification | Action attendue |
+| Code | Meaning | Expected action |
 |---|---|---|
-| `0` | Succès | — |
-| `1` | Erreur de configuration | Corriger `squirrel.conf` ou `targets.tsv` |
-| `2` | Aucune cible exploitable | Vérifier les montages source |
-| `3` | Verrou occupé | Aucune — attendu à chaque relance cron |
-| `4` | Écriture de déploiement en échec | Réparer la destination |
-| `5` | Fichier livré mais non retiré de la source | Corriger les droits sur le partage de dépôt |
+| `0` | Success | — |
+| `1` | Configuration error | Fix `file-deploy.conf` or `targets.tsv` |
+| `2` | No usable target | Check the source mounts |
+| `3` | Lock busy | None — expected on every cron tick |
+| `4` | A deployment write failed | Repair the destination |
+| `5` | File delivered but not removed from the source | Fix permissions on the pickup share |
 
-Précédence : aucune cible exploitable, puis échec de déploiement, puis source bloquée.
-La donnée non livrée prime sur la donnée livrée mais non drainée.
-
----
-
-## §13 — Exécution
-
-Une exécution acquiert un `flock` non bloquant sur `run.lock`, puis boucle jusqu'à
-`RUN_DURATION` secondes en réveillant chaque cible tous les `scan_interval`. Une seconde
-instance sort immédiatement en `3`. Une entrée cron par minute suffit donc à relancer la
-boucle si elle est morte, sans jamais provoquer de recouvrement.
-
-`--rediscover` dépose un marqueur et sort : la boucle en cours force une redécouverte
-complète et une passe profonde au cycle suivant.
-
-> **Mise en service.** Toute nouvelle cible se répète d'abord avec `DRY_RUN=true`, et
-> les lignes `WOULD_MOVE` se lisent une par une. Cet outil supprime depuis la source :
-> une `source_root` erronée ne se rattrape pas depuis les journaux.
+Precedence: no usable target, then deployment failure, then source stuck.
+Undelivered data outranks delivered-but-not-drained.
 
 ---
 
-## §14 — Migration depuis le mode copie
+## §13 — Execution
 
-| Élément | Comportement |
+A run acquires a non-blocking `flock` on `run.lock`, then loops for up to
+`RUN_DURATION` seconds, waking each target every `scan_interval`. A second
+instance exits immediately with `3`. One cron entry per minute therefore
+suffices to restart the loop if it died, without ever causing an overlap.
+
+`--rediscover` drops a marker and exits: the running loop forces a full
+rediscovery and a deep pass on its next cycle.
+
+> **Commissioning.** Every new target is rehearsed first with `DRY_RUN=true`,
+> reading the `WOULD_MOVE` lines one by one. This tool deletes from the source: a
+> wrong `source_root` cannot be recovered from the logs.
+
+---
+
+## §14 — Upgrading from copy mode
+
+| Item | Behaviour |
 |---|---|
-| Sentinelle héritée | `.squirrel-archive-root` est acceptée et le nouveau marqueur est écrit à côté (`DEPLOY_MARKER_MIGRATED`) |
-| Cache `leaves.tsv` | Porte une version de format. L'ancien cache est rejeté, sinon tout répertoire aurait été jugé « inchangé » depuis la dernière exécution en mode copie et l'arriéré n'aurait pas été drainé. |
-| Ledger existant | Conservé et complété. Il n'est plus lu pour décider quoi que ce soit. |
-| Arriéré dans la source | **Tout fichier encore présent sera déployé puis retiré**, en une seule passe. C'est le comportement voulu, mais il doit être une décision consciente. |
-| Colonne 4 de `targets.tsv` | Renommée `deploy_root`. Positionnelle : aucun changement de format. |
-| Versionnage | **B n'est plus un magasin de versions.** Un fichier modifié écrase désormais ; l'historique vit dans l'archive locale. |
+| `leaves.tsv` cache | Carries a format version. The old cache is rejected — otherwise every pickup directory would look "unchanged" since the last copy-mode run and the backlog would not be drained. |
+| Old `ledger.tsv` | No longer read or written. Left on disk; delete it at leisure. |
+| Backlog in the source | **Every file still present will be deployed then removed**, in a single pass. That is the intended behaviour, but it must be a deliberate decision — rehearse with `DRY_RUN=true`. |
+| `targets.tsv` column 4 | Renamed `deploy_root`. Positional: no format change. |
+| Versioning | **B is no longer a version store.** A changed file now overwrites; history lives in the local archive. |
+| `REQUIRE_MOUNT` | Removed. It only ever selected a log level, never a behaviour; the source guard has always been unconditional. A leftover setting in `file-deploy.conf` is harmless and ignored. |
 
 ---
 
-## §15 — Hors périmètre
+## §15 — Out of scope
 
-- **Aucune rétention.** Les archives locales croissent sans limite, sur le partage
-  *source*, et rien ne les purge. Les partages de dépôt ont besoin d'une politique de
-  rétention propre.
-- **Aucun montage.** Les partages sont supposés déjà montés ; squirrel constate leur
-  état et refuse d'agir dans le doute.
-- **Aucune garantie de capture.** Squirrel interroge, il ne verrouille pas le
-  producteur. Un fichier dont la durée de vie est plus courte qu'un `SCAN_INTERVAL` peut
-  être manqué.
-- **Aucun consommateur concurrent.** Squirrel est ce qui vide les répertoires de dépôt.
-  Si un autre processus en retire des fichiers, squirrel ne les verra simplement jamais.
-- **Aucune reprise transactionnelle multi-fichiers.** La transaction porte sur un
-  fichier ; il n'existe pas de lot atomique.
+- **No retention.** Local archives grow without bound, on the *source* share,
+  and nothing purges them. Pickup shares need a retention policy of their own.
+- **No mounting.** Shares are assumed mounted; file-deploy observes their state and
+  refuses to act when in doubt.
+- **No capture guarantee.** file-deploy polls, it does not lock the producer. A file
+  whose lifetime is shorter than one `SCAN_INTERVAL` can be missed.
+- **No concurrent consumer.** file-deploy is what empties the pickup directories. If
+  another process removes files from them, file-deploy simply never sees them.
+- **No multi-file transaction.** The transaction covers one file; there is no
+  atomic batch.

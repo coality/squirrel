@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# End-to-end test suite for squirrel.sh — pure bash, no external deps.
+# End-to-end test suite for file-deploy.sh — pure bash, no external deps.
 # Each test builds an isolated sandbox, runs the real script against it, and
 # asserts on the filesystem, the logs and the exit code. Exits non-zero if any
 # assertion fails.
@@ -9,12 +9,12 @@ set -uo pipefail
 
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 ROOT=$(CDPATH= cd -- "$HERE/.." && pwd -P)
-SCRIPT="$ROOT/squirrel.sh"
+SCRIPT="$ROOT/file-deploy.sh"
 
 # shellcheck source=tests/lib/assert.sh
 source "$HERE/lib/assert.sh"
 
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/squirrel-e2e.XXXXXX")
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/file-deploy-e2e.XXXXXX")
 cleanup() { chmod -R u+rwX "$WORK" 2>/dev/null; rm -rf "$WORK"; }
 trap cleanup EXIT
 
@@ -36,11 +36,11 @@ INPUT_DIR_NAME="input"
 SCAN_INTERVAL=1
 RUN_DURATION=0
 MIN_STABLE_AGE=0
-REQUIRE_MOUNT=false
 HASH_CMD="sha256sum"
 DRY_RUN=false
 DISCOVERY_INTERVAL=1800
 USE_DIR_MTIME_SKIP=true
+LOCAL_ARCHIVE_DIR="archive"
 LOG_LEVEL="DEBUG"
 LOG_FORMAT="text"
 LOG_ROTATE_MAX_BYTES=10485760
@@ -55,25 +55,68 @@ EOF
     } > "$d/conf"
 }
 
-add_target() {  # dir project env src arc [idn] [scan] [enabled]
-    local d=$1 p=$2 e=$3 src=$4 arc=$5 idn=${6:--} scan=${7:--} en=${8:-true}
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$p" "$e" "$src" "$arc" "$idn" "$scan" "$en" >> "$d/targets.tsv"
+add_target() {  # dir project env src deploy_root [idn] [scan] [enabled]
+    local d=$1 p=$2 e=$3 src=$4 dep=$5 idn=${6:--} scan=${7:--} en=${8:-true}
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$p" "$e" "$src" "$dep" "$idn" "$scan" "$en" >> "$d/targets.tsv"
+}
+
+# run_shimmed <shim_dir> <case_dir> [env...]: run with a fake cp/rm ahead on
+# PATH, to reach the two branches that a real filesystem will not produce on
+# demand (a writer racing the copy, an unlinkable source file).
+run_shimmed() { local shim=$1 d=$2; shift 2; env "$@" PATH="$shim:$PATH" bash "$SCRIPT" --config "$d/conf"; }
+
+# make_shim <dir> <tool> <body>: put a fake <tool> ahead on PATH for one case.
+make_shim() {
+    local dir=$1 tool=$2 body=$3
+    mkdir -p "$dir"
+    { printf '#!/usr/bin/env bash\n'; printf '%s\n' "$body"; } > "$dir/$tool"
+    chmod +x "$dir/$tool"
 }
 
 run() { bash "$SCRIPT" --config "$1/conf"; }
 
 oplog() { printf '%s/logs/%s__%s/operations.log' "$1" "$2" "$3"; }
 auditlog() { printf '%s/logs/%s__%s/audit.log' "$1" "$2" "$3"; }
-ledger() { printf '%s/state/%s__%s.ledger.tsv' "$1" "$2" "$3"; }
+deployed_mark() { printf '%s/state/%s__%s.deployed' "$1" "$2" "$3"; }
 
-# NUL-based count so that file names containing newlines count as one file.
-count_files() { find "$1" -type f -print0 2>/dev/null | tr -dc '\0' | wc -c | tr -d ' '; }
+# NUL-based counts so that file names containing newlines count as one file.
+# The root sentinels are bookkeeping, never content.
+_MARKERS=( ! -name '.file-deploy-root' )
+
+# Everything under a tree (deployment trees, or a source including its archives).
+count_files() {
+    find "$1" -type f "${_MARKERS[@]}" -print0 2>/dev/null | tr -dc '\0' | wc -c | tr -d ' '
+}
+
+# Files still waiting in the source: everything EXCEPT the local archives.
+# In move mode the steady state of a pickup directory is zero.
+count_pending() {
+    local arc=${2:-archive}
+    find "$1" -type d -name "$arc" -prune -o -type f "${_MARKERS[@]}" -print0 2>/dev/null |
+        tr -dc '\0' | wc -c | tr -d ' '
+}
+
+# Files sitting in the local archive directories of a source tree.
+count_archived() {
+    local arc=${2:-archive}
+    find "$1" -type d -name "$arc" -exec find {} -type f -print0 \; 2>/dev/null |
+        tr -dc '\0' | wc -c | tr -d ' '
+}
 
 fingerprint() {  # names + contents fingerprint of a directory tree
-    ( cd "$1" 2>/dev/null && find . -type f -print0 2>/dev/null | LC_ALL=C sort -z |
+    ( cd "$1" 2>/dev/null && find . -type f "${_MARKERS[@]}" -print0 2>/dev/null |
+        LC_ALL=C sort -z |
         while IFS= read -r -d '' f; do
             printf '%s|%s\n' "$f" "$(sha256sum -- "$f" 2>/dev/null | cut -d' ' -f1)"
         done ) | sha256sum | cut -d' ' -f1
+}
+
+# Digest of the CONTENTS of a tree, ignoring path and name. Move mode relocates
+# files, so this is what proves "the same bytes are still there, elsewhere".
+content_digest() {
+    ( find "$1" -type f "${_MARKERS[@]}" -print0 2>/dev/null |
+        while IFS= read -r -d '' f; do sha256sum -- "$f" | cut -d' ' -f1; done ) |
+        LC_ALL=C sort | sha256sum | cut -d' ' -f1
 }
 
 title() { printf '\n== %s\n' "$1"; }
@@ -83,7 +126,7 @@ title() { printf '\n== %s\n' "$1"; }
 # ---------------------------------------------------------------------------
 
 test_multitarget_and_isolation() {  # matrix 1,4,12,13,21
-    title "multi-target, mirror depth, ledger/log isolation, atomic copy"
+    title "multi-target, mirror depth, log isolation, atomic deploy"
     local d; d=$(new_case)
     mkdir -p "$d/srcA/input" "$d/srcB/deep/nested/input"
     echo aaa > "$d/srcA/input/a.txt"
@@ -95,12 +138,12 @@ test_multitarget_and_isolation() {  # matrix 1,4,12,13,21
     assert_exit "$rc" 0 "run"
     assert_file "$d/arcA/input/a.txt" "A mirror"
     assert_file "$d/arcB/deep/nested/input/b.txt" "B mirror depth"
-    assert_grep "$(oplog "$d" projA prod)" 'event=COPIED'
+    assert_grep "$(oplog "$d" projA prod)" 'event=DEPLOYED'
     assert_nogrep "$(oplog "$d" projA prod)" 'project=projB' "no cross-target logs"
-    assert_nogrep "$(ledger "$d" projA prod)" 'b.txt' "no cross-target ledger"
+    assert_nogrep "$(auditlog "$d" projA prod)" 'b.txt' "no cross-target audit trail"
     assert_grep "$d/logs/_run.log" 'event=START'
     assert_grep "$d/logs/_run.log" 'event=RUN_SUMMARY'
-    assert_nogrep "$d/logs/_run.log" 'event=COPIED' "_run.log has no archive events"
+    assert_nogrep "$d/logs/_run.log" 'event=DEPLOYED' "_run.log has no per-target events"
     assert_eq 0 "$(find "$d/arcA" -name '*.tmp.*' | wc -l | tr -d ' ')" "no tmp residue"
 }
 
@@ -128,61 +171,79 @@ test_enabled_false() {  # matrix 3
 }
 
 test_copy_and_audit() {  # matrix 5
-    title "initial copy fills ledger and audit"
+    title "a move is recorded in the audit trail"
     local d; d=$(new_case)
     mkdir -p "$d/src/input"
     echo hello > "$d/src/input/f.txt"
     add_target "$d" p e "$d/src" "$d/arc"
     write_conf "$d"
     run "$d"
-    assert_file "$(ledger "$d" p e)"
-    assert_grep "$(ledger "$d" p e)" 'input/f.txt'
-    assert_grep "$(auditlog "$d" p e)" 'action=COPIED'
-    assert_grep "$(auditlog "$d" p e)" 'input/f.txt'
+    assert_grep "$(auditlog "$d" p e)" 'action=DEPLOYED'
+    assert_grep "$(auditlog "$d" p e)" 'relpath="input/f.txt"'
+    assert_grep "$(auditlog "$d" p e)" 'archive="input/archive/f.txt"'
+    # The mirror makes the relative path identical on both sides, so there is no
+    # second path field to carry: a constant tells the reader nothing.
+    assert_nogrep "$(auditlog "$d" p e)" 'target=' "no redundant target field"
+    assert_file "$(deployed_mark "$d" p e)" "target recorded as having deployed"
 }
 
 test_idempotence_and_dirskip() {  # matrix 6,7,24
-    title "idempotence + SKIP_DIR_UNCHANGED on a no-op second run"
+    title "a drained pickup dir deploys nothing again and then settles"
     local d; d=$(new_case)
     mkdir -p "$d/src/input"
     echo hello > "$d/src/input/f.txt"
     add_target "$d" p e "$d/src" "$d/arc"
     write_conf "$d"
     run "$d"
-    assert_eq 1 "$(count_files "$d/arc")" "one file after run 1"
+    assert_eq 1 "$(count_files "$d/arc")" "one file deployed"
+    assert_eq 0 "$(count_pending "$d/src")" "pickup dir drained"
+    # Run 2 still has to look: our own move changed the directory's mtime.
     : > "$(oplog "$d" p e)"
     run "$d"
     assert_eq 1 "$(count_files "$d/arc")" "still one file after run 2"
+    assert_nogrep "$(oplog "$d" p e)" 'event=DEPLOYED' "nothing left to deploy"
+    # Run 3: nothing has changed since run 2, so the mtime skip finally fires.
+    : > "$(oplog "$d" p e)"
+    run "$d"
     assert_grep "$(oplog "$d" p e)" 'event=SKIP_DIR_UNCHANGED'
-    assert_nogrep "$(oplog "$d" p e)" 'event=COPIED' "no re-copy"
 }
 
 test_versioning_and_revert() {  # matrix 8,9
-    title "versioning on changed content, no re-copy on revert"
+    title "changed content overwrites the deployment and versions the archive"
     local d; d=$(new_case)
     mkdir -p "$d/src/input"
-    # Explicit, distinct mtimes/sizes so the (path,size,mtime) fast-path never
-    # hides a genuine content change (1-second mtime granularity otherwise).
     printf 'v1\n' > "$d/src/input/test.xml"
     touch -d '2001-01-01 10:00:00' "$d/src/input/test.xml"
     add_target "$d" p e "$d/src" "$d/arc"
-    # skip disabled so in-place content changes are always detected
-    write_conf "$d" 'USE_DIR_MTIME_SKIP=false'
+    write_conf "$d"
     run "$d"
-    assert_file "$d/arc/input/test.xml" "base version"
+    assert_file "$d/arc/input/test.xml" "deployed"
+    assert_eq 1 "$(count_archived "$d/src")" "archived once"
+
+    # Same name, new content: the deployment tree holds the CURRENT state, so it
+    # is overwritten; the previous version survives in the local archive.
     printf 'version-two-longer\n' > "$d/src/input/test.xml"
     touch -d '2001-01-01 10:00:05' "$d/src/input/test.xml"
     run "$d"
-    assert_eq 2 "$(count_files "$d/arc")" "base + timestamped version"
-    assert_file "$d/arc/input/test.xml" "original kept"
-    assert_grep "$(oplog "$d" p e)" 'event=VERSIONED'
-    # revert to v1 content with a fresh mtime (hash already archived -> skip)
+    assert_eq 1 "$(count_files "$d/arc")" "deployment tree still holds exactly one file"
+    assert_eq "version-two-longer" "$(cat "$d/arc/input/test.xml")" "deployment is the new content"
+    assert_eq 2 "$(count_archived "$d/src")" "archive keeps both versions"
+    assert_grep "$(oplog "$d" p e)" 'event=DEPLOYED_OVERWRITE'
+    assert_grep "$(oplog "$d" p e)" 'old_hash='
+    # An overwrite destroys a version in the deployment tree: the audit trail
+    # must record which digest it replaced.
+    assert_grep "$(auditlog "$d" p e)" 'action=DEPLOYED_OVERWRITE'
+    assert_grep "$(auditlog "$d" p e)" 'prev_hash='
+
+    # Re-drop the ORIGINAL content: it is deployed again (never left stuck in
+    # the source) and reuses its identical archive entry instead of duplicating.
     printf 'v1\n' > "$d/src/input/test.xml"
-    touch -d '2001-01-01 10:00:10' "$d/src/input/test.xml"
+    touch -d '2001-01-01 10:00:00' "$d/src/input/test.xml"
     : > "$(oplog "$d" p e)"
     run "$d"
-    assert_eq 2 "$(count_files "$d/arc")" "revert adds nothing"
-    assert_grep "$(oplog "$d" p e)" 'event=SKIP_SAME_HASH'
+    assert_eq 0 "$(count_pending "$d/src")" "re-dropped file is never left behind"
+    assert_eq "v1" "$(cat "$d/arc/input/test.xml")" "deployment reverted"
+    assert_eq 2 "$(count_archived "$d/src")" "identical archive entry reused, not duplicated"
 }
 
 test_stability() {  # matrix 10
@@ -193,15 +254,19 @@ test_stability() {  # matrix 10
     add_target "$d" p e "$d/src" "$d/arc"
     write_conf "$d" 'MIN_STABLE_AGE=3600' 'USE_DIR_MTIME_SKIP=false'
     run "$d"
-    assert_eq 0 "$(count_files "$d/arc")" "too recent -> not archived"
+    assert_eq 0 "$(count_files "$d/arc")" "too recent -> not deployed"
     assert_grep "$(oplog "$d" p e)" 'event=SKIP_UNSTABLE'
+    # The whole point in move mode: an unstable file must not be consumed.
+    assert_file "$d/src/input/f.txt" "and above all NOT removed from the source"
+    assert_eq 0 "$(count_archived "$d/src")" "nor archived"
     touch -d '2 hours ago' "$d/src/input/f.txt"
     run "$d"
-    assert_eq 1 "$(count_files "$d/arc")" "archived once stable"
+    assert_eq 1 "$(count_files "$d/arc")" "deployed once stable"
+    assert_eq 0 "$(count_pending "$d/src")" "and drained once stable"
 }
 
-test_source_readonly() {  # matrix 11
-    title "source tree is never modified"
+test_source_drained() {  # matrix 11 (inverted: the source IS modified now)
+    title "the source is drained and its bytes survive in the local archive"
     local d; d=$(new_case)
     mkdir -p "$d/src/a/input" "$d/src/b/input"
     echo one > "$d/src/a/input/one.txt"
@@ -209,11 +274,15 @@ test_source_readonly() {  # matrix 11
     add_target "$d" p e "$d/src" "$d/arc"
     write_conf "$d"
     local before after
-    before=$(fingerprint "$d/src")
+    before=$(content_digest "$d/src")
     run "$d"
-    after=$(fingerprint "$d/src")
-    assert_eq "$before" "$after" "source fingerprint unchanged"
-    assert_eq 2 "$(count_files "$d/arc")" "both archived"
+    after=$(content_digest "$d/src")
+    assert_eq "$before" "$after" "every byte still present in the source tree"
+    assert_eq 0 "$(count_pending "$d/src")" "pickup dirs emptied"
+    assert_eq 2 "$(count_archived "$d/src")" "both files archived locally"
+    assert_file "$d/src/a/input/archive/one.txt" "archived next to where it came from"
+    assert_file "$d/src/b/input/archive/two.txt" "archived next to where it came from"
+    assert_eq 2 "$(count_files "$d/arc")" "both deployed"
 }
 
 test_json_logging() {  # matrix 14
@@ -225,7 +294,7 @@ test_json_logging() {  # matrix 14
     write_conf "$d" 'LOG_FORMAT="json"'
     run "$d"
     assert_grepE "$(oplog "$d" p e)" '^\{"ts":' "starts as JSON object"
-    assert_grep "$(oplog "$d" p e)" '"event":"COPIED"'
+    assert_grep "$(oplog "$d" p e)" '"event":"DEPLOYED"'
 }
 
 test_log_rotation() {  # matrix 15
@@ -250,10 +319,10 @@ test_exit_config() {  # matrix 16 (config)
 }
 
 test_exit_notarget() {  # matrix 16 (no target), 19
-    title "exit 2 when the only source is missing (REQUIRE_MOUNT)"
+    title "exit 2 when the only source is missing"
     local d; d=$(new_case)
     add_target "$d" p e "$d/does-not-exist" "$d/arc"
-    write_conf "$d" 'REQUIRE_MOUNT=true'
+    write_conf "$d"
     run "$d"; local rc=$?
     assert_exit "$rc" 2 "no usable target"
     assert_grep "$(oplog "$d" p e)" 'event=MOUNT_MISSING'
@@ -267,10 +336,34 @@ test_exit_archive_error() {  # matrix 16 (archive), G2/G3
     chmod 555 "$d/arc"
     add_target "$d" p e "$d/src" "$d/arc"
     write_conf "$d"
-    run "$d"; local rc=$?
+    run "$d" 2>"$d/stderr"; local rc=$?
     chmod 755 "$d/arc"
     assert_exit "$rc" 4 "archive error"
-    assert_grep "$(oplog "$d" p e)" 'event=COPY_FAILED'
+    assert_grep "$(oplog "$d" p e)" 'event=DEPLOY_UNAVAILABLE'
+    assert_eq 0 "$(wc -c < "$d/stderr" | tr -d ' ')" "no shell noise on stderr"
+    assert_eq 0 "$(count_files "$d/arc")" "nothing deployed"
+    assert_file "$d/src/input/x.txt" "and the source is untouched"
+    assert_eq 0 "$(count_archived "$d/src")" "nothing archived either"
+}
+
+test_copy_failed_midtree() {  # per-file DEPLOY_FAILED once the deploy root is fine
+    title "exit 4 + DEPLOY_FAILED when a destination subdir is not writable"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/input"
+    echo a > "$d/src/input/a.txt"
+    add_target "$d" p e "$d/src" "$d/arc"
+    write_conf "$d"
+    run "$d"
+    assert_file "$d/arc/input/a.txt" "first file archived"
+    # archive root stays writable (marker ok), the mirrored subdir does not
+    echo b > "$d/src/input/b.txt"
+    chmod 555 "$d/arc/input"
+    run "$d"; local rc=$?
+    chmod 755 "$d/arc/input"
+    assert_exit "$rc" 4 "deploy error"
+    assert_grep "$(oplog "$d" p e)" 'event=DEPLOY_FAILED'
+    assert_file "$d/src/input/b.txt" "the file that failed to deploy is kept"
+    assert_nofile "$d/src/input/archive/b.txt" "and was not archived"
 }
 
 test_lock_busy() {  # matrix 17
@@ -296,10 +389,15 @@ test_dry_run() {  # matrix 18
     echo x > "$d/src/input/x.txt"
     add_target "$d" p e "$d/src" "$d/arc"
     write_conf "$d" 'DRY_RUN=true'
+    local before; before=$(fingerprint "$d/src")
     run "$d"
-    assert_eq 0 "$(count_files "$d/arc")" "nothing archived"
-    assert_nofile "$(ledger "$d" p e)" "no ledger written"
+    assert_eq 0 "$(count_files "$d/arc")" "nothing deployed"
+    assert_nofile "$(deployed_mark "$d" p e)" "no state written"
     assert_grep "$(oplog "$d" p e)" 'dry="1"'
+    # A rehearsal of a destructive tool must be provably inert.
+    assert_eq "$before" "$(fingerprint "$d/src")" "source byte-identical after a dry run"
+    assert_nofile "$d/src/input/archive" "no archive directory created"
+    assert_grep "$(oplog "$d" p e)" 'event=WOULD_MOVE'
 }
 
 test_weird_names() {  # matrix 20
@@ -312,7 +410,10 @@ test_weird_names() {  # matrix 20
     write_conf "$d"
     run "$d"
     assert_file "$d/arc/input/a b é.txt" "space + utf8 name"
-    assert_eq 2 "$(count_files "$d/arc")" "both weird names archived"
+    assert_eq 2 "$(count_files "$d/arc")" "both weird names deployed"
+    assert_file "$d/src/input/archive/a b é.txt" "and archived under the same name"
+    assert_eq 2 "$(count_archived "$d/src")" "both archived"
+    assert_eq 0 "$(count_pending "$d/src")" "both drained"
 }
 
 test_discovery_cache() {  # matrix 23
@@ -494,18 +595,6 @@ test_dirskip_disabled() {  # matrix 26
     assert_nogrep "$(oplog "$d" p e)" 'event=SKIP_DIR_UNCHANGED'
 }
 
-test_ledger_corrupt() {  # matrix 27
-    title "corrupted ledger makes the target refuse to run"
-    local d; d=$(new_case)
-    mkdir -p "$d/src/input"
-    echo x > "$d/src/input/x.txt"
-    printf 'garbage-without-tabs\n' > "$(ledger "$d" p e)"
-    add_target "$d" p e "$d/src" "$d/arc"
-    write_conf "$d"
-    run "$d"
-    assert_grep "$(oplog "$d" p e)" 'event=LEDGER_CORRUPT'
-    assert_eq 0 "$(count_files "$d/arc")" "nothing archived on corrupt ledger"
-}
 
 test_duplicate_target() {  # matrix 28
     title "duplicate (project,env) rejected, first kept"
@@ -531,9 +620,13 @@ test_resilience_unreadable_file() {  # matrix 22 (resilience)
     write_conf "$d"
     run "$d"; local rc=$?
     chmod 644 "$d/src/input/bad.txt"
-    assert_file "$d/arc/input/good.txt" "readable file archived"
+    assert_file "$d/arc/input/good.txt" "readable file deployed"
     assert_grep "$(oplog "$d" p e)" 'event=HASH_FAILED'
     assert_exit "$rc" 0 "run did not crash"
+    # Never consume what could not be read back.
+    assert_file "$d/src/input/bad.txt" "the unreadable file is kept in the source"
+    assert_nofile "$d/src/input/archive/bad.txt" "and never archived"
+    assert_nofile "$d/src/input/good.txt" "the readable one did leave"
 }
 
 test_multiple_input_names() {  # INPUT_DIR_NAME accepts several exact names
@@ -544,7 +637,7 @@ test_multiple_input_names() {  # INPUT_DIR_NAME accepts several exact names
     echo 2 > "$d/src/b/Input/y.txt"
     echo 3 > "$d/src/c/input_/z.txt"
     echo 4 > "$d/src/d/output/w.txt"
-    add_target "$d" p e "$d/src" "$d/arc" "input Input input_"
+    add_target "$d" p e "$d/src" "$d/arc" "input,Input,input_"
     write_conf "$d"
     run "$d"
     assert_file   "$d/arc/a/input/x.txt"  "lowercase input matched"
@@ -552,6 +645,40 @@ test_multiple_input_names() {  # INPUT_DIR_NAME accepts several exact names
     assert_file   "$d/arc/c/input_/z.txt" "input_ matched"
     assert_nofile "$d/arc/d/output/w.txt" "unlisted name not matched"
     assert_eq 3 "$(count_files "$d/arc")" "exactly three files"
+}
+
+test_input_name_with_space() {  # a name containing a space must still work
+    title "input_dir_name may contain spaces (comma is the only separator)"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/a/Input Files" "$d/src/b/input"
+    echo 1 > "$d/src/a/Input Files/x.txt"
+    echo 2 > "$d/src/b/input/y.txt"
+    add_target "$d" p e "$d/src" "$d/arc" "Input Files, input"
+    write_conf "$d"
+    run "$d"
+    assert_file "$d/arc/a/Input Files/x.txt" "name with a space matched"
+    assert_file "$d/arc/b/input/y.txt"       "plain name still matched"
+    assert_eq 2 "$(count_files "$d/arc")" "both matched"
+}
+
+test_input_name_no_globs() {  # names are matched literally, as documented
+    title "input_dir_name is literal: no glob expansion"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/a/input_old" "$d/src/b/input[1]"
+    echo 1 > "$d/src/a/input_old/x.txt"
+    echo 2 > "$d/src/b/input[1]/y.txt"
+    add_target "$d" p e "$d/src" "$d/arc" "input*"
+    write_conf "$d"
+    run "$d"
+    assert_eq 0 "$(count_files "$d/arc")" "'input*' does not glob-match input_old"
+    # a name that is all metacharacters is found when it exists literally
+    local d2; d2=$(new_case)
+    mkdir -p "$d2/src/b/input[1]"
+    echo 2 > "$d2/src/b/input[1]/y.txt"
+    add_target "$d2" p e "$d2/src" "$d2/arc" "input[1]"
+    write_conf "$d2"
+    run "$d2"
+    assert_file "$d2/arc/b/input[1]/y.txt" "literal bracket name matched"
 }
 
 test_input_name_comma_separated() {  # comma is also a valid separator
@@ -593,8 +720,8 @@ test_extra_dir_basic() {  # EXTRA_DIRS: fixed source -> precise destination, dep
     assert_file   "$d/arcR/sub/b.txt"      "level-1 subdir file mirrored under dest"
     assert_nofile "$d/arcR/sub/deep/c.txt" "level-2 beyond depth=1 ignored"
     assert_eq 2 "$(count_files "$d/arcR")" "exactly two files"
-    assert_grep "$(oplog "$d" reports extra)" 'event=COPIED'
-    assert_grep "$(ledger "$d" reports extra)" 'a.txt'
+    assert_grep "$(oplog "$d" reports extra)" 'event=DEPLOYED'
+    assert_grep "$(auditlog "$d" reports extra)" 'a.txt'
     assert_grep "$d/logs/_run.log" 'mode="fixed"'
 }
 
@@ -627,7 +754,7 @@ test_extra_dir_unlimited() {  # depth=unlimited -> the whole subtree
 }
 
 test_extra_dir_coexist_isolation() {  # a normal target and an extra rule, isolated
-    title "EXTRA_DIRS coexists with a normal target, ledgers isolated"
+    title "EXTRA_DIRS coexists with a normal target, state isolated"
     local d; d=$(new_case)
     mkdir -p "$d/src/input" "$d/special"
     echo t > "$d/src/input/t.txt"
@@ -637,8 +764,8 @@ test_extra_dir_coexist_isolation() {  # a normal target and an extra rule, isola
     run "$d"
     assert_file "$d/arc/input/t.txt" "normal target still mirrors input"
     assert_file "$d/arcR/x.txt"      "extra rule archives to its destination"
-    assert_nogrep "$(ledger "$d" reports extra)" 't.txt'  "extra ledger has no target file"
-    assert_nogrep "$(ledger "$d" proj prod)"     'x.txt'  "target ledger has no extra file"
+    assert_nogrep "$(auditlog "$d" reports extra)" 't.txt'  "extra trail has no target file"
+    assert_nogrep "$(auditlog "$d" proj prod)"     'x.txt'  "target trail has no extra file"
     assert_grep "$d/logs/_run.log" 'input="1" extra="1"'
 }
 
@@ -658,7 +785,7 @@ test_extra_dir_idempotent_and_exclude() {  # dedup on re-run + EXCLUDE_DIR_PATTE
     : > "$(oplog "$d" reports extra)"
     run "$d"
     assert_eq 2 "$(count_files "$d/arcR")" "no re-copy on second run"
-    assert_nogrep "$(oplog "$d" reports extra)" 'event=COPIED' "idempotent second run"
+    assert_nogrep "$(oplog "$d" reports extra)" 'event=DEPLOYED' "source already drained"
 }
 
 test_extra_dir_malformed() {  # missing source/destination -> rule rejected
@@ -674,6 +801,397 @@ test_extra_dir_malformed() {  # missing source/destination -> rule rejected
 }
 
 # ---------------------------------------------------------------------------
+# Regression tests for the review findings
+# ---------------------------------------------------------------------------
+
+test_archive_unmounted() {
+    title "an unmounted archive share is refused, not silently filled"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/input" "$d/mnt"
+    echo x > "$d/src/input/x.txt"
+    add_target "$d" p e "$d/src" "$d/mnt/archive"
+    write_conf "$d"
+    run "$d"                                    # share mounted: normal archiving
+    assert_file "$d/mnt/archive/.file-deploy-root" "marker bootstrapped"
+    assert_eq 1 "$(count_files "$d/mnt/archive")" "archived while mounted"
+    # The share goes away; the local mount point stays behind, empty.
+    rm -rf "$d/mnt/archive"
+    echo y > "$d/src/input/y.txt"
+    : > "$(oplog "$d" p e)"
+    run "$d"; local rc=$?
+    assert_exit "$rc" 4 "archive unavailable"
+    assert_grep "$(oplog "$d" p e)" 'event=DEPLOY_UNAVAILABLE'
+    assert_eq 0 "$(count_files "$d/mnt/archive")" "nothing written to the bare mount point"
+    assert_nogrep "$(auditlog "$d" p e)" 'y.txt' "not recorded as moved"
+    # The property that matters most: an unmounted destination must never cause
+    # a file to be taken out of the source.
+    assert_file "$d/src/input/y.txt" "the source file survives the outage"
+    assert_nofile "$d/src/input/archive/y.txt" "and is not archived either"
+    # Once the share is back, the file that was refused is archived for real.
+    mkdir -p "$d/mnt/archive"; : > "$d/mnt/archive/.file-deploy-root"
+    run "$d"
+    assert_file "$d/mnt/archive/input/y.txt" "archived once remounted"
+}
+
+test_archive_marker_adopted() {
+    title "a pre-existing archive is adopted, not refused"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/input" "$d/arc/input"
+    echo x > "$d/src/input/x.txt"
+    # A tree this target has deployed to before, whose marker was lost.
+    : > "$(deployed_mark "$d" p e)"
+    echo old > "$d/arc/input/gone.txt"
+    add_target "$d" p e "$d/src" "$d/arc"
+    write_conf "$d"
+    run "$d"; local rc=$?
+    assert_exit "$rc" 0 "adopted, not refused"
+    assert_grep "$(oplog "$d" p e)" 'event=DEPLOY_MARKER_ADOPTED'
+    assert_file "$d/arc/.file-deploy-root" "marker created"
+    assert_file "$d/arc/input/x.txt" "still deploying"
+}
+
+
+test_deep_scan_recovers_stale_mtime() {
+    title "the deep pass recovers a directory whose mtime did not move"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/input" "$d/arc"
+    printf 'v1\n' > "$d/src/input/x.txt"
+    add_target "$d" p e "$d/src" "$d/arc"
+    write_conf "$d" 'DEEP_SCAN_INTERVAL=3600'
+    # Pin the directory mtime to an exact value. The scanner compares against
+    # find's %T@, which keeps sub-second precision that `stat -c %Y` truncates,
+    # so only a timestamp we set ourselves can be restored byte for byte.
+    local pinned='2020-01-01 00:00:00'
+    touch -d "$pinned" "$d/src/input"
+    run "$d"
+    assert_eq 1 "$(count_files "$d/arc")" "deployed once"
+    # A share that fails to bump the directory mtime when a file appears: forge
+    # exactly that by putting the pinned mtime back.
+    printf 'newcomer\n' > "$d/src/input/y.txt"
+    touch -d "$pinned" "$d/src/input"
+    run "$d"
+    assert_eq 1 "$(count_files "$d/arc")" "the mtime skip hides it"
+    assert_eq 1 "$(count_pending "$d/src")" "and it is still waiting in the source"
+    # Make the deep pass due (deterministically, no sleep).
+    touch -d '-1 hour' "$d/state/p__e.deepscan"
+    touch -d "$pinned" "$d/src/input"
+    write_conf "$d" 'DEEP_SCAN_INTERVAL=60'
+    run "$d"
+    assert_eq 2 "$(count_files "$d/arc")" "the deep pass finds it"
+    assert_eq 0 "$(count_pending "$d/src")" "and drains it"
+}
+
+test_unreadable_file_settles() {
+    title "a permanently unreadable file does not re-warn on every cycle"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/input" "$d/arc"
+    echo ok > "$d/src/input/good.txt"
+    echo secret > "$d/src/input/bad.txt"; chmod 000 "$d/src/input/bad.txt"
+    add_target "$d" p e "$d/src" "$d/arc" - 1
+    write_conf "$d" 'RUN_DURATION=4' 'SCAN_INTERVAL=1' 'DEEP_SCAN_INTERVAL=0' 'LOG_LEVEL="INFO"'
+    run "$d"; local rc=$?
+    chmod 644 "$d/src/input/bad.txt"
+    assert_exit "$rc" 0 "run completes"
+    assert_file "$d/arc/input/good.txt" "the readable file is archived"
+    assert_eq 1 "$(grep -c 'event=HASH_FAILED' "$(oplog "$d" p e)")" \
+        "warned once per run, not once per cycle"
+}
+
+test_prehistoric_mtime() {
+    title "a file dated before 1970 is archived, not flagged as unreadable"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/input" "$d/arc"
+    echo old > "$d/src/input/old.txt"
+    touch -d '1969-01-01 00:00:00' "$d/src/input/old.txt"
+    add_target "$d" p e "$d/src" "$d/arc"
+    write_conf "$d" 'USE_DIR_MTIME_SKIP=false'
+    run "$d"
+    assert_file "$d/arc/input/old.txt" "pre-1970 file archived"
+    assert_nogrep "$(oplog "$d" p e)" 'event=META_UNREADABLE'
+    : > "$(oplog "$d" p e)"
+    run "$d"
+    assert_eq 1 "$(count_files "$d/arc")" "not re-deployed on the second pass"
+    assert_eq 0 "$(count_pending "$d/src")" "and it is drained, not stuck"
+}
+
+test_stderr_clean_first_run() {
+    title "a first run on a fresh deployment writes nothing to stderr"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/input" "$d/arc"
+    echo x > "$d/src/input/x.txt"
+    add_target "$d" p e "$d/src" "$d/arc"
+    write_conf "$d" 'LOG_CONSOLE="never"'
+    run "$d" 2>"$d/stderr"
+    assert_eq 0 "$(wc -c < "$d/stderr" | tr -d ' ')" "clean stderr (no cron mail)"
+    assert_file "$d/arc/input/x.txt" "still archived"
+}
+
+test_verbose_flag_wins() {
+    title "--verbose is not overridden by LOG_CONSOLE in the config"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/input" "$d/arc"
+    echo x > "$d/src/input/x.txt"
+    add_target "$d" p e "$d/src" "$d/arc"
+    write_conf "$d" 'LOG_CONSOLE="never"'
+    bash "$SCRIPT" --config "$d/conf" --verbose >/dev/null 2>"$d/stderr"
+    assert_grep "$d/stderr" 'event=START' "--verbose mirrors to the terminal"
+}
+
+test_config_missing_value() {
+    title "--config without a value fails cleanly"
+    local out rc
+    out=$(bash "$SCRIPT" --config 2>&1); rc=$?
+    assert_exit "$rc" 1 "config error"
+    case $out in
+        *"Missing value for --config"*) _ok "clear message" ;;
+        *) _no "clear message, got: [$out]" ;;
+    esac
+    case $out in
+        *"unbound variable"*) _no "raw bash error leaked" ;;
+        *) _ok "no raw bash error" ;;
+    esac
+}
+
+test_discovery_cache_config_change() {
+    title "changing input_dir_name invalidates the discovery cache at once"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/a/input" "$d/src/b/Input" "$d/arc"
+    echo 1 > "$d/src/a/input/x.txt"
+    echo 2 > "$d/src/b/Input/y.txt"
+    add_target "$d" p e "$d/src" "$d/arc" "input"
+    write_conf "$d" 'DISCOVERY_INTERVAL=99999'
+    run "$d"
+    assert_eq 1 "$(count_files "$d/arc")" "only 'input' discovered"
+    : > "$d/targets.tsv"
+    add_target "$d" p e "$d/src" "$d/arc" "input,Input"
+    : > "$(oplog "$d" p e)"
+    run "$d"
+    assert_grep "$(oplog "$d" p e)" 'reason="config-changed"'
+    assert_eq 2 "$(count_files "$d/arc")" "the new name is picked up on the next cycle"
+}
+
+test_audit_rotation() {
+    title "audit.log is rotated like the operations log"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/input" "$d/arc"
+    local i
+    for i in $(seq 1 40); do printf 'content-%s\n' "$i" > "$d/src/input/f$i.txt"; done
+    add_target "$d" p e "$d/src" "$d/arc"
+    write_conf "$d" 'LOG_ROTATE_MAX_BYTES=400' 'LOG_ROTATE_KEEP=3'
+    run "$d"
+    assert_file "$(auditlog "$d" p e).1" "audit.log rotated"
+    local sz; sz=$(wc -c < "$(auditlog "$d" p e)" | tr -d ' ')
+    if (( sz <= 800 )); then _ok "audit.log kept bounded [$sz]"; else _no "audit.log unbounded [$sz]"; fi
+}
+
+test_target_bad_enabled() {
+    title "a target dropped by an unparsable 'enabled' column says so"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/input" "$d/arc"
+    echo x > "$d/src/input/x.txt"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' p e "$d/src" "$d/arc" - - 'oui' >> "$d/targets.tsv"
+    write_conf "$d"
+    run "$d"
+    assert_grep "$d/logs/_run.log" 'event=TARGET_BAD_ENABLED'
+    assert_eq 0 "$(count_files "$d/arc")" "target skipped, not half-processed"
+}
+
+test_target_extra_fields() {
+    title "a whitespace-split line with shifted columns is flagged"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/input" "$d/arc"
+    echo x > "$d/src/input/x.txt"
+    printf 'p e %s %s input,Input 10 true extra\n' "$d/src" "$d/arc" >> "$d/targets.tsv"
+    write_conf "$d"
+    run "$d"
+    assert_grep "$d/logs/_run.log" 'event=TARGET_EXTRA_FIELDS'
+}
+
+# ---------------------------------------------------------------------------
+# Move mode: the no-loss properties
+# ---------------------------------------------------------------------------
+
+test_local_archive_not_rescanned() {
+    title "the local archive is never re-deployed nor re-consumed"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/proj/input/sub"
+    echo one > "$d/src/proj/input/f.txt"
+    echo two > "$d/src/proj/input/sub/g.txt"
+    add_target "$d" p e "$d/src" "$d/arc"
+    write_conf "$d"
+    run "$d"
+    assert_eq 2 "$(count_archived "$d/src")" "both archived locally"
+    local arc_before; arc_before=$(fingerprint "$d/src")
+    : > "$(oplog "$d" p e)"
+    run "$d"; run "$d"
+    assert_eq "$arc_before" "$(fingerprint "$d/src")" "the source tree stopped changing"
+    assert_eq 2 "$(count_files "$d/arc")" "nothing new deployed"
+    assert_nofile "$d/arc/proj/input/archive" "no archive dir mirrored into the deployment tree"
+    assert_nofile "$d/arc/proj/input/sub/archive" "none from the subdir either"
+    assert_nogrep "$(oplog "$d" p e)" 'event=DEPLOYED' "no second deployment"
+    assert_grep "$(oplog "$d" p e)" 'event=LOCAL_ARCHIVE_SKIPPED'
+}
+
+test_pickup_dir_unwritable() {
+    title "an undrainable pickup dir deploys nothing and exits 5"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/input"
+    echo x > "$d/src/input/x.txt"
+    add_target "$d" p e "$d/src" "$d/arc"
+    write_conf "$d"
+    chmod 555 "$d/src/input"
+    run "$d"; local rc=$?
+    chmod 755 "$d/src/input"
+    assert_exit "$rc" 5 "source stuck"
+    assert_grep "$(oplog "$d" p e)" 'event=SOURCE_NOT_WRITABLE'
+    # Deploying out of a directory we cannot then clean would re-deploy forever.
+    assert_eq 0 "$(count_files "$d/arc")" "nothing deployed from it"
+    assert_file "$d/src/input/x.txt" "the file is untouched"
+}
+
+test_source_stuck_exit5() {
+    title "deployed but not removable: exit 5, file kept, no duplicate archive"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/input"
+    echo a > "$d/src/input/a.txt"
+    add_target "$d" p e "$d/src" "$d/arc"
+    write_conf "$d"
+    run "$d"
+    assert_eq 1 "$(count_archived "$d/src")" "first file archived"
+    # The pickup dir stays writable (so the guard passes) but its archive does not.
+    chmod 555 "$d/src/input/archive"
+    echo b > "$d/src/input/b.txt"
+    : > "$(oplog "$d" p e)"
+    run "$d"; local rc=$?
+    chmod 755 "$d/src/input/archive"
+    assert_exit "$rc" 5 "source stuck"
+    assert_grep "$(oplog "$d" p e)" 'event=SOURCE_STUCK'
+    assert_file "$d/src/input/b.txt" "kept in the source, not lost"
+    assert_file "$d/arc/input/b.txt" "but it IS deployed"
+    assert_eq 1 "$(count_archived "$d/src")" "no half-written archive entry"
+    # Once the obstacle is gone the retry converges, with no duplicate anywhere.
+    run "$d"
+    assert_eq 0 "$(count_pending "$d/src")" "drained on retry"
+    assert_eq 2 "$(count_archived "$d/src")" "exactly two archive entries"
+    assert_eq 2 "$(count_files "$d/arc")" "exactly two deployed files"
+}
+
+test_retry_after_deploy_failure() {
+    title "a failed deployment leaves the source intact and retries cleanly"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/input"
+    echo a > "$d/src/input/a.txt"
+    add_target "$d" p e "$d/src" "$d/arc"
+    write_conf "$d"
+    run "$d"
+    chmod 555 "$d/arc/input"
+    echo b > "$d/src/input/b.txt"
+    run "$d"; local rc=$?
+    chmod 755 "$d/arc/input"
+    assert_exit "$rc" 4 "deploy failure"
+    assert_file "$d/src/input/b.txt" "source kept when the deployment fails"
+    assert_eq 1 "$(count_archived "$d/src")" "nothing archived for a file that never deployed"
+    run "$d"
+    assert_file "$d/arc/input/b.txt" "deployed on retry"
+    assert_eq 0 "$(count_pending "$d/src")" "and drained"
+    assert_eq 2 "$(count_archived "$d/src")" "exactly one archive entry per file"
+}
+
+test_source_changed_during_copy() {
+    title "a file rewritten mid-copy is deployed but never removed"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/input"
+    printf 'start\n' > "$d/src/input/w.txt"
+    add_target "$d" p e "$d/src" "$d/arc"
+    write_conf "$d"
+    # A slow writer that appends right after our copy read the file. Only a shim
+    # can produce this race on demand.
+    make_shim "$d/shim" cp '/bin/cp "$@"; rc=$?
+for a in "$@"; do [[ $a == */input/w.txt ]] && printf "grew\n" >> "$a"; done
+exit $rc'
+    run_shimmed "$d/shim" "$d" >/dev/null 2>&1
+    assert_grep "$(oplog "$d" p e)" 'event=SOURCE_CHANGED_DURING_COPY'
+    assert_file "$d/src/input/w.txt" "NOT removed: what we deployed is a half-written snapshot"
+    assert_eq 0 "$(count_archived "$d/src")" "and not archived either"
+    # Without the shim the writer has stopped, so the next pass converges.
+    run "$d"
+    assert_eq 0 "$(count_pending "$d/src")" "drained once the file settles"
+    assert_eq "$(cat "$d/src/input/archive/w.txt")" "$(cat "$d/arc/input/w.txt")" \
+        "deployment and archive agree on the final content"
+}
+
+# ---------------------------------------------------------------------------
+# Move mode: deployment semantics
+# ---------------------------------------------------------------------------
+
+test_identical_redrop_moves() {
+    title "an identical re-drop is re-deployed, moved, and not duplicated"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/input"
+    printf 'same\n' > "$d/src/input/f.txt"
+    touch -d '2001-01-01 10:00:00' "$d/src/input/f.txt"
+    add_target "$d" p e "$d/src" "$d/arc"
+    write_conf "$d"
+    run "$d"
+    printf 'same\n' > "$d/src/input/f.txt"
+    touch -d '2001-01-01 10:00:00' "$d/src/input/f.txt"
+    : > "$(oplog "$d" p e)"
+    run "$d"
+    assert_grep "$(oplog "$d" p e)" 'event=DEPLOYED_IDENTICAL'
+    # The point of decision 5: it must never be left stuck in the pickup dir.
+    assert_eq 0 "$(count_pending "$d/src")" "removed from the source anyway"
+    assert_eq 1 "$(count_archived "$d/src")" "identical archive entry reused"
+    assert_eq 1 "$(count_files "$d/arc")" "one deployed file"
+}
+
+test_archive_versioning() {
+    title "successive contents stack in the archive, not in the deployment tree"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/input"
+    add_target "$d" p e "$d/src" "$d/arc"
+    write_conf "$d"
+    local i
+    for i in 1 2 3; do
+        printf 'content-%s\n' "$i" > "$d/src/input/f.txt"
+        touch -d "2001-01-0$i 10:00:00" "$d/src/input/f.txt"
+        run "$d"
+    done
+    assert_eq 1 "$(count_files "$d/arc")" "the deployment tree holds only the latest"
+    assert_eq "content-3" "$(cat "$d/arc/input/f.txt")" "and it is the latest"
+    assert_eq 3 "$(count_archived "$d/src")" "all three versions kept in the archive"
+    assert_file "$d/src/input/archive/f.txt" "the first keeps the base name"
+    assert_eq 0 "$(count_pending "$d/src")" "source drained"
+}
+
+test_local_archive_dir_configurable() {
+    title "LOCAL_ARCHIVE_DIR renames the archive and frees the name 'archive'"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/input/archive"
+    echo x > "$d/src/input/x.txt"
+    echo y > "$d/src/input/archive/y.txt"
+    add_target "$d" p e "$d/src" "$d/arc"
+    write_conf "$d" 'LOCAL_ARCHIVE_DIR="_bak"'
+    run "$d"
+    assert_file "$d/src/input/_bak/x.txt" "archived under the configured name"
+    # 'archive' is no longer reserved, so it is ordinary deployable content.
+    assert_file "$d/arc/input/archive/y.txt" "a dir named 'archive' is deployed again"
+    assert_eq 0 "$(count_pending "$d/src" _bak)" "everything drained"
+}
+
+test_archived_dirname_still_deployed() {
+    title "the archive-dir skip is an exact match: 'archived' is still deployed"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/input/archived"
+    echo a > "$d/src/input/archived/a.txt"
+    add_target "$d" p e "$d/src" "$d/arc"
+    write_conf "$d"
+    run "$d"
+    assert_file "$d/arc/input/archived/a.txt" "'archived' != 'archive'"
+    assert_file "$d/src/input/archived/archive/a.txt" "and it gets its own archive dir"
+}
+
+
+# ---------------------------------------------------------------------------
 # Run all
 # ---------------------------------------------------------------------------
 main() {
@@ -686,7 +1204,7 @@ main() {
     test_idempotence_and_dirskip
     test_versioning_and_revert
     test_stability
-    test_source_readonly
+    test_source_drained
     test_json_logging
     test_log_rotation
     test_exit_config
@@ -706,7 +1224,6 @@ main() {
     test_force_rediscovery
     test_antioubli
     test_dirskip_disabled
-    test_ledger_corrupt
     test_duplicate_target
     test_resilience_unreadable_file
     test_multiple_input_names
@@ -718,6 +1235,30 @@ main() {
     test_extra_dir_coexist_isolation
     test_extra_dir_idempotent_and_exclude
     test_extra_dir_malformed
+    test_copy_failed_midtree
+    test_input_name_with_space
+    test_input_name_no_globs
+    test_archive_unmounted
+    test_archive_marker_adopted
+    test_deep_scan_recovers_stale_mtime
+    test_unreadable_file_settles
+    test_prehistoric_mtime
+    test_stderr_clean_first_run
+    test_verbose_flag_wins
+    test_config_missing_value
+    test_discovery_cache_config_change
+    test_audit_rotation
+    test_target_bad_enabled
+    test_target_extra_fields
+    test_local_archive_not_rescanned
+    test_pickup_dir_unwritable
+    test_source_stuck_exit5
+    test_retry_after_deploy_failure
+    test_source_changed_during_copy
+    test_identical_redrop_moves
+    test_archive_versioning
+    test_local_archive_dir_configurable
+    test_archived_dirname_still_deployed
 
     printf '\n=========================================\n'
     printf 'Results: %d passed, %d failed\n' "$ASSERT_PASS" "$ASSERT_FAIL"

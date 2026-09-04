@@ -1,12 +1,15 @@
-# squirrel.conf — global defaults, sourced by squirrel.sh
-# Copy this file to squirrel.conf and adjust. Values here are the defaults
+# file-deploy.conf — global defaults, sourced by file-deploy.sh
+# Copy this file to file-deploy.conf and adjust. Values here are the defaults
 # applied to a target whenever its column in targets.tsv is empty or "-".
 
 # --- Defaults applied per target when the column is "-" ---
 INPUT_DIR_NAME="input"          # EXACT name(s) of the scanned directory. Several exact,
-                                # case-sensitive names allowed, separated by spaces or
-                                # commas, e.g. "input Input input_" (no globs). 'input'
-                                # alone does NOT match 'Input' — list each variant.
+                                # case-sensitive names allowed, separated by COMMAS,
+                                # e.g. "input,Input,input_". 'input' alone does NOT match
+                                # 'Input' — list each variant. Names are matched literally
+                                # (no globs: "input*" matches a directory really called
+                                # "input*", not "input_old") and MAY CONTAIN SPACES, e.g.
+                                # "Input Files,input" — which is why only commas separate.
 SCAN_INTERVAL=2                 # seconds between scan passes (small = better capture;
                                 # idle passes only stat directories, so this stays cheap)
 
@@ -16,19 +19,47 @@ SCAN_INTERVAL=2                 # seconds between scan passes (small = better ca
 # minute just restarts it if it died, and the internal flock guarantees a single
 # instance. See README "Run with cron".
 RUN_DURATION=86400              # ~24h continuous loop, then it recycles (cron restarts it)
-MIN_STABLE_AGE=0                # min file age (s) before archiving; keep 0 if files are written
-                                # atomically (rename/mv into 'input'); raise it only for in-place writes
-REQUIRE_MOUNT=true              # skip a target whose source is missing/unreadable (unmounted share)
+# SAFETY SETTING. A file is only taken out of the source once it has been
+# untouched for this long. 0 is safe ONLY if you can prove every producer
+# publishes atomically (writes elsewhere, then renames into 'input'). Windows
+# Explorer copies, SMB clients, rsync without --partial-dir, scanners and ERP
+# exports usually do NOT. Size it as the longest plausible write plus clock
+# skew; it costs latency, not throughput. The size+mtime re-check performed
+# immediately before the move is the backstop, this is the tuning knob.
+MIN_STABLE_AGE=10
+# Sentinel file at the root of every deploy_root. It is what tells a mounted
+# deployment share apart from a bare, unmounted mount point: without it, an
+# unmounted destination would be filled on the local disk, every file would then
+# be moved out of the source because of it, and on remount the tree would be
+# empty and the sources gone. The script creates the marker itself (on the first
+# run for a target, or by adopting a pre-existing tree); a missing marker on a
+# target that has deployed here before is refused with DEPLOY_UNAVAILABLE and
+# exit 4. "" disables the check -- strongly discouraged on a mounted share.
+DEPLOY_MARKER=".file-deploy-root"
+
+# Name of the archive directory created next to each file taken out of the
+# source: <pickup dir>/<name>/<file>. Matched EXACTLY (case-sensitive, no
+# globs) and pruned from every walk, so file-deploy never re-deploys its own
+# output -- which also means a directory of this name is never deployed. Rename
+# it here if that collides with a real directory in your tree. "" disables the
+# local archive entirely: moved files then exist only in the deployment tree.
+LOCAL_ARCHIVE_DIR="archive"
 HASH_CMD="sha256sum"            # content hash command
 DRY_RUN=false                   # true = simulate, copy nothing
 # TARGETS_FILE defaults to <script directory>/targets.tsv; set an absolute path to override:
-# TARGETS_FILE="/opt/squirrel/targets.tsv"
+# TARGETS_FILE="/opt/file-deploy/targets.tsv"
 
 # --- Discovery & I/O (minimise disk access) ---
 DISCOVERY_INTERVAL=1800         # seconds between full-tree rediscoveries of input dirs
 DISCOVERY_MAXDEPTH=0            # cap the discovery walk depth (0 = unlimited); set it if input dirs
                                 # sit at a bounded depth to speed up discovery, e.g. 6
 USE_DIR_MTIME_SKIP=true         # skip a directory whose mtime has not changed
+# The skip above trusts the share to bump a directory's mtime when a file is
+# added. Every DEEP_SCAN_INTERVAL seconds one pass ignores the skip and lists
+# everything, which recovers a share that does not. It is cheap: a drained
+# pickup directory is the steady state. 0 = off, and a share with unreliable
+# directory mtimes then hides new files indefinitely.
+DEEP_SCAN_INTERVAL=300          # seconds between passes that ignore the mtime skip
 # Directory-name patterns (case-insensitive globs) to ignore anywhere in the tree.
 # A matching directory is skipped and never descended into. Bash array; empty = off.
 EXCLUDE_DIR_PATTERNS=()
@@ -42,17 +73,17 @@ EXCLUDE_DIR_PATTERNS=()
 #
 #     label <TAB> source <TAB> destination <TAB> depth
 #
-#   - label        identity of the rule; its ledger and logs live under
-#                  "<label>__extra" (state/<label>__extra.ledger.tsv,
+#   - label        identity of the rule; its state and logs live under
+#                  "<label>__extra" (state/<label>__extra.*,
 #                  logs/<label>__extra/). Must be unique.
-#   - source       the exact directory to archive (a fixed path; no "input" lookup).
+#   - source       the exact directory to drain (a fixed path; no "input" lookup).
 #   - destination  where its content is mirrored: <source>/sub/f -> <destination>/sub/f.
 #   - depth        0  = only files directly in <source>;
 #                  N  = also N sub-levels deep (1 = like the input scanner);
 #                  -1 = the whole subtree (aliases: unlimited, inf, all).
 #                  Empty or "-" defaults to 1.
 #
-# The same engine applies: hash dedup, timestamped versioning, MIN_STABLE_AGE
+# The same engine applies: the MOVE (files are drained into a local archive),
 # stability, EXCLUDE_DIR_PATTERNS, DRY_RUN, per-rule logging and audit trail.
 # Bash array; empty = no extra directories. Tip: write real TABs, or use $'...\t...'.
 EXTRA_DIRS=()
@@ -72,6 +103,6 @@ LOG_CONSOLE="auto"              # mirror log lines to the terminal: auto (only w
 HEARTBEAT_INTERVAL=60           # seconds between periodic "still alive" summaries in _run.log (0 = off)
 
 # --- Paths (optional; derived from the script directory if unset) ---
-# STATE_DIR="/opt/squirrel/state"
-# LOG_DIR="/opt/squirrel/logs"
-# LOCK_FILE="/opt/squirrel/run.lock"
+# STATE_DIR="/opt/file-deploy/state"
+# LOG_DIR="/opt/file-deploy/logs"
+# LOCK_FILE="/opt/file-deploy/run.lock"

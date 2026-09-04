@@ -4,7 +4,7 @@ state/
 run.lock
 
 # Real configuration (only the *.example files are versioned)
-squirrel.conf
+file-deploy.conf
 targets.tsv
 *.local.conf
 
