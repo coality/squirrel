@@ -215,6 +215,7 @@ SETTINGS = [
     Setting("DEPLOY_MARKER", "str", ".file-deploy-root"),
     Setting("LOCAL_ARCHIVE_DIR", "str", "archive"),
     Setting("HASH_ALGO", "str", "sha256"),
+    Setting("PRESERVE_METADATA", "bool", True),
     Setting("ON_CONFLICT", "enum", "overwrite", choices=CONFLICT_POLICIES),
     # scanning
     Setting("SCAN_INTERVAL", "int", 10, minimum=1),

@@ -136,13 +136,47 @@ read.
 
 ### 3. Deploy, verified before publication
 
-Copy to a hidden temporary `.<name>.file-deploy-tmp.$$` beside the target,
-**re-hash the temporary**, then `mv` into place. Verifying before renaming
-guarantees a corrupt copy never becomes visible and never clobbers a file that
-was already correct.
+Four separate steps, reported separately, because they fail for different
+reasons and only three of them are fatal:
 
-*Failure* → `DEPLOY_FAILED`; temporary removed, whatever was deployed stays
-intact, source kept.
+| Step | Fatal? |
+|---|---|
+| `copy-data` — the bytes, to a hidden sibling temp | yes |
+| `copy-metadata` — mode and timestamps (`PRESERVE_METADATA`) | **no** |
+| `verify` — re-hash what landed | yes |
+| `publish` — rename into place | yes |
+
+Metadata is a nicety, not the payload. A CIFS/SMB share routinely refuses
+`chmod`/`utime` with `EPERM` while the data copied perfectly, and failing the
+deployment over that would mean refusing to work at all: it is reported once per
+run as `METADATA_NOT_PRESERVED` and the deployment proceeds. Verifying before
+publishing is what guarantees a corrupt copy never becomes visible and never
+clobbers a file that was already correct.
+
+*Failure* → `DEPLOY_FAILED` with `deployed="no" source_kept="yes"`; the temporary
+is removed and whatever was deployed stays intact.
+
+### All-or-nothing, and its exact limit
+
+A move spans two filesystems, so no system call can make "write to B" and
+"remove from A" indivisible. What can be chosen is *which* partial state is
+reachable — and this ordering makes it "present in both", never "present in
+neither".
+
+Within one cycle the transaction is nonetheless all-or-nothing, through a
+two-phase commit. An overwrite destroys what is already deployed, so the previous
+version is first stashed aside as a hidden sibling; if any later step fails, the
+published file is removed and the stash is renamed back. The cycle then leaves
+**both** trees exactly as it found them, and the log says so explicitly
+(`deployed="rolled-back" source_kept="yes"`). A failure never reads as an error
+while the destination quietly received the file.
+
+The one window that cannot be closed is between draining the source and dropping
+the stash: a crash there leaves a hidden stash file behind. The transaction did
+complete, and the next run sweeps it (`STALE_SWEPT`).
+
+If the stash itself cannot be restored — the only genuinely unrecoverable case —
+`ROLLBACK_FAILED` names the stash file so it can be put back by hand.
 
 ### 4. Re-check the source
 
@@ -268,10 +302,10 @@ never of the wall clock — so that every retry resolves to the same path.
 | `META_UNREADABLE` | WARN | Nonsensical size or mtime | Kept | — | 0 | Retried every cycle |
 | `SKIP_UNSTABLE` | DEBUG | Younger than `MIN_STABLE_AGE` | Kept | — | 0 | Retried |
 | `HASH_FAILED` | WARN | Unreadable file | **Kept** | — | 0 | Retried; never consumed |
-| `DEPLOY_FAILED` | ERROR | `stage=mkdir\|cp\|verify\|mv` | **Kept** | Previous version intact | 4 | Retried, temporary cleaned up |
-| `SOURCE_CHANGED_DURING_COPY` | WARN | Writer racing the copy | **Kept** | Partial snapshot | 0 | Converges on the final content |
-| `ARCHIVE_DIR_FAILED` | ERROR | Local archive cannot be created | **Kept** | Deployed | 5 | Retried |
-| `SOURCE_STUCK` | ERROR | `rename` into the archive refused | **Kept** | Deployed | 5 | Idempotent retry, no duplicate |
+| `DEPLOY_FAILED` | ERROR | `stage=mkdir\|stash-previous\|copy-data\|verify\|publish` | **Kept** | Previous version intact, rolled back if needed | 4 | Retried |
+| `SOURCE_CHANGED_DURING_COPY` | WARN | Writer racing the copy | **Kept** | **Rolled back** — no truncated version left | 0 | Converges on the final content |
+| `ARCHIVE_DIR_FAILED` | ERROR | Local archive cannot be created | **Kept** | **Rolled back** | 5 | Retried |
+| `SOURCE_STUCK` | ERROR | the source could not be drained | **Kept** | **Rolled back** — unchanged | 5 | Idempotent retry, no duplicate |
 
 > **Operational reading.** `4` means "the data was not delivered": the
 > destination is broken. `5` means "delivered, but the source is filling up":
@@ -351,6 +385,7 @@ where a column exists.
 | `REPORT_DELIMITER` | `","` | CSV field separator (`";"` for a French-locale Excel/Power BI) |
 | `DEPLOY_MARKER` | `".file-deploy-root"` | Deployment-root sentinel |
 | `HASH_ALGO` | `"sha256"` | Any algorithm `hashlib` knows |
+| `PRESERVE_METADATA` | `yes` | Carry mode and timestamps over; never fatal |
 | `DRY_RUN` | `false` | Inert rehearsal: no write, no delete |
 | `DISCOVERY_INTERVAL` | `1800` | Seconds between full rediscoveries |
 | `DISCOVERY_MAXDEPTH` | `0` | Depth cap; 0 = unlimited |

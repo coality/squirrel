@@ -273,10 +273,17 @@ class TestNoLoss(Base):
         self.assertEqual(self.tree(self.dep), [])
         self.assertEqual(self.pending(), ["input/a.txt"])
 
-    def test_stuck_source_exits_5_and_retries_without_duplicating(self):
+    def test_stuck_source_rolls_the_deployment_back(self):
+        """An undrainable source undoes the deployment: nothing half-done.
+
+        Deploying and then failing to drain would leave the file in both trees
+        and a log that says ERROR while the destination quietly received it. The
+        cycle is undone instead, so it either happened entirely or not at all.
+        """
         self.drop("input/a.txt", "a\n")
         self.write_conf()
         self.run_fd()
+        before_dep = self.tree(self.dep)
         # The pickup dir stays writable (so the guard passes) but its archive does not.
         adir = os.path.join(self.src, "input", "archive")
         self.drop("input/b.txt", "b\n")
@@ -287,14 +294,42 @@ class TestNoLoss(Base):
             os.chmod(adir, 0o755)
         self.assertEqual(r.returncode, EX_SOURCE)
         self.assertIn("SOURCE_STUCK", self.log())
-        self.assertEqual(self.pending(), ["input/b.txt"], "kept, not lost")
-        self.assertIn("input/b.txt", self.tree(self.dep), "but it IS deployed")
-        self.assertEqual(len(self.archived()), 1, "no half-written archive entry")
+        self.assertIn('deployed="rolled-back"', self.log())
+        self.assertEqual(self.tree(self.dep), before_dep,
+                         "the deployment tree is exactly as it was")
+        self.assertEqual(self.pending(), ["input/b.txt"], "the source is kept")
+        self.assertEqual(len(self.archived()), 1, "nothing archived either")
         # The retry converges, with no duplicate anywhere.
         self.run_fd()
         self.assertEqual(self.pending(), [])
         self.assertEqual(len(self.archived()), 2)
         self.assertEqual(len(self.tree(self.dep)), 2)
+
+    def test_overwrite_is_undone_if_the_source_cannot_be_drained(self):
+        """The hardest case: an overwrite that cannot be committed.
+
+        The previously deployed version is stashed before being replaced, so a
+        failure afterwards puts it back byte for byte instead of leaving the
+        destination holding a version the source still owns.
+        """
+        self.drop("input/f.txt", "v1\n")
+        self.write_conf()
+        self.run_fd()
+        with open(os.path.join(self.dep, "input", "f.txt")) as fh:
+            self.assertEqual(fh.read(), "v1\n")
+        adir = os.path.join(self.src, "input", "archive")
+        self.drop("input/f.txt", "v2\n")
+        os.chmod(adir, 0o555)
+        try:
+            r = self.run_fd()
+        finally:
+            os.chmod(adir, 0o755)
+        self.assertEqual(r.returncode, EX_SOURCE)
+        with open(os.path.join(self.dep, "input", "f.txt")) as fh:
+            self.assertEqual(fh.read(), "v1\n", "the previous version is restored")
+        self.assertEqual(self.tree(self.dep), ["input/f.txt"], "no stash left behind")
+        self.assertEqual(self.pending(), ["input/f.txt"], "and the source is kept")
+
 
 
 # ==========================================================================
@@ -350,6 +385,124 @@ class TestSourceChangedDuringCopy(unittest.TestCase):
                                                      "archive", "w.txt")))
         with open(log.path, encoding="utf-8") as fh:
             self.assertIn("SOURCE_CHANGED_DURING_COPY", fh.read())
+
+
+# ==========================================================================
+class TestRefusedOperations(unittest.TestCase):
+    """What happens when the filesystem says no, and what the log says about it.
+
+    Reached by importing the program directly: a CIFS mount refusing chmod is not
+    something a sandbox on ext4 can produce on demand.
+    """
+
+    def setUp(self):
+        self.sb = tempfile.mkdtemp(prefix="fd-perm-")
+        for d in ("src/input", "dep", "state", "logs"):
+            os.makedirs(os.path.join(self.sb, d))
+        self.src = os.path.join(self.sb, "src", "input", "f.xml")
+        with open(self.src, "w") as fh:
+            fh.write("<payload/>\n")
+
+    def tearDown(self):
+        shutil.rmtree(self.sb, ignore_errors=True)
+
+    def _runner(self):
+        import deploy, engine
+        cfg = engine.Config()
+        cfg.values.update({
+            "INSTANCE_ID": "perm",
+            "SOURCE_DIR": os.path.join(self.sb, "src"),
+            "DEPLOY_DIR": os.path.join(self.sb, "dep"),
+            "STATE_DIR": os.path.join(self.sb, "state"),
+            "LOG_DIR": os.path.join(self.sb, "logs"),
+            "MIN_STABLE_AGE": 0,
+        })
+        log = deploy.Log(cfg, "test", False)
+        runner = deploy.Runner(cfg, log, dry_run=False)
+        runner.deploy_checked = True
+        return deploy, runner, log
+
+    def _log_text(self, log):
+        with open(log.path, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_metadata_refusal_does_not_stop_the_deployment(self):
+        # A CIFS/SMB share commonly refuses chmod/utime with EPERM while the data
+        # copied perfectly. Refusing to deploy over that would be refusing to work.
+        import shutil as sh
+        deploy, runner, log = self._runner()
+        real = sh.copystat
+
+        def refuse(*a, **k):
+            raise OSError(1, "Operation not permitted")
+
+        sh.copystat = refuse
+        try:
+            unsettled = runner.process_file(self.src, os.path.dirname(self.src))
+        finally:
+            sh.copystat = real
+        text = self._log_text(log)
+        self.assertFalse(unsettled, "the file was handled")
+        self.assertTrue(os.path.exists(os.path.join(self.sb, "dep", "input", "f.xml")),
+                        "deployed despite the metadata refusal")
+        self.assertFalse(os.path.exists(self.src), "and drained")
+        self.assertIn("METADATA_NOT_PRESERVED", text)
+        self.assertIn("op=\"copystat\"", text)
+        self.assertNotIn("DEPLOY_FAILED", text)
+
+    def test_data_refusal_is_fatal_and_fully_explained(self):
+        import shutil as sh
+        deploy, runner, log = self._runner()
+        real = sh.copyfile
+
+        def refuse(*a, **k):
+            raise OSError(1, "Operation not permitted")
+
+        sh.copyfile = refuse
+        try:
+            unsettled = runner.process_file(self.src, os.path.dirname(self.src))
+        finally:
+            sh.copyfile = real
+        text = self._log_text(log)
+        self.assertTrue(unsettled)
+        self.assertTrue(runner.deploy_failed)
+        self.assertTrue(os.path.exists(self.src), "the source is kept")
+        self.assertIn('stage="copy-data"', text)
+        # The whole point: an operator must not have to reproduce it by hand.
+        for field in ("errno=", "cause=", "op=", "path_is=", "parent_is=",
+                      "fs=", "fs_opts=", "process_user="):
+            self.assertIn(field, text, "missing diagnostic field %s" % field)
+        self.assertIn("EPERM", text)
+
+    def test_cross_device_archive_names_the_boundary(self):
+        deploy, runner, log = self._runner()
+        real = os.replace
+
+        def refuse(a, b):
+            if "archive" in str(b):
+                raise OSError(18, "Invalid cross-device link")
+            return real(a, b)
+
+        os.replace = refuse
+        try:
+            runner.process_file(self.src, os.path.dirname(self.src))
+        finally:
+            os.replace = real
+        text = self._log_text(log)
+        self.assertIn("SOURCE_STUCK", text)
+        self.assertIn('stage="archive-rename"', text)
+        self.assertIn("EXDEV", text)
+        self.assertIn("different filesystems", text)
+        self.assertTrue(os.path.exists(self.src), "kept, and retried next cycle")
+
+    def test_diagnose_reports_the_mount(self):
+        import deploy
+        fields = deploy.diagnose(OSError(1, "Operation not permitted"),
+                                 "copyfile", self.src)
+        self.assertEqual(fields["errno"], "EPERM(1)")
+        self.assertIn("refused on this mount", fields["cause"])
+        self.assertIn("mode=", fields["path_is"])
+        self.assertNotEqual(fields["fs"], "")
 
 
 # ==========================================================================

@@ -68,7 +68,11 @@ EX_SOURCE = 5        # at least one file was deployed but could not leave the so
 
 LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40}
 LEAVES_CACHE_VERSION = "#v3-python"
+# Where the last Log() wrote, so the top-level guard can record a crash in the
+# same file as the rest of the run instead of only on stderr.
+_LAST_LOG = [""]
 TMP_SUFFIX = ".file-deploy-tmp"
+PREV_SUFFIX = ".file-deploy-prev"
 
 
 # ==========================================================================
@@ -92,6 +96,7 @@ class Log(object):
         self.audit_path = os.path.join(cfg.LOG_DIR, "audit.log")
         self.cycle = None
         self._sizes = {}
+        _LAST_LOG[0] = self.path
 
     def _rotate(self, path):
         keep = self.cfg.LOG_KEEP
@@ -232,6 +237,124 @@ def deepest_existing(path):
     return "/"
 
 
+# Plain-language cause for the errnos this tool actually meets. The point is to
+# turn "[Errno 1] Operation not permitted" into something an operator can act on
+# without reproducing the failure by hand.
+ERRNO_CAUSE = {
+    errno.EPERM: "the operation itself is refused on this mount, even though the "
+                 "permission bits may look fine -- CIFS/SMB commonly refuses "
+                 "chmod, utime and chown; an immutable or append-only attribute "
+                 "does the same",
+    errno.EACCES: "the permission bits deny it, on the path or on one of its parents",
+    errno.EROFS: "the filesystem is mounted read-only",
+    errno.ENOSPC: "no space left on the destination filesystem",
+    errno.EDQUOT: "the quota for this user on the destination is exhausted",
+    errno.EXDEV: "source and destination are on different filesystems, so this "
+                 "cannot be a rename",
+    errno.ENOENT: "a component of the path does not exist",
+    errno.ENOTDIR: "a component of the path is not a directory",
+    errno.EISDIR: "the target is a directory",
+    errno.EBUSY: "the file is in use",
+    errno.ETXTBSY: "the file is being executed",
+    errno.ESTALE: "a stale NFS handle: the share moved or was remounted underneath",
+    errno.ENAMETOOLONG: "the path is too long for this filesystem",
+    errno.EEXIST: "the target already exists and could not be replaced",
+    errno.EIO: "an I/O error from the underlying device or share",
+}
+
+
+def _owner(uid, gid):
+    try:
+        import pwd
+        user = pwd.getpwuid(uid).pw_name
+    except Exception:
+        user = str(uid)
+    try:
+        import grp
+        group = grp.getgrgid(gid).gr_name
+    except Exception:
+        group = str(gid)
+    return "%s:%s(%d:%d)" % (user, group, uid, gid)
+
+
+def describe_path(path):
+    """'mode=0644 owner=jerome:jerome(1001:1001)' for a path, or why not."""
+    try:
+        st = os.lstat(path)
+    except OSError as exc:
+        return "absent(%s)" % errno.errorcode.get(exc.errno, exc.errno)
+    kind = "dir" if stat.S_ISDIR(st.st_mode) else (
+        "link" if stat.S_ISLNK(st.st_mode) else "file")
+    return "%s mode=%04o owner=%s" % (kind, stat.S_IMODE(st.st_mode),
+                                      _owner(st.st_uid, st.st_gid))
+
+
+def mount_info(path):
+    """(fstype, options) of the filesystem holding `path`, from /proc/mounts.
+
+    This is what shows a share mounted read-only, or a CIFS mount whose uid/gid
+    mapping explains a refusal the permission bits alone do not.
+    """
+    try:
+        with open("/proc/mounts", "r", encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return "", ""
+    target = os.path.abspath(path)
+    best = ("", "", -1)
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        mnt = parts[1].replace("\\040", " ")
+        if target == mnt or target.startswith(mnt.rstrip("/") + "/"):
+            if len(mnt) > best[2]:
+                best = (parts[2], parts[3], len(mnt))
+    return best[0], best[1]
+
+
+def diagnose(exc, op, path, other=None):
+    """Everything known about a refused operation, as log fields.
+
+    Answers "why could this not happen here?" without a second investigation:
+    which call failed, on what, with which errno, what the path and its parent
+    actually are, what kind of filesystem it sits on, and who we are.
+    """
+    code = getattr(exc, "errno", None)
+    name = errno.errorcode.get(code, "?") if code is not None else "?"
+    fstype, opts = mount_info(path)
+    fields = {
+        "op": op,
+        "errno": "%s(%s)" % (name, code),
+        "err": str(exc),
+        "cause": ERRNO_CAUSE.get(code, "see the errno above"),
+        "path": path,
+        "path_is": describe_path(path),
+        "parent_is": describe_path(os.path.dirname(path) or "."),
+        "fs": fstype or "?",
+        "fs_opts": opts or "?",
+        "process_user": _owner(os.geteuid(), os.getegid()),
+    }
+    if other:
+        fields["other"] = other
+        ofs, oopts = mount_info(other)
+        fields["other_fs"] = ofs or "?"
+        if code == errno.EXDEV:
+            fields["hint"] = ("these two paths are on different filesystems (%s vs "
+                              "%s); a rename cannot cross that boundary"
+                              % (ofs or "?", fstype or "?"))
+    if code == errno.EPERM and "hint" not in fields:
+        fields["hint"] = ("if the destination is a CIFS/SMB mount, metadata "
+                          "preservation is the usual culprit; check the mount's "
+                          "uid/gid/file_mode options, and lsattr on the path")
+    elif code == errno.EACCES:
+        fields["hint"] = ("the process user above needs write+execute on the parent "
+                          "directory shown in parent_is")
+    elif code == errno.EROFS:
+        fields["hint"] = "remount the share read-write, or point DEPLOY_DIR elsewhere"
+    return fields
+
+
 def iso(epoch):
     try:
         return datetime.fromtimestamp(float(epoch)).astimezone().strftime(
@@ -273,6 +396,7 @@ class Runner(object):
         self.deep_scan = False
         self.force_rediscover = False
         self._report_started = set()
+        self._metadata_warned = False
 
         self.state = cfg.STATE_DIR
         self.archive_name = cfg.LOCAL_ARCHIVE_DIR
@@ -545,35 +669,113 @@ class Runner(object):
 
     # ------------------------------------------------------------ deployment
     def atomic_copy(self, src, dst, digest):
-        """Copy to a hidden sibling temp, verify it, and only then rename in.
+        """Copy to a hidden sibling temp, verify it, and only then rename it in.
 
-        Verifying before the rename is what guarantees a corrupt or short copy
-        never becomes visible at the destination and never clobbers a file that
-        was already correct. The temp is a sibling, so the rename is
-        same-filesystem and therefore atomic; it is dot-prefixed so a downstream
-        consumer globbing the tree cannot pick it up.
+        Four separate steps, reported separately, because they fail for very
+        different reasons and only two of them are fatal:
+
+          copy-data      the bytes. Fatal.
+          copy-metadata  mode and timestamps. BEST EFFORT: a CIFS/SMB share
+                         routinely refuses chmod/utime with EPERM while the data
+                         copied perfectly, and refusing to deploy over that would
+                         be refusing to work at all. Reported, never fatal.
+          verify         re-hash what landed. Fatal.
+          publish        rename into place. Fatal.
+
+        Verifying before publishing is what guarantees a corrupt or short copy
+        never becomes visible and never clobbers a file that was already correct.
+        The temp is a sibling, so the rename is same-filesystem and atomic; it is
+        dot-prefixed so a consumer globbing the tree cannot pick it up.
+
+        Returns (stage, fields) on failure, (None, None) on success.
         """
         d = os.path.dirname(dst)
         tmp = os.path.join(d, ".%s%s.%d" % (os.path.basename(dst), TMP_SUFFIX,
                                             os.getpid()))
         try:
-            shutil.copy2(src, tmp)
+            shutil.copyfile(src, tmp)
         except OSError as exc:
             self._unlink(tmp)
-            return "copy", str(exc)
+            return "copy-data", diagnose(exc, "copyfile", tmp, other=src)
+
+        # Mode and timestamps are a nicety, not the payload: the transaction is
+        # about content. A CIFS/SMB share routinely refuses them with EPERM, and
+        # failing the deployment over that would mean refusing to work at all.
+        # Reported once per run, never fatal. PRESERVE_METADATA=no skips it.
+        if self.cfg.PRESERVE_METADATA:
+            try:
+                shutil.copystat(src, tmp)
+            except OSError as exc:
+                if self.log.debug_on or not self._metadata_warned:
+                    self._metadata_warned = True
+                    self.log("WARN", "METADATA_NOT_PRESERVED",
+                             note="the content is copied and verified; only mode and "
+                                  "timestamps could not be carried over. Set "
+                                  "PRESERVE_METADATA=no to stop trying.",
+                             **diagnose(exc, "copystat", tmp, other=src))
+
         got = file_digest(tmp, self.cfg.HASH_ALGO)
         if got is None:
             self._unlink(tmp)
-            return "verify", "the copy could not be hashed back"
+            return "verify", {"err": "the copy could not be hashed back",
+                              "path": tmp}
         if got != digest:
             self._unlink(tmp)
-            return "verify", "hash mismatch: expected %s got %s" % (digest[:12], got[:12])
+            return "verify", {"err": "hash mismatch", "expected": digest[:16],
+                              "actual": got[:16], "path": tmp}
         try:
             os.replace(tmp, dst)
         except OSError as exc:
             self._unlink(tmp)
-            return "rename", str(exc)
+            return "publish", diagnose(exc, "rename", dst, other=tmp)
         return None, None
+
+    def _sweep_stale(self, directory, base):
+        """Remove leftovers of a run that was killed mid-transaction.
+
+        The only window the two-phase commit cannot close is between draining the
+        source and dropping the stashed previous version: a crash there leaves a
+        stash behind. It is harmless -- hidden, and the transaction did complete --
+        but it would otherwise accumulate one per interruption.
+        """
+        for suffix in (TMP_SUFFIX, PREV_SUFFIX):
+            prefix = ".%s%s." % (base, suffix)
+            try:
+                with os.scandir(directory) as it:
+                    for e in it:
+                        if e.name.startswith(prefix):
+                            self._unlink(e.path)
+                            if self.log.debug_on:
+                                self.log("DEBUG", "STALE_SWEPT", path=e.path)
+            except OSError:
+                pass
+
+    def _rollback(self, saved_prev, dpath, published, relpath):
+        """Put the deployment tree back exactly as it was.
+
+        Called whenever the transaction cannot be completed. It is what turns
+        "deployed but not drained" from a lasting half-state into a cycle that
+        simply did nothing, so the next attempt starts from a clean slate.
+        """
+        if not published and not saved_prev:
+            return
+        if published:
+            self._unlink(dpath)
+        if saved_prev:
+            try:
+                os.replace(saved_prev, dpath)
+            except OSError as exc:
+                # The one case we cannot undo: say so loudly rather than let it
+                # pass as an ordinary failure.
+                self.deploy_failed = True
+                self.log("ERROR", "ROLLBACK_FAILED", relpath=relpath, dst=dpath,
+                         stash=saved_prev,
+                         note="the previously deployed version is in the stash file "
+                              "named above and must be restored by hand",
+                         **diagnose(exc, "rename", dpath, other=saved_prev))
+                return
+        if self.log.debug_on:
+            self.log("DEBUG", "ROLLED_BACK", relpath=relpath, dst=dpath)
 
     @staticmethod
     def _unlink(path):
@@ -626,9 +828,9 @@ class Runner(object):
             except OSError as exc:
                 self.source_stuck = True
                 self.n_errors += 1
-                self.log("ERROR", "SOURCE_STUCK", relpath=relpath, err=str(exc),
-                         hint="the file is deployed but could not be removed; "
-                              "it will be retried")
+                self.log("ERROR", "SOURCE_STUCK", stage="source-unlink",
+                         relpath=relpath, deployed="rolled-back", source_kept="yes",
+                         **diagnose(exc, "unlink", src))
                 return None
         adir = os.path.join(pickup, self.archive_name)
         try:
@@ -636,8 +838,8 @@ class Runner(object):
         except OSError as exc:
             self.source_stuck = True
             self.n_errors += 1
-            self.log("ERROR", "ARCHIVE_DIR_FAILED", relpath=relpath, dir=adir,
-                     err=str(exc))
+            self.log("ERROR", "ARCHIVE_DIR_FAILED", relpath=relpath,
+                     **diagnose(exc, "makedirs", adir))
             return None
 
         stamp = engine.stamp_from_epoch(mtime)
@@ -659,10 +861,12 @@ class Runner(object):
         except OSError as exc:
             self.source_stuck = True
             self.n_errors += 1
-            self.log("ERROR", "SOURCE_STUCK", relpath=relpath, archive=target,
-                     err=str(exc),
-                     hint="the file is deployed but could not be moved out of the "
-                          "pickup directory; it will be retried")
+            self.log("ERROR", "SOURCE_STUCK", stage="archive-rename",
+                     relpath=relpath, archive=target, deployed="rolled-back",
+                     source_kept="yes",
+                     note="the source could not be drained, so the deployment was "
+                          "undone: neither tree changed. It will be retried.",
+                     **diagnose(exc, "rename", target, other=src))
             return None
         return target
 
@@ -693,6 +897,8 @@ class Runner(object):
 
         base = os.path.basename(src)
         dst = os.path.join(cfg.DEPLOY_DIR, relpath)
+        saved_prev = None      # the overwritten version, kept until we commit
+        published = False      # whether the new file is already visible in B
         archive_rel = (os.path.join(os.path.relpath(pickup, cfg.SOURCE_DIR),
                                     self.archive_name, base)
                        if self.archive_name else "")
@@ -718,7 +924,7 @@ class Runner(object):
             self.n_errors += 1
             self.deploy_failed = True
             self.log("ERROR", "DEPLOY_FAILED", stage="mkdir", relpath=relpath,
-                     dst_dir=os.path.dirname(dst), err=str(exc))
+                     **diagnose(exc, "makedirs", os.path.dirname(dst)))
             return True
 
         outcome, dpath, prev = self.resolve_deploy(dst, digest, mtime)
@@ -758,33 +964,70 @@ class Runner(object):
                      hint="the deployment tree was left untouched; the incoming "
                           "file is archived and drained")
         elif outcome != engine.DEPLOYED_IDENTICAL:
-            stage, err = self.atomic_copy(src, dpath, digest)
+            # Two-phase commit. An overwrite destroys what is already deployed, so
+            # move it aside first: until the whole transaction succeeds it can be
+            # put back, and the cycle then leaves BOTH trees exactly as it found
+            # them. Nothing here can produce "the log says it failed but the file
+            # went through anyway".
+            if outcome == engine.DEPLOYED_OVERWRITE:
+                ddir, dbase = os.path.dirname(dpath), os.path.basename(dpath)
+                # Dot-prefixed so a consumer globbing the tree cannot see it, and
+                # any stash left by a run that was killed is swept first.
+                self._sweep_stale(ddir, dbase)
+                saved_prev = os.path.join(ddir, ".%s%s.%d"
+                                          % (dbase, PREV_SUFFIX, os.getpid()))
+                try:
+                    os.replace(dpath, saved_prev)
+                except OSError as exc:
+                    self.n_errors += 1
+                    self.deploy_failed = True
+                    self.log("ERROR", "DEPLOY_FAILED", stage="stash-previous",
+                             relpath=relpath, dst=dpath,
+                             **diagnose(exc, "rename", dpath))
+                    return True
+            stage, detail = self.atomic_copy(src, dpath, digest)
             if stage:
+                self._rollback(saved_prev, dpath, False, relpath)
                 self.n_errors += 1
                 self.deploy_failed = True
                 self.log("ERROR", "DEPLOY_FAILED", stage=stage, relpath=relpath,
-                         dst=dpath, err=err)
+                         dst=dpath, deployed="no", source_kept="yes", **detail)
                 return True
+            published = True
             if outcome == engine.DEPLOYED_VERSION:
                 self.n_conflicts += 1
 
         # --- 4. the source must not have moved under us --------------------
         st2 = stat_or_none(src)
         if st2 is None:
+            self._rollback(saved_prev, dpath, published, relpath)
             self.log("WARN", "FILE_VANISHED", relpath=relpath, stage="post-deploy")
             return False
         if (st2.st_size, st2.st_mtime) != (size, mtime):
+            # What we just published is a snapshot of a half-written file. Undo it
+            # rather than leave a truncated version in the deployment tree.
+            self._rollback(saved_prev, dpath, published, relpath)
             self.log("WARN", "SOURCE_CHANGED_DURING_COPY", relpath=relpath,
                      before="%s/%s" % (size, mtime),
                      after="%s/%s" % (st2.st_size, st2.st_mtime),
-                     hint="the file was still being written; it was NOT moved and "
-                          "will be retried")
+                     deployed="no", source_kept="yes",
+                     hint="the file was still being written; the deployment was "
+                          "rolled back and the source left alone, to be retried")
             return True
 
         # --- 5. commit -----------------------------------------------------
         archive_path = self.archive_source(src, pickup, base, digest, mtime, relpath)
         if archive_path is None:
+            # The source could not be drained, so the whole cycle is undone: the
+            # deployment tree goes back to exactly what it was.
+            self._rollback(saved_prev, dpath, published, relpath)
             return True
+        # Past this point the transaction is committed on both sides. Dropping the
+        # stashed previous version is the only thing left, and losing that to a
+        # crash costs nothing but a stale file the next run sweeps away.
+        if saved_prev:
+            self._unlink(saved_prev)
+            saved_prev = None
         self.n_moved += 1
 
         if not self.deployed_marked:
@@ -1151,5 +1394,33 @@ def main(argv=None):
     return EX_OK
 
 
+def _guarded():
+    """Never let an unexpected exception reach cron as a bare traceback.
+
+    A stack trace on stderr becomes an unreadable mail and is lost from the log
+    that everything else is in. Record it where the rest of the run is, then
+    exit with the configuration code so the failure is still loud.
+    """
+    try:
+        return main()
+    except KeyboardInterrupt:
+        return EX_OK
+    except Exception:
+        import traceback
+        detail = traceback.format_exc()
+        sys.stderr.write(detail)
+        for path in (_LAST_LOG[0],):
+            if not path:
+                continue
+            try:
+                with open(path, "a", encoding="utf-8") as fh:
+                    fh.write("%s ERROR event=UNEXPECTED_ERROR detail=\"%s\"\n"
+                             % (datetime.now().astimezone().strftime(
+                                 "%Y-%m-%dT%H:%M:%S%z"), engine.enc(detail)))
+            except OSError:
+                pass
+        return EX_CONFIG
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_guarded())

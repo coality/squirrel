@@ -90,6 +90,14 @@ LOCAL_ARCHIVE_DIR="archive"
 # archive entries. Any algorithm hashlib knows: sha256, sha1, md5, blake2b...
 HASH_ALGO = sha256
 
+# Carry the source file's mode and timestamps over to the deployed copy.
+# It is a nicety, never part of the transaction: the content is always copied and
+# hash-verified, and a share that refuses chmod/utime (CIFS/SMB routinely does,
+# with "Operation not permitted") gets one METADATA_NOT_PRESERVED warning per run
+# and the deployment goes ahead. Set it to no on such a share to stop trying and
+# silence the warning.
+PRESERVE_METADATA = yes
+
 # ===========================================================================
 # What to do when the destination already holds a DIFFERENT file
 # ===========================================================================
