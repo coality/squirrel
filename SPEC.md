@@ -261,10 +261,20 @@ large files.
 ### CSV report
 
 When `REPORT_DIR` is set, every file that actually moved appends one row to
-`<REPORT_DIR>/file-deploy-<YYYY-MM-DD>.csv`: one file per day, all targets in
-it, header written on creation, RFC 4180 quoting on text fields. It is a
-reporting side-channel, not state: deleting it changes nothing, and nothing is
-written during a rehearsal.
+`<REPORT_DIR>/file-deploy-<YYYY-MM-DD>.csv`: one file per day, header written on
+creation, RFC 4180 quoting on text fields. It is a reporting side-channel, not
+state: deleting it changes nothing, and nothing is written during a rehearsal.
+
+**A row that cannot be written is queued, never dropped.** The report must never
+fail a deployment — but by the time a row is written the file has already been
+drained, so no later cycle could reconstruct it, and a dataset with silent holes
+is worse than one that is late. Failures are therefore spooled to
+`STATE_DIR/report-spool.jsonl` (`REPORT_SPOOLED`, WARN) and replayed on the next
+cycle that can reach the report (`REPORT_SPOOL_FLUSHED`). A queued row keeps its
+original `deployed_at`, so a late flush lands in the day it belongs to rather
+than the day it was recovered. `RUN_SUMMARY` carries `report_spooled=` and
+`report_lost=`; the latter is only ever non-zero when the local spool itself is
+unwritable (`REPORT_ROW_LOST`, ERROR).
 
 Columns: `run_id`, `deployed_at`, `project`, `env`, `outcome`, `file_name`,
 `relpath`, `source_path`, `deploy_path`, `archive_path`, `size_bytes`, `hash`,

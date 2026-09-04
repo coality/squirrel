@@ -199,6 +199,12 @@ filesystems that do not record one — CIFS/SMB usually does not, so build on
 `source_modified`. And `REPORT_DELIMITER=";"` if your Excel/Power BI locale
 expects semicolons.
 
+A row that cannot be written is **queued locally and replayed**, not dropped:
+by then the file has already been drained, so nothing else could reconstruct it.
+Watch for `REPORT_SPOOLED` (queued) and `REPORT_SPOOL_FLUSHED` (recovered), and
+alert on `REPORT_ROW_LOST` — the only case where a row is genuinely gone, which
+takes both `REPORT_DIR` and the local spool being unwritable.
+
 Nothing is written during a rehearsal, so `--dry-run` stays inert.
 
 ## Operating notes

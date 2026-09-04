@@ -922,8 +922,16 @@ class TestConfigAndCli(Base):
 class TestReport(Base):
     def csv(self):
         rd = os.path.join(self.sb, "reports")
-        files = [os.path.join(rd, f) for f in os.listdir(rd)] if os.path.isdir(rd) else []
+        files = sorted(os.path.join(rd, f) for f in os.listdir(rd)) if os.path.isdir(rd) else []
         return files[0] if files else None
+
+    def rows(self):
+        """Data rows of the current day's report, header excluded."""
+        path = self.csv()
+        if not path:
+            return []
+        with open(path, encoding="utf-8") as fh:
+            return [l for l in fh.read().splitlines()[1:] if l.strip()]
 
     def test_one_row_per_file_with_quoting(self):
         self.drop("input/a.txt", "one\n")
@@ -973,6 +981,53 @@ class TestReport(Base):
         idx_prev = list(__import__("engine").REPORT_COLUMNS).index("prev_hash")
         self.assertEqual(second[idx_prev], first[idx_hash],
                          "prev_hash chains, so a self-join rebuilds the history")
+
+    def test_unwritable_report_is_queued_then_recovered(self):
+        """A row that cannot be written is never lost.
+
+        The file has already been drained by then, so no later cycle could
+        reconstruct the row: it is spooled locally and replayed as soon as the
+        report is reachable again.
+        """
+        rd = os.path.join(self.sb, "reports")
+        self.write_conf(REPORT_DIR='"%s"' % rd)
+        self.drop("input/a.txt")
+        self.run_fd()
+        self.assertEqual(len(self.rows()), 1)
+        # Make the day's file unwritable, then deploy another file.
+        os.chmod(self.csv(), 0o444)
+        self.drop("input/b.txt")
+        r = self.run_fd()
+        os.chmod(self.csv(), 0o644)
+        self.assertEqual(r.returncode, EX_OK, "the report never fails a deployment")
+        self.assertEqual(self.pending(), [], "the file was still delivered")
+        self.assertEqual(len(self.rows()), 1, "its row could not be written")
+        self.assertIn("REPORT_SPOOLED", self.log())
+        spool = os.path.join(self.sb, "state", "compta", "report-spool.jsonl")
+        self.assertTrue(os.path.exists(spool), "queued locally")
+        # Next run, with the report reachable again: the row is replayed.
+        self.run_fd()
+        self.assertEqual(len(self.rows()), 2, "the queued row was recovered")
+        self.assertIn("REPORT_SPOOL_FLUSHED", self.log())
+        self.assertFalse(os.path.exists(spool), "and the queue is drained")
+        self.assertIn("b.txt", "".join(self.rows()))
+
+    def test_a_late_row_lands_in_its_own_day(self):
+        # A row spooled on one day and flushed later belongs to the day it was
+        # deployed, so the dataset stays chronologically honest.
+        import json
+        rd = os.path.join(self.sb, "reports")
+        self.write_conf(REPORT_DIR='"%s"' % rd)
+        os.makedirs(os.path.join(self.sb, "state", "compta"), exist_ok=True)
+        spool = os.path.join(self.sb, "state", "compta", "report-spool.jsonl")
+        with open(spool, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"deployed_at": "2026-01-15T09:00:00+0100",
+                                 "instance": "compta", "outcome": "DEPLOYED",
+                                 "file_name": "old.txt"}) + "\n")
+        self.drop("input/a.txt")
+        self.run_fd()
+        self.assertTrue(os.path.exists(os.path.join(rd, "file-deploy-2026-01-15.csv")),
+                        "the late row went to its own day")
 
     def test_rehearsal_writes_no_report(self):
         self.drop("input/a.txt")

@@ -192,6 +192,12 @@ EXCLUDE_DIR_PATTERNS =
 #
 # Nothing is written during a rehearsal: --dry-run stays inert.
 #
+# A row that cannot be written (share unmounted, disk full, file read-only) is
+# queued in STATE_DIR/report-spool.jsonl and replayed on the next cycle that can
+# reach REPORT_DIR -- it is never dropped, because by then the file has already
+# been drained and nothing else could reconstruct the row. It keeps its original
+# deployed_at, so a late flush lands in the day it belongs to.
+#
 # Columns
 #   run_id            correlates a row with the run that produced it (see logs)
 #   deployed_at       when the move completed, ISO-8601 with timezone

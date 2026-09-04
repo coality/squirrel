@@ -397,49 +397,136 @@ class Runner(object):
         self.force_rediscover = False
         self._report_started = set()
         self._metadata_warned = False
+        self._spool_warned = False
+        self._report_error = None
+        self.n_spooled = 0
+        self.n_report_lost = 0
 
         self.state = cfg.STATE_DIR
         self.archive_name = cfg.LOCAL_ARCHIVE_DIR
         self.excludes = [p.lower() for p in cfg.EXCLUDE_DIR_PATTERNS if p]
 
     # ---------------------------------------------------------------- report
-    def report(self, outcome, src_path, deploy_path, archive_path, relpath,
-               size, digest, prev_hash, mtime, btime, age, pickup_dir):
-        if not self.cfg.REPORT_DIR or self.dry:
-            return
-        day = datetime.now().strftime("%Y-%m-%d")
-        path = os.path.join(self.cfg.REPORT_DIR, "file-deploy-%s.csv" % day)
+    #
+    # The CSV is a side-channel: it must never fail a deployment. But a row that
+    # cannot be written is gone for good -- the file has already been drained, so
+    # no later cycle can reconstruct it, and a BI dataset with silent holes is
+    # worse than one that is late. Rows that cannot be written are therefore
+    # spooled in STATE_DIR (always writable: the run needs it anyway) and flushed
+    # on the next cycle that can reach the report.
+    def _spool_path(self):
+        return os.path.join(self.state, "report-spool.jsonl")
+
+    @staticmethod
+    def _row_day(row):
+        """The day the row belongs to, so a late flush lands in the right file."""
+        stamp = str(row.get("deployed_at") or "")
+        return stamp[:10] if len(stamp) >= 10 else datetime.now().strftime("%Y-%m-%d")
+
+    def _write_row(self, row):
+        """Append one row to its day's file. True on success, False otherwise."""
+        path = os.path.join(self.cfg.REPORT_DIR,
+                            "file-deploy-%s.csv" % self._row_day(row))
         delim = self.cfg.REPORT_DELIMITER
         try:
             if path not in self._report_started:
-                self._report_started.add(path)
                 os.makedirs(self.cfg.REPORT_DIR, exist_ok=True)
                 if not os.path.exists(path) or os.path.getsize(path) == 0:
                     with open(path, "a", encoding="utf-8") as fh:
                         fh.write(engine.csv_header(delim) + "\n")
-            row = {
-                "run_id": self.log.run_id,
-                "deployed_at": iso(time.time()),
-                "instance": self.cfg.INSTANCE_ID,
-                "outcome": outcome,
-                "file_name": os.path.basename(src_path),
-                "relpath": relpath,
-                "source_path": src_path,
-                "deploy_path": deploy_path or "",
-                "archive_path": archive_path or "",
-                "size_bytes": size,
-                "hash": digest,
-                "prev_hash": prev_hash or "",
-                "source_modified": iso(mtime),
-                "source_created": iso(btime) if btime else "",
-                "age_at_pickup_s": age,
-                "pickup_dir": pickup_dir,
-                "host": self.host,
-            }
+                # Only now: a header that failed must be retried, not assumed.
+                self._report_started.add(path)
             with open(path, "a", encoding="utf-8") as fh:
                 fh.write(engine.csv_row(row, delim) + "\n")
+            return True
+        except OSError as exc:
+            self._report_error = diagnose(exc, "append", path)
+            return False
+
+    def _spool(self, row):
+        try:
+            with open(self._spool_path(), "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+            self.n_spooled += 1
+            if not self._spool_warned:
+                self._spool_warned = True
+                self.log("WARN", "REPORT_SPOOLED",
+                         spool=self._spool_path(),
+                         note="the deployment succeeded; only its report row could "
+                              "not be written. It is queued and will be flushed on "
+                              "the next cycle that can reach REPORT_DIR.",
+                         **(self._report_error or {}))
+            return True
+        except OSError as exc:
+            # Both the report and its spool are unreachable: say so, once.
+            self.n_report_lost += 1
+            if not self._spool_warned:
+                self._spool_warned = True
+                self.log("ERROR", "REPORT_ROW_LOST",
+                         note="neither REPORT_DIR nor the local spool could be "
+                              "written; this row is not recoverable",
+                         **diagnose(exc, "append", self._spool_path()))
+            return False
+
+    def flush_spool(self):
+        """Replay everything queued by an earlier run. Cheap when there is none."""
+        if not self.cfg.REPORT_DIR or self.dry:
+            return
+        path = self._spool_path()
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                rows = [json.loads(l) for l in fh if l.strip()]
+        except (OSError, ValueError) as exc:
+            self.log("WARN", "REPORT_SPOOL_UNREADABLE", spool=path, err=str(exc))
+            return
+        written, pending = 0, []
+        for row in rows:
+            if self._write_row(row):
+                written += 1
+            else:
+                pending.append(row)
+        try:
+            if pending:
+                tmp = path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    for row in pending:
+                        fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+                os.replace(tmp, path)
+            else:
+                os.remove(path)
         except OSError:
             pass
+        if written:
+            self.log("INFO", "REPORT_SPOOL_FLUSHED", recovered=written,
+                     still_queued=len(pending))
+
+    def report(self, outcome, src_path, deploy_path, archive_path, relpath,
+               size, digest, prev_hash, mtime, btime, age, pickup_dir):
+        if not self.cfg.REPORT_DIR or self.dry:
+            return
+        row = {
+            "run_id": self.log.run_id,
+            "deployed_at": iso(time.time()),
+            "instance": self.cfg.INSTANCE_ID,
+            "outcome": outcome,
+            "file_name": os.path.basename(src_path),
+            "relpath": relpath,
+            "source_path": src_path,
+            "deploy_path": deploy_path or "",
+            "archive_path": archive_path or "",
+            "size_bytes": size,
+            "hash": digest,
+            "prev_hash": prev_hash or "",
+            "source_modified": iso(mtime),
+            "source_created": iso(btime) if btime else "",
+            "age_at_pickup_s": age,
+            "pickup_dir": pickup_dir,
+            "host": self.host,
+        }
+        if not self._write_row(row):
+            self._spool(row)
 
     # ------------------------------------------------------- deployment root
     def check_deploy_root(self):
@@ -1156,6 +1243,7 @@ class Runner(object):
             if self.log.debug_on:
                 self.log("DEBUG", "DEEP_SCAN", interval_s=cfg.DEEP_SCAN_INTERVAL)
 
+        self.flush_spool()
         self.load_leaves()
         self.load_inputs()
 
@@ -1381,7 +1469,8 @@ def main(argv=None):
     log("INFO", "RUN_SUMMARY", cycles=cycle, scanned=runner.n_scanned,
         deployed=runner.n_deployed, overwritten=runner.n_overwritten,
         conflicts=runner.n_conflicts, moved=runner.n_moved,
-        errors=runner.n_errors, mount=runner.mount_state or "unknown")
+        errors=runner.n_errors, report_spooled=runner.n_spooled,
+        report_lost=runner.n_report_lost, mount=runner.mount_state or "unknown")
     log("INFO", "END")
 
     # Undelivered data outranks delivered-but-not-drained.
