@@ -285,6 +285,9 @@ class Config(object):
         self.warnings = []
         self.path = None
         self.found = False
+        # Which names the file actually set, so --check can tell a value that was
+        # chosen from one that is merely the default.
+        self.seen = set()
 
     def __getattr__(self, name):
         # Settings are read as attributes: cfg.SOURCE_DIR
@@ -315,6 +318,7 @@ class Config(object):
                 if name not in BY_NAME:
                     self.errors.append("line %d: unknown setting '%s'" % (lineno, name))
                     continue
+                self.seen.add(name)
                 self._assign(name, unquote(value), lineno)
         return self
 
@@ -412,6 +416,20 @@ class Config(object):
                 "LOCAL_ARCHIVE_DIR is empty: moved files are deleted from the "
                 "source instead of being archived beside it")
         return self
+
+    def effective(self):
+        """[(name, value, from_file)] in declaration order, for --check."""
+        out = []
+        for spec in SETTINGS:
+            v = self.values[spec.name]
+            if spec.kind == "bool":
+                shown = "yes" if v else "no"
+            elif spec.kind == "list":
+                shown = ", ".join(v) if v else "(none)"
+            else:
+                shown = str(v) if str(v) != "" else "(none)"
+            out.append((spec.name, shown, spec.name in self.seen))
+        return out
 
     def input_names(self):
         return split_list(self.values["INPUT_DIR_NAME"])

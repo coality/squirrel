@@ -853,8 +853,31 @@ class TestConfigAndCli(Base):
         r = self.run_fd("--check")
         self.assertEqual(r.returncode, EX_OK)
         self.assertIn("configuration OK", r.stdout)
-        self.assertIn("instance   compta", r.stdout)
+        self.assertRegex(r.stdout, r"INSTANCE_ID\s+compta")
+        self.assertRegex(r.stdout, r"STATE_DIR\s+\S*state/compta")
         self.assertEqual(self.tree(self.dep), [], "--check scans nothing")
+
+    def test_check_names_every_setting_using_its_default(self):
+        """--check answers "is this setting missing from my file?".
+
+        A required setting missing is an error; an optional one merely takes its
+        default, which is silent by nature -- so every value is listed with where
+        it came from.
+        """
+        self.write_conf()
+        r = self.run_fd("--check")
+        self.assertEqual(r.returncode, EX_OK)
+        self.assertIn("settings come from the file", r.stdout)
+        # Set in the fixture, so not a default.
+        self.assertRegex(r.stdout, r"SOURCE_DIR\s+\S+\s*\n")
+        # Never set by the fixture, so it must be flagged.
+        self.assertIn("using defaults:", r.stdout)
+        self.assertIn("PRESERVE_METADATA", r.stdout.split("using defaults:")[1])
+        self.assertIn("ON_CONFLICT", r.stdout.split("using defaults:")[1])
+        # Every setting appears exactly once.
+        import engine as eng
+        for spec in eng.SETTINGS:
+            self.assertIn(spec.name, r.stdout)
 
     def test_check_lists_every_problem_at_once(self):
         with open(self.conf, "w", encoding="utf-8") as fh:

@@ -1331,13 +1331,21 @@ def main(argv=None):
     if args.check:
         for w in cfg.warnings:
             sys.stderr.write("warning: %s\n" % w)
+        rows = cfg.effective()
+        missing = [n for n, _v, seen in rows if not seen]
         sys.stdout.write("configuration OK: %s\n" % config_path)
-        sys.stdout.write("  instance   %s\n" % cfg.INSTANCE_ID)
-        sys.stdout.write("  source     %s\n" % cfg.SOURCE_DIR)
-        sys.stdout.write("  deploy     %s\n" % cfg.DEPLOY_DIR)
-        sys.stdout.write("  state      %s\n" % cfg.STATE_DIR)
-        sys.stdout.write("  logs       %s\n" % cfg.LOG_DIR)
-        sys.stdout.write("  lock       %s\n" % cfg.LOCK_FILE)
+        if not cfg.found:
+            sys.stdout.write("  (file not found -- every value below is a default)\n")
+        sys.stdout.write("  %d of %d settings come from the file, %d use their default\n\n"
+                         % (len(rows) - len(missing), len(rows), len(missing)))
+        # Every setting, so a value that is merely absent is as visible as a
+        # wrong one. "default" is not a problem in itself -- it is the answer to
+        # "is this setting missing from my file?".
+        for name, value, seen in rows:
+            sys.stdout.write("  %-22s %-34s %s\n"
+                             % (name, value, "" if seen else "(default)"))
+        if missing:
+            sys.stdout.write("\n  using defaults: %s\n" % ", ".join(missing))
         return EX_OK
 
     for d in (cfg.STATE_DIR, cfg.LOG_DIR):
