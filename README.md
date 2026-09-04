@@ -76,15 +76,22 @@ The three settings worth deciding before you start:
 ## Rehearse, then enable
 
 ```sh
-# 1. see what would happen, without writing or deleting anything
-./file-deploy.sh --config file-deploy.conf --once --debug   # with DRY_RUN=true
+# 1. rehearse: nothing is written, nothing is deleted
+./file-deploy.sh --config file-deploy.conf --once --dry-run --verbose
 
-# 2. read every WOULD_MOVE line: source, target, archive path
+# 2. read every WOULD_MOVE line: the relative path, the deployment verdict
+#    (DEPLOYED / DEPLOYED_OVERWRITE / DEPLOYED_IDENTICAL) and the archive path
 grep WOULD_MOVE logs/*/operations.log
 
-# 3. set DRY_RUN=false and run one pass for real
+# 3. same command without --dry-run, for real
 ./file-deploy.sh --config file-deploy.conf --once --verbose
 ```
+
+`--dry-run` is the flag form of `DRY_RUN=true`; the flag is applied after the
+config is read, so it always wins. Prefer it over editing the config: a
+rehearsal left switched on looks exactly like a healthy run that never delivers
+anything. Whenever it is active — from either source — the run logs
+`DRY_RUN_ACTIVE` at `WARN` so monitoring can catch it.
 
 Check the result: the pickup directory holds only `archive/`, the deployment
 tree mirrors it, and `state/<project>__<env>.deployed` exists.

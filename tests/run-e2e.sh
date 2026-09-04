@@ -926,6 +926,46 @@ test_stderr_clean_first_run() {
     assert_file "$d/arc/input/x.txt" "still archived"
 }
 
+test_dry_run_flag() {
+    title "--dry-run rehearses without touching the config"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/input"
+    echo x > "$d/src/input/x.txt"
+    add_target "$d" p e "$d/src" "$d/arc"
+    write_conf "$d"                      # DRY_RUN stays false in the file
+    local before; before=$(fingerprint "$d/src")
+    bash "$SCRIPT" --config "$d/conf" --dry-run >/dev/null 2>&1; local rc=$?
+    assert_exit "$rc" 0 "rehearsal exits cleanly"
+    assert_eq 0 "$(count_files "$d/arc")" "nothing deployed"
+    assert_eq "$before" "$(fingerprint "$d/src")" "source byte-identical"
+    assert_grep "$(oplog "$d" p e)" 'event=WOULD_MOVE'
+    # A rehearsal left on is indistinguishable from a run that delivers nothing.
+    assert_grep "$d/logs/_run.log" 'event=DRY_RUN_ACTIVE'
+    assert_grep "$d/logs/_run.log" 'source="--dry-run"'
+    # The flag is applied after the config, so it cannot be overridden by it.
+    run "$d"
+    assert_eq 1 "$(count_files "$d/arc")" "the same command without the flag delivers"
+}
+
+test_dry_run_then_real_deploys() {
+    title "a rehearsal does not stop the real run that follows it"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/input"
+    echo x > "$d/src/input/x.txt"
+    add_target "$d" p e "$d/src" "$d/arc"
+    write_conf "$d" 'DRY_RUN=true'
+    run "$d"
+    assert_eq 0 "$(count_files "$d/arc")" "rehearsal deployed nothing"
+    assert_nofile "$d/state/p__e.leaves.tsv" "and settled no directory"
+    assert_nofile "$d/state/p__e.deepscan" "and did not consume the deep pass"
+    # The prescribed workflow: rehearse, then flip DRY_RUN off and run for real.
+    # The rehearsal must not have recorded the pickup dir as up to date.
+    write_conf "$d"
+    run "$d"
+    assert_eq 1 "$(count_files "$d/arc")" "the real run deploys"
+    assert_eq 0 "$(count_pending "$d/src")" "and drains the source"
+}
+
 test_verbose_flag_wins() {
     title "--verbose is not overridden by LOG_CONSOLE in the config"
     local d; d=$(new_case)
@@ -1244,6 +1284,8 @@ main() {
     test_unreadable_file_settles
     test_prehistoric_mtime
     test_stderr_clean_first_run
+    test_dry_run_flag
+    test_dry_run_then_real_deploys
     test_verbose_flag_wins
     test_config_missing_value
     test_discovery_cache_config_change

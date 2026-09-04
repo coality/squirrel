@@ -301,9 +301,17 @@ where a column exists.
 | `AUDIT_LOG` | `true` | Per-target provenance trail |
 | `HEARTBEAT_INTERVAL` | `60` | Periodic summary; 0 = off |
 
-Command-line options: `--config FILE`, `--rediscover`, `--debug`, `--once`,
-`--verbose`, `--help`. `--debug`, `--once` and `--verbose` are applied *after*
-the configuration is sourced, so a flag cannot be overridden by the file.
+Command-line options: `--config FILE`, `--dry-run` (`-n`), `--once`,
+`--debug`, `--verbose` (`-v`), `--rediscover`, `--help`. `--dry-run`, `--once`,
+`--debug` and `--verbose` are applied *after* the configuration is sourced, so a
+flag cannot be overridden by the file.
+
+A rehearsal is inert in both directions: it writes nothing to the source or the
+deployment tree, and it records nothing that would change a later run — no
+settled-mtime cache, no deep-pass timestamp. Whenever it is active, from the
+flag or from the config, the run logs `DRY_RUN_ACTIVE` at `WARN`, because a
+rehearsal left switched on is indistinguishable from a healthy run that never
+delivers anything.
 
 ---
 

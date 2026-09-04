@@ -28,7 +28,7 @@
 # (LOG_CONSOLE=auto). `--debug` turns on maximum verbosity, `--once` does a single
 # pass and exits. MOUNT_MISSING logs the exact reason and the deepest existing
 # ancestor so an unmounted share or a wrong path is obvious immediately.
-# Run with DRY_RUN=true first on a real share: it logs every WOULD_MOVE without
+# Run with --dry-run first on a real share: it logs every WOULD_MOVE without
 # writing or deleting anything.
 #
 # Portability: POSIX-ish bash (>=4) plus GNU coreutils / findutils / util-linux,
@@ -110,6 +110,7 @@ FORCE_REDISCOVER=0     # set per-cycle when a manual rediscovery is requested
 FORCE_MARKER=""        # marker file path, set in main once STATE_DIR is known
 FORCE_DEBUG=0          # --debug: max verbosity + console
 FORCE_CONSOLE=""       # --verbose: applied AFTER the config file so the flag wins
+FORCE_DRY=0            # --dry-run: rehearse without editing the config file
 ONCE=0                 # --once: single pass then exit
 CONSOLE_ON=0           # whether log lines are mirrored to the terminal
 CONFIG_STATUS="none"   # none | loaded | missing
@@ -966,6 +967,11 @@ process_file() {
             deploy="$would" archive="$(enc "${la:+${la#"$src_root"/}/$base}")" \
             hash="${h:0:8}…" dry="1"
         (( CYC_DEPLOYED++ ))
+        # The file has NOT been handled, so the directory still has work to do.
+        # Without this the rehearsal would settle the directory, and the real
+        # run right after would skip it on an unchanged mtime -- silently
+        # deploying nothing, which is exactly the workflow the docs prescribe.
+        DIR_UNSETTLED=1
         return 0
     fi
 
@@ -1202,7 +1208,7 @@ scan_target() {
         (( nowd - dmt >= DEEP_SCAN_INTERVAL )) && DEEP_SCAN=1
     fi
     if (( DEEP_SCAN )); then
-        : > "$deep_marker" 2>/dev/null
+        [[ $DRY_RUN == true ]] || : > "$deep_marker" 2>/dev/null
         (( DEBUG_ON )) && log_tgt DEBUG DEEP_SCAN interval_s="$DEEP_SCAN_INTERVAL"
     fi
 
@@ -1248,7 +1254,8 @@ scan_target() {
     # Persist settled mtimes for the leaves seen this cycle (only when something
     # changed; this also drops leaves that disappeared).
     local tmp="$leaves_cache.tmp.$$" lf
-    if (( cache_dirty )) && printf '%s\n' "$LEAVES_CACHE_VERSION" > "$tmp" 2>/dev/null; then
+    if (( cache_dirty )) && [[ $DRY_RUN != true ]] &&
+       printf '%s\n' "$LEAVES_CACHE_VERSION" > "$tmp" 2>/dev/null; then
         for lf in "${!seen[@]}"; do
             [[ -n ${DIRLAST["$lf"]:-} ]] || continue
             enc_r "$lf"; printf '%s\t%s\n' "$REPLY" "${DIRLAST["$lf"]}" >> "$tmp"
@@ -1277,13 +1284,14 @@ scan_target() {
 # ---------------------------------------------------------------------------
 usage() {
     cat <<'EOF'
-Usage: file-deploy.sh [--config FILE] [--rediscover] [--debug] [--once] [--verbose] [--help]
+Usage: file-deploy.sh [--config FILE] [--dry-run] [--once] [--debug] [--verbose]
+                      [--rediscover] [--help]
 
 Moves files from "input" directories on a mounted NAS share into a mirror
 deployment tree, keeping a local archive copy behind in the source. Targets are
 described in targets.tsv. See README.md for details.
 
-WARNING: this tool DELETES from the source. Rehearse with DRY_RUN=true first.
+WARNING: this tool DELETES from the source. Rehearse with --dry-run first.
 
   --config FILE  Use this configuration file (default: <script dir>/file-deploy.conf).
   --rediscover   Request an immediate rediscovery of the input directories:
@@ -1293,6 +1301,10 @@ WARNING: this tool DELETES from the source. Rehearse with DRY_RUN=true first.
                  terminal. Great for finding why nothing is being deployed.
   --once         Do a single scan pass and exit (RUN_DURATION=0), instead of the
                  continuous loop. Combine with --debug to diagnose quickly.
+  --dry-run, -n  Rehearse: log a WOULD_MOVE line per file with the deployment
+                 verdict and the archive path, without writing or deleting
+                 anything. Same as DRY_RUN=true, but without editing the config
+                 (and without the risk of leaving it on afterwards).
   --verbose      Mirror log lines to the terminal (without changing the level).
   --help         Show this help.
 EOF
@@ -1310,6 +1322,7 @@ parse_args() {
             --rediscover) ACTION="rediscover"; shift ;;
             --debug) FORCE_DEBUG=1; shift ;;
             --once) ONCE=1; shift ;;
+            --dry-run|-n) FORCE_DRY=1; shift ;;
             --verbose|-v) FORCE_CONSOLE="always"; shift ;;
             -h|--help) usage; exit $EX_OK ;;
             *) printf 'Unknown argument: %s\n' "$1" >&2; usage >&2; exit $EX_CONFIG ;;
@@ -1337,6 +1350,7 @@ load_config() {
     # let a config file silently override the flag.
     if (( FORCE_DEBUG )); then LOG_LEVEL="DEBUG"; LOG_CONSOLE="always"; fi
     if (( ONCE )); then RUN_DURATION=0; fi
+    if (( FORCE_DRY )); then DRY_RUN=true; fi
     [[ -n $FORCE_CONSOLE ]] && LOG_CONSOLE=$FORCE_CONSOLE
     LOG_LEVEL_NUM=${LVLNUM[$LOG_LEVEL]:-20}
     (( LOG_LEVEL_NUM <= 10 )) && DEBUG_ON=1 || DEBUG_ON=0
@@ -1396,6 +1410,11 @@ main() {
         log_format="$LOG_FORMAT" log_level="$LOG_LEVEL" console="$LOG_CONSOLE"
     [[ $CONFIG_STATUS == missing ]] && log_run WARN CONFIG_NOT_FOUND config="$(enc "$CONFIG_FILE")" \
         hint="config file not found; running with built-in defaults"
+    # A rehearsal left switched on looks exactly like a healthy run that never
+    # delivers anything, so say it loudly enough to show up in monitoring.
+    [[ $DRY_RUN == true ]] && log_run WARN DRY_RUN_ACTIVE \
+        source="$( (( FORCE_DRY )) && printf -- '--dry-run' || printf 'config' )" \
+        hint="nothing will be written or deleted; unset DRY_RUN to deliver"
 
     if ! load_targets; then
         exit $EX_CONFIG
