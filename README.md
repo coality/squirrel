@@ -72,6 +72,7 @@ The three settings worth deciding before you start:
 | `MIN_STABLE_AGE` | **Safety.** A file is only taken once untouched for this long. `0` is safe only if every producer writes elsewhere and renames into place — most NAS producers do not. See [SPEC.md §8.3](SPEC.md#83-stability-and-in-place-writes). |
 | `LOCAL_ARCHIVE_DIR` | Name of the archive created beside each drained file (default `archive`). It is matched exactly and pruned from every walk, so a directory of that name is never deployed. Rename it if that collides with a real directory in your tree. |
 | `DEPLOY_MARKER` | Sentinel guarding each `deploy_root`. Leave it on: it is what stops an unmounted destination from draining your source into nothing. |
+| `ON_CONFLICT` | What to do when the destination already holds the same path with **different** content: `overwrite` (default, source wins), `version` (keep both), `skip` (destination wins, source still drained), `fail` (keep the source, exit 4). Identical content is never a conflict. Fully documented in [`file-deploy.conf.example`](file-deploy.conf.example). |
 
 ## Rehearse, then enable
 
@@ -133,6 +134,7 @@ and mirrors it to the terminal. The likely answers, in order:
 | `SOURCE_NOT_WRITABLE` | A pickup directory lacks `w+x`. file-deploy refuses to deploy out of a directory it cannot then drain. |
 | `SKIP_UNSTABLE` | The file is younger than `MIN_STABLE_AGE`. |
 | `SKIP_DIR_UNCHANGED` | The directory mtime has not moved. A deep pass (`DEEP_SCAN_INTERVAL`) recovers a share that fails to update it. |
+| `DEPLOY_SKIPPED` / `DEPLOY_CONFLICT` | The destination holds different content and `ON_CONFLICT` is `skip` or `fail`. |
 
 **Alert on** `DEPLOY_UNAVAILABLE`, `DEPLOY_FAILED`, `SOURCE_STUCK`,
 `SOURCE_NOT_WRITABLE` and `MOUNT_MISSING`, and on `errors=` in `RUN_SUMMARY`.

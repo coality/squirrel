@@ -80,6 +80,14 @@ DEEP_SCAN_INTERVAL=300
 # is never deployed. "" disables the local archive entirely -- which means
 # moved files exist only in the deployment tree.
 LOCAL_ARCHIVE_DIR="archive"
+# What to do when the deployment tree already holds this file with DIFFERENT
+# content. Identical content is never a conflict: nothing is rewritten and the
+# source file is drained either way. See file-deploy.conf.example.
+#   overwrite  replace it; the previous version survives in the local archive
+#   version    deploy alongside as <name>_<stamp><ext>, keep the deployed one
+#   skip       leave the deployment tree alone; still archive and drain the source
+#   fail       refuse: keep the source file, log an error, exit 4
+ON_CONFLICT="overwrite"
 # Sentinel file expected at the root of every deploy_root. It is what tells an
 # unmounted deployment share apart from an empty one; see check_deploy_root.
 # "" disables the check (not recommended on a mounted share).
@@ -721,7 +729,7 @@ write_inputs_cache() {  # cache header
 ANY_TARGET_OK=0
 ANY_DEPLOY_FAILED=0   # something could not be written to the deployment tree -> exit 4
 ANY_SOURCE_STUCK=0    # something was deployed but could not leave the source -> exit 5
-declare -A RUN_DEPLOYED=() RUN_OVERWRITTEN=() RUN_MOVED=() RUN_ERRORS=() RUN_SCANNED=()
+declare -A RUN_DEPLOYED=() RUN_OVERWRITTEN=() RUN_CONFLICTS=() RUN_MOVED=() RUN_ERRORS=() RUN_SCANNED=()
 
 # _file_error <errkey> <event> [k=v ...]
 # Report a per-file error that may well be permanent (unreadable file, bogus
@@ -786,36 +794,82 @@ atomic_copy() {
 cleanup_inflight() { [[ -n $INFLIGHT_TMP ]] && rm -f -- "$INFLIGHT_TMP" 2>/dev/null; }
 trap cleanup_inflight EXIT INT TERM
 
-# deploy_file <src> <dst> <hash> <encrel>
-# Put the file in the deployment tree. Sets DEPLOY_ACTION to DEPLOYED,
-# DEPLOYED_OVERWRITE (with DEPLOY_OLD_HASH) or DEPLOYED_IDENTICAL. The
-# deployment tree holds the CURRENT state, so changed content overwrites in
-# place -- history lives in the local archive, not here. Returns 1 (and logs)
-# on failure, always leaving whatever was already deployed untouched.
+# conflict_verdict <dst> <hash> <mtime>
+# Decide what a file would do against the current deployment tree, WITHOUT
+# writing anything: sets VERDICT, VERDICT_DST and VERDICT_OLD_HASH. Shared by
+# deploy_file and the dry run, so a rehearsal reports exactly what would happen.
+#   nothing there            -> DEPLOYED
+#   identical content        -> DEPLOYED_IDENTICAL (never a conflict)
+#   different content        -> per $ON_CONFLICT
+VERDICT=""
+VERDICT_DST=""
+VERDICT_OLD_HASH=""
+conflict_verdict() {
+    local dst=$1 h=$2 mtime=$3 old
+    VERDICT=DEPLOYED; VERDICT_DST=$dst; VERDICT_OLD_HASH=""
+    [[ -f $dst ]] || return 0
+    old=$(hash_file "$dst" 2>/dev/null) || old=""
+    if [[ -n $old && $old == "$h" ]]; then VERDICT=DEPLOYED_IDENTICAL; return 0; fi
+    VERDICT_OLD_HASH=$old
+    case $ON_CONFLICT in
+        overwrite) VERDICT=DEPLOYED_OVERWRITE ;;
+        skip)      VERDICT=DEPLOY_SKIPPED ;;
+        fail)      VERDICT=DEPLOY_CONFLICT ;;
+        version)
+            pick_free_path "${dst%/*}" "${dst##*/}" "$(stamp_from_epoch "$mtime")" "$h"
+            VERDICT_DST=$PICKED
+            (( PICKED_EXISTS )) && VERDICT=DEPLOYED_IDENTICAL || VERDICT=DEPLOYED_VERSION ;;
+    esac
+    return 0
+}
+
+# deploy_file <src> <dst> <hash> <mtime> <encrel>
+# Put the file in the deployment tree according to $ON_CONFLICT. Sets
+# DEPLOY_ACTION and, on a real write, DEPLOY_DST. Returns 1 (and logs) on
+# failure, always leaving whatever was already deployed untouched.
 DEPLOY_ACTION=""
 DEPLOY_OLD_HASH=""
+DEPLOY_DST=""
 deploy_file() {
-    local src=$1 dst=$2 h=$3 encrel=$4 err old dst_dir=${2%/*}
-    DEPLOY_ACTION=DEPLOYED; DEPLOY_OLD_HASH=""
+    local src=$1 dst=$2 h=$3 mtime=$4 encrel=$5 err dst_dir=${2%/*}
+    DEPLOY_ACTION=DEPLOYED; DEPLOY_OLD_HASH=""; DEPLOY_DST=$dst
     if ! err=$(mkdir -p -- "$dst_dir" 2>&1); then
         log_tgt ERROR DEPLOY_FAILED stage="mkdir" relpath="$encrel" \
             dst_dir="$(enc "$dst_dir")" err="$(enc "$err")"
         (( CYC_ERRORS++ )); ANY_DEPLOY_FAILED=1
         return 1
     fi
-    if [[ -f $dst ]]; then
-        old=$(hash_file "$dst" 2>/dev/null) || old=""
-        if [[ -n $old && $old == "$h" ]]; then
-            # Already deployed byte for byte. Nothing to write -- but the source
-            # file must still be archived and removed, so this is NOT a skip.
-            DEPLOY_ACTION=DEPLOYED_IDENTICAL
-            return 0
-        fi
-        DEPLOY_ACTION=DEPLOYED_OVERWRITE; DEPLOY_OLD_HASH=$old
-    fi
-    if ! atomic_copy "$src" "$dst" "$h"; then
+    conflict_verdict "$dst" "$h" "$mtime"
+    DEPLOY_ACTION=$VERDICT; DEPLOY_OLD_HASH=$VERDICT_OLD_HASH; DEPLOY_DST=$VERDICT_DST
+
+    case $DEPLOY_ACTION in
+        DEPLOYED_IDENTICAL)
+            # Already there byte for byte. Nothing to write -- but the source
+            # file is still archived and drained, so this is NOT a skip.
+            return 0 ;;
+        DEPLOY_SKIPPED)
+            # The deployment tree is authoritative: leave it alone. The source
+            # file is still archived, so its content is not lost, and it is
+            # drained so it cannot pile up in the pickup directory.
+            (( CYC_CONFLICTS++ ))
+            log_tgt WARN DEPLOY_SKIPPED relpath="$encrel" dst="$(enc "$dst")" \
+                deployed_hash="${DEPLOY_OLD_HASH:0:8}…" incoming_hash="${h:0:8}…" \
+                on_conflict="$ON_CONFLICT" \
+                hint="the deployment tree was left untouched; the incoming file is archived and drained"
+            return 0 ;;
+        DEPLOY_CONFLICT)
+            (( CYC_CONFLICTS++ )); (( CYC_ERRORS++ )); ANY_DEPLOY_FAILED=1
+            log_tgt ERROR DEPLOY_CONFLICT relpath="$encrel" dst="$(enc "$dst")" \
+                deployed_hash="${DEPLOY_OLD_HASH:0:8}…" incoming_hash="${h:0:8}…" \
+                on_conflict="$ON_CONFLICT" \
+                hint="the source file was kept; resolve the collision or change ON_CONFLICT"
+            return 1 ;;
+        DEPLOYED_VERSION) (( CYC_CONFLICTS++ )) ;;
+    esac
+
+    if ! atomic_copy "$src" "$DEPLOY_DST" "$h"; then
         log_tgt ERROR DEPLOY_FAILED stage="$COPY_STAGE" relpath="$encrel" \
-            dst="$(enc "$dst")" err="$(enc "$COPY_ERR")"
+            dst="$(enc "$DEPLOY_DST")" err="$(enc "$COPY_ERR")"
         (( CYC_ERRORS++ )); ANY_DEPLOY_FAILED=1
         return 1
     fi
@@ -851,24 +905,15 @@ deploy_file() {
 ARC_PATH=""
 archive_source() {
     local src=$1 la=$2 base=$3 h=$4 mtime=$5 encrel=$6
-    local err existing stamp stem ext cand
+    local err cand
     ARC_PATH=""
     if ! err=$(mkdir -p -- "$la" 2>&1); then
         log_tgt ERROR ARCHIVE_DIR_FAILED relpath="$encrel" dir="$(enc "$la")" err="$(enc "$err")"
         (( CYC_ERRORS++ )); ANY_SOURCE_STUCK=1
         return 1
     fi
-    if [[ $base == ?*.* ]]; then stem=${base%.*}; ext=".${base##*.}"
-    else stem=$base; ext=""; fi
-    stamp=$(stamp_from_epoch "$mtime")
-
-    cand="$la/$base"
-    if [[ -e $cand ]] && ! same_content "$cand" "$h"; then
-        cand="$la/${stem}_${stamp}${ext}"
-        if [[ -e $cand ]] && ! same_content "$cand" "$h"; then
-            cand="$la/${stem}_${stamp}_${h:0:8}${ext}"
-        fi
-    fi
+    pick_free_path "$la" "$base" "$(stamp_from_epoch "$mtime")" "$h"
+    cand=$PICKED
 
     if ! err=$(mv -f -- "$src" "$cand" 2>&1); then
         log_tgt ERROR SOURCE_STUCK relpath="$encrel" archive="$(enc "$cand")" err="$(enc "$err")" \
@@ -877,6 +922,28 @@ archive_source() {
         return 1
     fi
     ARC_PATH=$cand
+    return 0
+}
+
+# pick_free_path <dir> <base> <stamp> <hash>
+# Resolve <dir>/<base> to a path that is either free or already holds exactly
+# this content, so the answer is a pure function of (base, stamp, hash) and every
+# retry lands on the same place. Sets PICKED, and PICKED_EXISTS=1 when the chosen
+# path already holds the content (nothing left to write).
+PICKED=""
+PICKED_EXISTS=0
+pick_free_path() {
+    local dir=$1 base=$2 stamp=$3 h=$4 stem ext cand
+    PICKED=""; PICKED_EXISTS=0
+    if [[ $base == ?*.* ]]; then stem=${base%.*}; ext=".${base##*.}"
+    else stem=$base; ext=""; fi
+    for cand in "$dir/$base" "$dir/${stem}_${stamp}${ext}" "$dir/${stem}_${stamp}_${h:0:8}${ext}"; do
+        if [[ ! -e $cand ]]; then PICKED=$cand; return 0; fi
+        if same_content "$cand" "$h"; then PICKED=$cand; PICKED_EXISTS=1; return 0; fi
+    done
+    # All three are taken by other content: fall back to the most specific one,
+    # which by construction can only collide with identical content.
+    PICKED="$dir/${stem}_${stamp}_${h:0:8}${ext}"
     return 0
 }
 
@@ -959,12 +1026,11 @@ process_file() {
     dst="$dep_root/$relpath"
 
     if [[ $DRY_RUN == true ]]; then
-        local would=DEPLOYED
-        if [[ -f $dst ]]; then
-            if same_content "$dst" "$h"; then would=DEPLOYED_IDENTICAL; else would=DEPLOYED_OVERWRITE; fi
-        fi
+        conflict_verdict "$dst" "$h" "$mtime"
+        local wdep=""; [[ $VERDICT_DST != "$dst" ]] && wdep=$(enc "${VERDICT_DST#"$dep_root"/}")
         log_tgt INFO WOULD_MOVE relpath="$encrel" size="$size" \
-            deploy="$would" archive="$(enc "${la:+${la#"$src_root"/}/$base}")" \
+            deploy="$VERDICT" deployed="$wdep" on_conflict="$ON_CONFLICT" \
+            archive="$(enc "${la:+${la#"$src_root"/}/$base}")" \
             hash="${h:0:8}…" dry="1"
         (( CYC_DEPLOYED++ ))
         # The file has NOT been handled, so the directory still has work to do.
@@ -976,7 +1042,7 @@ process_file() {
     fi
 
     # 2. Deploy first: the source is still there to retry from if this fails.
-    deploy_file "$src" "$dst" "$h" "$encrel" || { DIR_UNSETTLED=1; return 0; }
+    deploy_file "$src" "$dst" "$h" "$mtime" "$encrel" || { DIR_UNSETTLED=1; return 0; }
 
     # 3. The source must not have moved under us while we were copying. If it
     #    did, what we just deployed is a snapshot of a half-written file: leave
@@ -1015,17 +1081,30 @@ process_file() {
     fi
 
     local encarc=""; [[ -n $ARC_PATH ]] && encarc=$(enc "${ARC_PATH#"$src_root"/}")
-    if [[ $DEPLOY_ACTION == DEPLOYED_OVERWRITE ]]; then
-        audit_write "$DEPLOY_ACTION" "$encrel" "$encarc" "$h" "$size" "$DEPLOY_OLD_HASH"
-        log_tgt INFO DEPLOYED_OVERWRITE relpath="$encrel" size="$size" \
-            new_hash="${h:0:8}…" old_hash="${DEPLOY_OLD_HASH:0:8}…" archive="$encarc"
-        (( CYC_OVERWRITTEN++ ))
-    else
-        audit_write "$DEPLOY_ACTION" "$encrel" "$encarc" "$h" "$size"
-        log_tgt INFO "$DEPLOY_ACTION" relpath="$encrel" size="$size" \
-            hash="${h:0:8}…" archive="$encarc"
-        (( CYC_DEPLOYED++ ))
-    fi
+    # Only name the deployed path when the policy made it differ from the mirror.
+    local encdep=""; [[ $DEPLOY_DST != "$dst" ]] && encdep=$(enc "${DEPLOY_DST#"$dep_root"/}")
+    case $DEPLOY_ACTION in
+        DEPLOYED_OVERWRITE)
+            audit_write "$DEPLOY_ACTION" "$encrel" "$encarc" "$h" "$size" "$DEPLOY_OLD_HASH"
+            log_tgt INFO DEPLOYED_OVERWRITE relpath="$encrel" size="$size" \
+                new_hash="${h:0:8}…" old_hash="${DEPLOY_OLD_HASH:0:8}…" archive="$encarc"
+            (( CYC_OVERWRITTEN++ )) ;;
+        DEPLOYED_VERSION)
+            audit_write "$DEPLOY_ACTION" "$encrel" "$encarc" "$h" "$size" "$DEPLOY_OLD_HASH"
+            log_tgt INFO DEPLOYED_VERSION relpath="$encrel" size="$size" \
+                hash="${h:0:8}…" deployed="$encdep" kept_hash="${DEPLOY_OLD_HASH:0:8}…" \
+                archive="$encarc"
+            (( CYC_DEPLOYED++ )) ;;
+        DEPLOY_SKIPPED)
+            # deploy_file already reported the collision at WARN; record that the
+            # source was still drained.
+            audit_write "$DEPLOY_ACTION" "$encrel" "$encarc" "$h" "$size" "$DEPLOY_OLD_HASH" ;;
+        *)
+            audit_write "$DEPLOY_ACTION" "$encrel" "$encarc" "$h" "$size"
+            log_tgt INFO "$DEPLOY_ACTION" relpath="$encrel" size="$size" \
+                hash="${h:0:8}…" archive="$encarc"
+            (( CYC_DEPLOYED++ )) ;;
+    esac
     (( CYC_BYTES += size ))
 }
 
@@ -1145,7 +1224,7 @@ check_deploy_root() {
 # ---------------------------------------------------------------------------
 # scan_target <idx>: one cycle over a single target.
 # ---------------------------------------------------------------------------
-CYC_SCANNED=0 CYC_DEPLOYED=0 CYC_OVERWRITTEN=0 CYC_MOVED=0 CYC_ERRORS=0 CYC_BYTES=0
+CYC_SCANNED=0 CYC_DEPLOYED=0 CYC_OVERWRITTEN=0 CYC_CONFLICTS=0 CYC_MOVED=0 CYC_ERRORS=0 CYC_BYTES=0
 scan_target() {
     local idx=$1
     CUR_PROJECT=${T_PROJECT[$idx]}
@@ -1218,7 +1297,7 @@ scan_target() {
         discover_or_load_dirs "$key" "$src" "$idn" "$inputs_cache" "$leaves_cache"
     fi
 
-    CYC_SCANNED=0 CYC_DEPLOYED=0 CYC_OVERWRITTEN=0 CYC_MOVED=0 CYC_ERRORS=0 CYC_BYTES=0
+    CYC_SCANNED=0 CYC_DEPLOYED=0 CYC_OVERWRITTEN=0 CYC_CONFLICTS=0 CYC_MOVED=0 CYC_ERRORS=0 CYC_BYTES=0
     local -A seen=()
     local input mt leaf dir_reads=0 scan_dirs=0 rescanned=0 cache_dirty=0
     local t_start; t_start=$(date +%s%N 2>/dev/null)
@@ -1265,6 +1344,7 @@ scan_target() {
 
     RUN_DEPLOYED[$key]=$(( ${RUN_DEPLOYED[$key]:-0} + CYC_DEPLOYED ))
     RUN_OVERWRITTEN[$key]=$(( ${RUN_OVERWRITTEN[$key]:-0} + CYC_OVERWRITTEN ))
+    RUN_CONFLICTS[$key]=$(( ${RUN_CONFLICTS[$key]:-0} + CYC_CONFLICTS ))
     RUN_MOVED[$key]=$(( ${RUN_MOVED[$key]:-0} + CYC_MOVED ))
     RUN_ERRORS[$key]=$(( ${RUN_ERRORS[$key]:-0} + CYC_ERRORS ))
     RUN_SCANNED[$key]=$(( ${RUN_SCANNED[$key]:-0} + CYC_SCANNED ))
@@ -1275,7 +1355,7 @@ scan_target() {
     [[ $t_start =~ ^[0-9]+$ && $t_end =~ ^[0-9]+$ ]] && dur_ms=$(( (t_end - t_start) / 1000000 ))
     log_tgt DEBUG CYCLE_SUMMARY dir_reads="$dir_reads" scan_dirs="$scan_dirs" rescanned="$rescanned" \
         scanned="$CYC_SCANNED" deployed="$CYC_DEPLOYED" overwritten="$CYC_OVERWRITTEN" \
-        moved="$CYC_MOVED" errors="$CYC_ERRORS" \
+        conflicts="$CYC_CONFLICTS" moved="$CYC_MOVED" errors="$CYC_ERRORS" \
         bytes_deployed="$CYC_BYTES" dur_ms="$dur_ms"
 }
 
@@ -1351,6 +1431,12 @@ load_config() {
     if (( FORCE_DEBUG )); then LOG_LEVEL="DEBUG"; LOG_CONSOLE="always"; fi
     if (( ONCE )); then RUN_DURATION=0; fi
     if (( FORCE_DRY )); then DRY_RUN=true; fi
+    case ${ON_CONFLICT,,} in
+        overwrite|version|skip|fail) ON_CONFLICT=${ON_CONFLICT,,} ;;
+        *) printf 'Invalid ON_CONFLICT: %s (expected overwrite, version, skip or fail)\n' \
+               "$ON_CONFLICT" >&2
+           exit $EX_CONFIG ;;
+    esac
     [[ -n $FORCE_CONSOLE ]] && LOG_CONSOLE=$FORCE_CONSOLE
     LOG_LEVEL_NUM=${LVLNUM[$LOG_LEVEL]:-20}
     (( LOG_LEVEL_NUM <= 10 )) && DEBUG_ON=1 || DEBUG_ON=0
@@ -1405,7 +1491,7 @@ main() {
         discovery_interval="$DISCOVERY_INTERVAL" discovery_maxdepth="$DISCOVERY_MAXDEPTH" \
         use_dir_mtime_skip="$USE_DIR_MTIME_SKIP" deep_scan_interval="$DEEP_SCAN_INTERVAL" \
         deploy_marker="$(enc "$DEPLOY_MARKER")" local_archive_dir="$(enc "$LOCAL_ARCHIVE_DIR")" \
-        hash_cmd="$HASH_CMD" dry_run="$DRY_RUN" \
+        hash_cmd="$HASH_CMD" dry_run="$DRY_RUN" on_conflict="$ON_CONFLICT" \
         exclude_patterns="$(enc "${EXCLUDE_DIR_PATTERNS[*]:-}")" extra_dirs="${#EXTRA_DIRS[@]}" \
         log_format="$LOG_FORMAT" log_level="$LOG_LEVEL" console="$LOG_CONSOLE"
     [[ $CONFIG_STATUS == missing ]] && log_run WARN CONFIG_NOT_FOUND config="$(enc "$CONFIG_FILE")" \
@@ -1488,10 +1574,11 @@ main() {
     done
 
     # Aggregated run summary (orchestration log).
-    local tot_deployed=0 tot_overwritten=0 tot_moved=0 tot_errors=0 k
+    local tot_deployed=0 tot_overwritten=0 tot_conflicts=0 tot_moved=0 tot_errors=0 k
     for k in "${T_KEY[@]}"; do
         tot_deployed=$(( tot_deployed + ${RUN_DEPLOYED[$k]:-0} ))
         tot_overwritten=$(( tot_overwritten + ${RUN_OVERWRITTEN[$k]:-0} ))
+        tot_conflicts=$(( tot_conflicts + ${RUN_CONFLICTS[$k]:-0} ))
         tot_moved=$(( tot_moved + ${RUN_MOVED[$k]:-0} ))
         tot_errors=$(( tot_errors + ${RUN_ERRORS[$k]:-0} ))
     done
@@ -1503,13 +1590,14 @@ main() {
         CUR_OPLOG="$LOG_DIR/$k/operations.log"
         [[ -d "$LOG_DIR/$k" ]] && log_tgt INFO TARGET_SUMMARY \
             deployed="${RUN_DEPLOYED[$k]:-0}" overwritten="${RUN_OVERWRITTEN[$k]:-0}" \
-            moved="${RUN_MOVED[$k]:-0}" errors="${RUN_ERRORS[$k]:-0}" \
+            conflicts="${RUN_CONFLICTS[$k]:-0}" moved="${RUN_MOVED[$k]:-0}" errors="${RUN_ERRORS[$k]:-0}" \
             scanned="${RUN_SCANNED[$k]:-0}" mount="${T_MOUNT_STATE[$k]:-unknown}" cycles="$cycle"
     done
     CUR_PROJECT="" CUR_ENV="" CUR_CYCLE=""
 
     log_run INFO RUN_SUMMARY targets="$ntargets" cycles="$cycle" \
-        deployed="$tot_deployed" overwritten="$tot_overwritten" moved="$tot_moved" errors="$tot_errors"
+        deployed="$tot_deployed" overwritten="$tot_overwritten" conflicts="$tot_conflicts" \
+        moved="$tot_moved" errors="$tot_errors"
     log_run INFO END
 
     # Exit code precedence: no usable target > deploy failure > source stuck.

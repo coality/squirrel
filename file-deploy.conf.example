@@ -44,6 +44,46 @@ DEPLOY_MARKER=".file-deploy-root"
 # it here if that collides with a real directory in your tree. "" disables the
 # local archive entirely: moved files then exist only in the deployment tree.
 LOCAL_ARCHIVE_DIR="archive"
+
+# --- What to do when the destination already holds a DIFFERENT file ---
+#
+# Identical content is never a conflict: nothing is rewritten, and the source
+# file is archived and drained either way. This setting only decides what
+# happens when <deploy_root>/<same relative path> exists with a different hash.
+#
+#   overwrite  Replace the deployed file. The version it replaced is NOT lost:
+#              the incoming file is archived locally, and the audit line records
+#              the digest that was replaced (prev_hash=). This is the default
+#              and the right choice when the source is authoritative.
+#
+#   version    Deploy alongside instead of replacing: the existing file is kept
+#              and the incoming one lands next to it as
+#              <name>_<YYYYMMDD_HHMMSS><ext>, stamped from the SOURCE mtime so a
+#              retry always resolves to the same name. Nothing is ever lost on
+#              either side, at the cost of a deployment tree that accumulates.
+#
+#   skip       Leave the deployment tree completely alone. The incoming file is
+#              still archived locally and drained from the pickup directory, so
+#              nothing is lost and nothing piles up -- but the deployed file
+#              stays stale. Logged at WARN (DEPLOY_SKIPPED) on every collision.
+#              Use when the destination is authoritative and re-deliveries are
+#              expected noise.
+#
+#   fail       Refuse. The source file is KEPT in its pickup directory, nothing
+#              is archived, an ERROR is logged (DEPLOY_CONFLICT) and the run
+#              exits 4. Use when a collision means something upstream is wrong
+#              and a human must look. Note the file is retried every cycle until
+#              the collision is resolved.
+#
+# Examples
+#   ON_CONFLICT="overwrite"   # source wins; history kept in the local archive
+#   ON_CONFLICT="version"     # keep both sides, never clobber anything
+#   ON_CONFLICT="skip"        # destination wins; drain the source anyway
+#   ON_CONFLICT="fail"        # stop and alert; keep the source file untouched
+#
+# Whatever the policy, a rehearsal (--dry-run) reports the exact verdict it
+# would apply, per file, in the WOULD_MOVE line's deploy= field.
+ON_CONFLICT="overwrite"
 HASH_CMD="sha256sum"            # content hash command
 DRY_RUN=false                   # true = simulate, copy nothing
 # TARGETS_FILE defaults to <script directory>/targets.tsv; set an absolute path to override:

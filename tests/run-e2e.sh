@@ -926,6 +926,120 @@ test_stderr_clean_first_run() {
     assert_file "$d/arc/input/x.txt" "still archived"
 }
 
+# ---------------------------------------------------------------------------
+# ON_CONFLICT: what happens when the destination holds different content
+# ---------------------------------------------------------------------------
+
+# _conflict_case <dir> <policy>: a deployed "old" plus an incoming "new" under
+# the same relative path, ready to run.
+_conflict_case() {
+    local d=$1 policy=$2
+    mkdir -p "$d/src/input" "$d/arc/input"
+    printf 'incoming\n' > "$d/src/input/f.txt"
+    touch -d '2001-01-01 10:00:00' "$d/src/input/f.txt"
+    printf 'already-deployed\n' > "$d/arc/input/f.txt"
+    : > "$d/arc/.file-deploy-root"
+    add_target "$d" p e "$d/src" "$d/arc"
+    write_conf "$d" "ON_CONFLICT=\"$policy\""
+}
+
+test_conflict_overwrite() {
+    title "ON_CONFLICT=overwrite replaces the deployed file"
+    local d; d=$(new_case); _conflict_case "$d" overwrite
+    run "$d"; local rc=$?
+    assert_exit "$rc" 0 "run succeeds"
+    assert_eq "incoming" "$(cat "$d/arc/input/f.txt")" "destination replaced"
+    assert_eq 1 "$(count_files "$d/arc")" "no extra file in the deployment tree"
+    assert_eq 0 "$(count_pending "$d/src")" "source drained"
+    assert_grep "$(oplog "$d" p e)" 'event=DEPLOYED_OVERWRITE'
+    assert_grep "$(auditlog "$d" p e)" 'prev_hash=' "the replaced digest is recorded"
+}
+
+test_conflict_version() {
+    title "ON_CONFLICT=version deploys alongside and clobbers nothing"
+    local d; d=$(new_case); _conflict_case "$d" version
+    run "$d"; local rc=$?
+    assert_exit "$rc" 0 "run succeeds"
+    assert_eq "already-deployed" "$(cat "$d/arc/input/f.txt")" "existing file untouched"
+    assert_eq 2 "$(count_files "$d/arc")" "both versions present"
+    assert_file "$d/arc/input/f_20010101_100000.txt" "stamped from the SOURCE mtime"
+    assert_eq 0 "$(count_pending "$d/src")" "source drained"
+    assert_grep "$(oplog "$d" p e)" 'event=DEPLOYED_VERSION'
+    # The name is a pure function of (name, source mtime, hash), so re-dropping
+    # the same content must land on the same path, not a third file.
+    printf 'incoming\n' > "$d/src/input/f.txt"
+    touch -d '2001-01-01 10:00:00' "$d/src/input/f.txt"
+    run "$d"
+    assert_eq 2 "$(count_files "$d/arc")" "a repeat is idempotent"
+}
+
+test_conflict_skip() {
+    title "ON_CONFLICT=skip leaves the destination stale but drains the source"
+    local d; d=$(new_case); _conflict_case "$d" skip
+    run "$d"; local rc=$?
+    assert_exit "$rc" 0 "not an error"
+    assert_eq "already-deployed" "$(cat "$d/arc/input/f.txt")" "destination untouched"
+    assert_eq 1 "$(count_files "$d/arc")" "nothing added"
+    # Nothing is lost and nothing piles up: the incoming file is archived.
+    assert_eq 0 "$(count_pending "$d/src")" "source drained anyway"
+    assert_eq "incoming" "$(cat "$d/src/input/archive/f.txt")" "and preserved locally"
+    assert_grep "$(oplog "$d" p e)" 'event=DEPLOY_SKIPPED'
+}
+
+test_conflict_fail() {
+    title "ON_CONFLICT=fail keeps the source file and exits 4"
+    local d; d=$(new_case); _conflict_case "$d" fail
+    run "$d"; local rc=$?
+    assert_exit "$rc" 4 "deploy conflict"
+    assert_eq "already-deployed" "$(cat "$d/arc/input/f.txt")" "destination untouched"
+    assert_file "$d/src/input/f.txt" "source file kept for a human to resolve"
+    assert_eq 0 "$(count_archived "$d/src")" "and not archived either"
+    assert_grep "$(oplog "$d" p e)" 'event=DEPLOY_CONFLICT'
+}
+
+test_conflict_identical_is_never_a_conflict() {
+    title "identical content is not a conflict, whatever the policy"
+    local d p
+    for p in overwrite version skip fail; do
+        d=$(new_case)
+        mkdir -p "$d/src/input" "$d/arc/input"
+        printf 'same\n' > "$d/src/input/f.txt"
+        printf 'same\n' > "$d/arc/input/f.txt"
+        : > "$d/arc/.file-deploy-root"
+        add_target "$d" p e "$d/src" "$d/arc"
+        write_conf "$d" "ON_CONFLICT=\"$p\""
+        run "$d"; local rc=$?
+        assert_exit "$rc" 0 "$p: run succeeds"
+        assert_eq 1 "$(count_files "$d/arc")" "$p: nothing added"
+        assert_eq 0 "$(count_pending "$d/src")" "$p: source drained"
+    done
+}
+
+test_conflict_dry_run_reports_the_policy() {
+    title "a rehearsal reports the verdict the policy would apply"
+    local d p
+    for p in overwrite version skip fail; do
+        d=$(new_case); _conflict_case "$d" "$p"
+        bash "$SCRIPT" --config "$d/conf" --dry-run >/dev/null 2>&1
+        assert_grep "$(oplog "$d" p e)" "on_conflict=\"$p\""
+        assert_eq "already-deployed" "$(cat "$d/arc/input/f.txt")" "$p: nothing written"
+        assert_file "$d/src/input/f.txt" "$p: source untouched"
+    done
+}
+
+test_conflict_invalid_value() {
+    title "an unknown ON_CONFLICT stops the run instead of guessing"
+    local d; d=$(new_case); _conflict_case "$d" ovrewrite
+    local out rc
+    out=$(run "$d" 2>&1); rc=$?
+    assert_exit "$rc" 1 "config error"
+    case $out in
+        *"Invalid ON_CONFLICT"*) _ok "names the offending value" ;;
+        *) _no "clear message, got: [$out]" ;;
+    esac
+    assert_file "$d/src/input/f.txt" "nothing touched"
+}
+
 test_dry_run_flag() {
     title "--dry-run rehearses without touching the config"
     local d; d=$(new_case)
@@ -1284,6 +1398,13 @@ main() {
     test_unreadable_file_settles
     test_prehistoric_mtime
     test_stderr_clean_first_run
+    test_conflict_overwrite
+    test_conflict_version
+    test_conflict_skip
+    test_conflict_fail
+    test_conflict_identical_is_never_a_conflict
+    test_conflict_dry_run_reports_the_policy
+    test_conflict_invalid_value
     test_dry_run_flag
     test_dry_run_then_real_deploys
     test_verbose_flag_wins

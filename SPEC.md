@@ -177,12 +177,37 @@ version is ever created in B.**
 | Destination state | Action | Event |
 |---|---|---|
 | Absent | Written | `DEPLOYED` |
-| Present, different content | Overwritten, both digests logged | `DEPLOYED_OVERWRITE` |
 | Present, identical content | Nothing rewritten — but the source file is **still** archived and removed | `DEPLOYED_IDENTICAL` |
+| Present, different content | Decided by `ON_CONFLICT` — see below | |
 
 > **Why the identical case is not a skip.** Skipping a file because the
 > destination is already current would leave it in its pickup directory
 > indefinitely. A file re-dropped unchanged must be drained like any other.
+> Identical content is never a conflict, whatever the policy.
+
+### Conflict policy
+
+`ON_CONFLICT` decides what happens when the destination holds the same relative
+path with **different** content. It is validated at startup: an unrecognised
+value is a configuration error (exit `1`), never a guess.
+
+| Value | Deployment tree | Source file | Event | Exit |
+|---|---|---|---|---|
+| `overwrite` (default) | Replaced | Archived and drained | `DEPLOYED_OVERWRITE` + `prev_hash=` in the audit trail | `0` |
+| `version` | Existing file kept; the incoming one lands beside it as `<name>_<stamp><ext>` | Archived and drained | `DEPLOYED_VERSION` | `0` |
+| `skip` | Untouched, therefore stale | Archived and drained — nothing is lost, nothing piles up | `DEPLOY_SKIPPED` (WARN) | `0` |
+| `fail` | Untouched | **Kept in the pickup directory**, not archived | `DEPLOY_CONFLICT` (ERROR) | `4` |
+
+Under `version` the stamp comes from the **source mtime**, so the chosen path is
+a pure function of `(name, source mtime, hash)` and a retry lands on the same
+file rather than creating a third one — the same rule the local archive uses.
+
+`skip` is the one policy that relaxes [§3](#3--invariant): the file leaves the
+source while the deployment tree still holds different content. Its content is
+never lost — the local archive holds it, hash-verified — but the deployed
+version stays stale, which is why every occurrence is logged at `WARN`. `fail`
+keeps the invariant intact at the cost of a file that is retried every cycle
+until a human resolves the collision.
 
 ### In the local archive
 
@@ -284,6 +309,7 @@ where a column exists.
 | `RUN_DURATION` | `55` | Maximum duration of one run |
 | `MIN_STABLE_AGE` | `5` | **Safety setting** — see §8.3 |
 | `LOCAL_ARCHIVE_DIR` | `"archive"` | Name of the local archive; `""` disables it |
+| `ON_CONFLICT` | `"overwrite"` | `overwrite` / `version` / `skip` / `fail` when the destination holds different content — see [§6](#6--naming) |
 | `DEPLOY_MARKER` | `".file-deploy-root"` | Deployment-root sentinel |
 | `HASH_CMD` | `"sha256sum"` | Hash command, single word |
 | `DRY_RUN` | `false` | Inert rehearsal: no write, no delete |
