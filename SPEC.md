@@ -196,6 +196,7 @@ value is a configuration error (exit `1`), never a guess.
 | `overwrite` (default) | Replaced | Archived and drained | `DEPLOYED_OVERWRITE` + `prev_hash=` in the audit trail | `0` |
 | `version` | Existing file kept; the incoming one lands beside it as `<name>_<stamp><ext>` | Archived and drained | `DEPLOYED_VERSION` | `0` |
 | `skip` | Untouched, therefore stale | Archived and drained — nothing is lost, nothing piles up | `DEPLOY_SKIPPED` (WARN) | `0` |
+| `retry` | Untouched | **Kept**, not archived; re-evaluated every cycle until the collision clears | `DEPLOY_RETRY` (WARN, once per run per file) | `0` |
 | `fail` | Untouched | **Kept in the pickup directory**, not archived | `DEPLOY_CONFLICT` (ERROR) | `4` |
 
 Under `version` the stamp comes from the **source mtime**, so the chosen path is
@@ -205,9 +206,35 @@ file rather than creating a third one — the same rule the local archive uses.
 `skip` is the one policy that relaxes [§3](#3--invariant): the file leaves the
 source while the deployment tree still holds different content. Its content is
 never lost — the local archive holds it, hash-verified — but the deployed
-version stays stale, which is why every occurrence is logged at `WARN`. `fail`
-keeps the invariant intact at the cost of a file that is retried every cycle
-until a human resolves the collision.
+version stays stale, which is why every occurrence is logged at `WARN`.
+
+`retry` and `fail` both keep the invariant intact and both keep the source file;
+they differ only in how loudly they say so. `retry` treats the collision as a
+pending state — `WARN`, exit `0` — and clears by itself as soon as the deployed
+file changes or is consumed, which is the natural fit when the destination is a
+handover directory someone else empties. `fail` treats it as an incident —
+`ERROR`, exit `4` — for when a collision means something upstream is wrong.
+Both re-hash the file on every cycle until it resolves, so neither is free on
+large files.
+
+### CSV report
+
+When `REPORT_DIR` is set, every file that actually moved appends one row to
+`<REPORT_DIR>/file-deploy-<YYYY-MM-DD>.csv`: one file per day, all targets in
+it, header written on creation, RFC 4180 quoting on text fields. It is a
+reporting side-channel, not state: deleting it changes nothing, and nothing is
+written during a rehearsal.
+
+Columns: `run_id`, `deployed_at`, `project`, `env`, `outcome`, `file_name`,
+`relpath`, `source_path`, `deploy_path`, `archive_path`, `size_bytes`, `hash`,
+`prev_hash`, `source_modified`, `source_created`, `age_at_pickup_s`,
+`pickup_dir`, `host`.
+
+`archive_path` is the retrieval key: it is where the file actually is now.
+`source_created` is a real birth time and is **empty** on filesystems that do
+not record one — CIFS/SMB usually does not, so `source_modified` is the field to
+build on. `age_at_pickup_s` is `now − mtime` at pickup, a latency measure of how
+long a file waited before being taken.
 
 ### In the local archive
 
@@ -309,7 +336,9 @@ where a column exists.
 | `RUN_DURATION` | `55` | Maximum duration of one run |
 | `MIN_STABLE_AGE` | `5` | **Safety setting** — see §8.3 |
 | `LOCAL_ARCHIVE_DIR` | `"archive"` | Name of the local archive; `""` disables it |
-| `ON_CONFLICT` | `"overwrite"` | `overwrite` / `version` / `skip` / `fail` when the destination holds different content — see [§6](#6--naming) |
+| `ON_CONFLICT` | `"overwrite"` | `overwrite` / `version` / `skip` / `retry` / `fail` when the destination holds different content — see [§6](#6--naming) |
+| `REPORT_DIR` | `""` | Directory receiving the daily CSV of everything that moved; `""` disables it |
+| `REPORT_DELIMITER` | `","` | CSV field separator (`";"` for a French-locale Excel/Power BI) |
 | `DEPLOY_MARKER` | `".file-deploy-root"` | Deployment-root sentinel |
 | `HASH_CMD` | `"sha256sum"` | Hash command, single word |
 | `DRY_RUN` | `false` | Inert rehearsal: no write, no delete |

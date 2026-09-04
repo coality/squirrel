@@ -1040,6 +1040,62 @@ test_conflict_invalid_value() {
     assert_file "$d/src/input/f.txt" "nothing touched"
 }
 
+test_conflict_retry() {
+    title "ON_CONFLICT=retry keeps both sides and clears by itself"
+    local d; d=$(new_case); _conflict_case "$d" retry
+    run "$d"; local rc=$?
+    assert_exit "$rc" 0 "a pending collision is not a failure"
+    assert_eq "already-deployed" "$(cat "$d/arc/input/f.txt")" "destination untouched"
+    assert_file "$d/src/input/f.txt" "source kept for the next attempt"
+    assert_eq 0 "$(count_archived "$d/src")" "and not archived yet"
+    assert_grep "$(oplog "$d" p e)" 'event=DEPLOY_RETRY'
+    # It resolves on its own once the deployed file goes away or changes.
+    rm "$d/arc/input/f.txt"
+    run "$d"
+    assert_eq "incoming" "$(cat "$d/arc/input/f.txt")" "delivered on a later cycle"
+    assert_eq 0 "$(count_pending "$d/src")" "and drained"
+}
+
+test_report_csv() {
+    title "REPORT_DIR writes one CSV row per file that moved"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/input/sub"
+    printf 'one\n' > "$d/src/input/a.txt"
+    # A name carrying the delimiter and a quote must survive RFC 4180 quoting.
+    printf 'two\n' > "$d/src/input/sub/b,\"x\".txt"
+    add_target "$d" p e "$d/src" "$d/arc"
+    write_conf "$d" "REPORT_DIR=\"$d/reports\""
+    run "$d"
+    local csv; csv=$(find "$d/reports" -name '*.csv' | head -1)
+    assert_file "$csv" "a dated CSV was written"
+    assert_grep "$csv" 'run_id,deployed_at,project,env,outcome' "header present"
+    assert_eq 3 "$(wc -l < "$csv" | tr -d ' ')" "header + one row per file"
+    assert_grep "$csv" '"DEPLOYED"'
+    assert_grep "$csv" '"a.txt"'
+    assert_grep "$csv" '/input/archive/a.txt' "archive path recorded for retrieval"
+    # The awkward name must be quoted, with its inner quote doubled.
+    assert_grep "$csv" '"b,""x"".txt"' "delimiter and quote escaped"
+    # A second run appends to the same day's file instead of starting over.
+    printf 'three\n' > "$d/src/input/c.txt"
+    run "$d"
+    assert_eq 4 "$(wc -l < "$csv" | tr -d ' ')" "appended, header not repeated"
+}
+
+test_report_delimiter_and_dry_run() {
+    title "REPORT_DELIMITER is honoured, and a rehearsal writes no report"
+    local d; d=$(new_case)
+    mkdir -p "$d/src/input"
+    echo x > "$d/src/input/x.txt"
+    add_target "$d" p e "$d/src" "$d/arc"
+    write_conf "$d" "REPORT_DIR=\"$d/reports\"" 'REPORT_DELIMITER=";"'
+    bash "$SCRIPT" --config "$d/conf" --dry-run >/dev/null 2>&1
+    assert_eq 0 "$(find "$d/reports" -name '*.csv' 2>/dev/null | wc -l)" "rehearsal wrote nothing"
+    run "$d"
+    local csv; csv=$(find "$d/reports" -name '*.csv' | head -1)
+    assert_grep "$csv" 'run_id;deployed_at;project;env' "semicolon header"
+    assert_grep "$csv" '"DEPLOYED";"x.txt"' "semicolon rows"
+}
+
 test_dry_run_flag() {
     title "--dry-run rehearses without touching the config"
     local d; d=$(new_case)
@@ -1405,6 +1461,9 @@ main() {
     test_conflict_identical_is_never_a_conflict
     test_conflict_dry_run_reports_the_policy
     test_conflict_invalid_value
+    test_conflict_retry
+    test_report_csv
+    test_report_delimiter_and_dry_run
     test_dry_run_flag
     test_dry_run_then_real_deploys
     test_verbose_flag_wins

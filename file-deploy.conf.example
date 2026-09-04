@@ -84,6 +84,62 @@ LOCAL_ARCHIVE_DIR="archive"
 # Whatever the policy, a rehearsal (--dry-run) reports the exact verdict it
 # would apply, per file, in the WOULD_MOVE line's deploy= field.
 ON_CONFLICT="overwrite"
+
+# --- CSV report, for BI tools ---
+#
+# When set, every file that actually moved appends one row to
+#   <REPORT_DIR>/file-deploy-<YYYY-MM-DD>.csv
+# One file per day, all targets in it, header written when the file is created.
+# Point Power BI (or anything else) at the DIRECTORY and let it append the lot:
+#   Get Data > Folder > <REPORT_DIR> > Combine & Transform
+#
+# Nothing is written during a rehearsal: --dry-run stays inert.
+#
+# Columns
+#   run_id            correlates a row with the run that produced it (see logs)
+#   deployed_at       when the move completed, ISO-8601 with timezone
+#   project, env      the target -- what you slice by
+#   outcome           DEPLOYED | DEPLOYED_OVERWRITE | DEPLOYED_VERSION
+#                     | DEPLOYED_IDENTICAL | DEPLOY_SKIPPED
+#   file_name         base name only
+#   relpath           path relative to the roots; identical on both sides, so it
+#                     is the natural key to join source and destination
+#   source_path       absolute path it was picked up from
+#   deploy_path       absolute path it was deployed to (differs from the mirror
+#                     under ON_CONFLICT="version"; empty when the deploy was
+#                     skipped)
+#   archive_path      absolute path of the local archive copy -- THIS is what you
+#                     use to retrieve the file afterwards
+#   size_bytes        integer
+#   hash              full digest of the content ($HASH_CMD)
+#   prev_hash         digest that was replaced, on an overwrite; empty otherwise
+#   source_modified   the file's mtime. NOTE: on Linux this is the closest thing
+#                     to a reliable "creation date" -- see below
+#   source_created    real birth time when the filesystem records one. ext4 and
+#                     xfs usually do; CIFS/SMB mounts usually do NOT, and the
+#                     column is then EMPTY. Do not build a report on it without
+#                     checking your share first; use source_modified instead.
+#   age_at_pickup_s   how long the file sat in the pickup directory before being
+#                     taken (now - mtime). A latency KPI: a rising curve means
+#                     the scan interval or MIN_STABLE_AGE is too high, or the
+#                     producer writes slowly.
+#   pickup_dir        absolute directory it came from -- group by supplier/site
+#   host              machine that ran it, for multi-host deployments
+#
+# Text fields are RFC 4180 quoted (inner quotes doubled), so paths containing
+# the delimiter, a quote or a newline survive intact. Numbers and timestamps are
+# left bare so they type cleanly on import.
+#
+# Examples
+#   REPORT_DIR=""                      # off (default)
+#   REPORT_DIR="/var/log/file-deploy/reports"
+#   REPORT_DIR="/mnt/nas/bi/file-deploy"   # drop it where Power BI already looks
+#
+# Field separator. Power BI and Excel in a French locale often expect ";".
+#   REPORT_DELIMITER=","
+#   REPORT_DELIMITER=";"
+REPORT_DIR=""
+REPORT_DELIMITER=","
 HASH_CMD="sha256sum"            # content hash command
 DRY_RUN=false                   # true = simulate, copy nothing
 # TARGETS_FILE defaults to <script directory>/targets.tsv; set an absolute path to override:

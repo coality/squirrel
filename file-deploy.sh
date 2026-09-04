@@ -86,8 +86,13 @@ LOCAL_ARCHIVE_DIR="archive"
 #   overwrite  replace it; the previous version survives in the local archive
 #   version    deploy alongside as <name>_<stamp><ext>, keep the deployed one
 #   skip       leave the deployment tree alone; still archive and drain the source
+#   retry      leave both alone and try again next cycle, until the collision clears
 #   fail       refuse: keep the source file, log an error, exit 4
 ON_CONFLICT="overwrite"
+# Directory receiving a machine-readable CSV of every file that moved, one row
+# per file, for BI tools. "" disables it. See file-deploy.conf.example.
+REPORT_DIR=""
+REPORT_DELIMITER=","
 # Sentinel file expected at the root of every deploy_root. It is what tells an
 # unmounted deployment share apart from an empty one; see check_deploy_root.
 # "" disables the check (not recommended on a mounted share).
@@ -410,6 +415,60 @@ _append_rotating() {
         LOG_BYTES[$file]=$(( LOG_BYTES[$file] + ${#line} + 1 ))
     fi
     printf '%s\n' "$line" >> "$file"
+}
+
+# ---------------------------------------------------------------------------
+# CSV report (optional): one row per file that moved, for BI tools.
+#
+# Written to $REPORT_DIR/file-deploy-YYYY-MM-DD.csv -- one file per day, every
+# target in it, so a BI tool can point at the directory and append the lot. The
+# header is written when the file is created. RFC 4180 quoting: text fields are
+# always quoted and inner quotes doubled, so paths containing the delimiter, a
+# quote or a newline survive. Numeric and timestamp fields are left bare so they
+# type cleanly on import.
+#
+# Nothing is written during a rehearsal: --dry-run stays inert.
+# ---------------------------------------------------------------------------
+REPORT_FILE=""
+declare -A REPORT_STARTED=()
+
+csv_q() {  # quote one text field
+    local v=$1
+    v=${v//\"/\"\"}
+    printf '"%s"' "$v"
+}
+
+# report_row <outcome> <src_path> <deploy_path> <archive_path> <relpath>
+#            <size> <hash> <prev_hash> <mtime_epoch> <btime_epoch> <age_s> <pickup_dir>
+report_row() {
+    [[ -n $REPORT_DIR ]] || return 0
+    [[ $DRY_RUN == true ]] && return 0
+    local d=$REPORT_DELIMITER day
+    printf -v day '%(%Y-%m-%d)T' -1 2>/dev/null || day=$(date +%Y-%m-%d)
+    REPORT_FILE="$REPORT_DIR/file-deploy-$day.csv"
+    if [[ -z ${REPORT_STARTED[$REPORT_FILE]:-} ]]; then
+        REPORT_STARTED[$REPORT_FILE]=1
+        mkdir -p -- "$REPORT_DIR" 2>/dev/null
+        if [[ ! -s $REPORT_FILE ]]; then
+            printf '%s\n' "run_id${d}deployed_at${d}project${d}env${d}outcome${d}file_name${d}relpath${d}source_path${d}deploy_path${d}archive_path${d}size_bytes${d}hash${d}prev_hash${d}source_modified${d}source_created${d}age_at_pickup_s${d}pickup_dir${d}host" \
+                >> "$REPORT_FILE" 2>/dev/null
+        fi
+    fi
+    local created=""
+    (( ${10} > 0 )) && created=$(epoch_iso "${10}")
+    printf '%s\n' "$(csv_q "$RUN_ID")$d$(epoch_iso "$(now_epoch)")$d$(csv_q "$CUR_PROJECT")$d$(csv_q "$CUR_ENV")$d$(csv_q "$1")$d$(csv_q "${2##*/}")$d$(csv_q "$5")$d$(csv_q "$2")$d$(csv_q "$3")$d$(csv_q "$4")$d${6}$d$(csv_q "$7")$d$(csv_q "$8")$d$(epoch_iso "$9")$d${created}$d${11}$d$(csv_q "${12}")$d$(csv_q "${HOSTNAME:-}")" \
+        >> "$REPORT_FILE" 2>/dev/null
+    return 0
+}
+
+# epoch_iso <epoch>: ISO-8601 with timezone, the form BI tools parse directly.
+epoch_iso() {
+    local e=$1 out
+    if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 2) )) && (( e >= 0 )); then
+        printf '%(%Y-%m-%dT%H:%M:%S%z)T' "$e"; return 0
+    fi
+    out=$(date -d "@$e" +%Y-%m-%dT%H:%M:%S%z 2>/dev/null) || out=""
+    printf '%s' "$out"
 }
 
 log_run() { local lvl=$1 ev=$2; shift 2; _emit_file "$RUN_LOG" 0 "$lvl" "$ev" "$@"; }
@@ -814,6 +873,7 @@ conflict_verdict() {
     case $ON_CONFLICT in
         overwrite) VERDICT=DEPLOYED_OVERWRITE ;;
         skip)      VERDICT=DEPLOY_SKIPPED ;;
+        retry)     VERDICT=DEPLOY_RETRY ;;
         fail)      VERDICT=DEPLOY_CONFLICT ;;
         version)
             pick_free_path "${dst%/*}" "${dst##*/}" "$(stamp_from_epoch "$mtime")" "$h"
@@ -823,15 +883,16 @@ conflict_verdict() {
     return 0
 }
 
-# deploy_file <src> <dst> <hash> <mtime> <encrel>
+# deploy_file <src> <dst> <hash> <mtime> <encrel> <key>
 # Put the file in the deployment tree according to $ON_CONFLICT. Sets
 # DEPLOY_ACTION and, on a real write, DEPLOY_DST. Returns 1 (and logs) on
 # failure, always leaving whatever was already deployed untouched.
 DEPLOY_ACTION=""
 DEPLOY_OLD_HASH=""
 DEPLOY_DST=""
+declare -A CONFLICT_SEEN=()   # key SEP relpath -> 1 once a pending conflict was reported
 deploy_file() {
-    local src=$1 dst=$2 h=$3 mtime=$4 encrel=$5 err dst_dir=${2%/*}
+    local src=$1 dst=$2 h=$3 mtime=$4 encrel=$5 key=$6 err dst_dir=${2%/*}
     DEPLOY_ACTION=DEPLOYED; DEPLOY_OLD_HASH=""; DEPLOY_DST=$dst
     if ! err=$(mkdir -p -- "$dst_dir" 2>&1); then
         log_tgt ERROR DEPLOY_FAILED stage="mkdir" relpath="$encrel" \
@@ -857,6 +918,22 @@ deploy_file() {
                 on_conflict="$ON_CONFLICT" \
                 hint="the deployment tree was left untouched; the incoming file is archived and drained"
             return 0 ;;
+        DEPLOY_RETRY)
+            # Neither side is touched and the source file stays put, so the
+            # collision is re-evaluated every cycle: this is a pending state,
+            # not a failure, hence WARN once per run and exit 0. It clears by
+            # itself as soon as the deployed file changes or goes away.
+            (( CYC_CONFLICTS++ ))
+            if [[ -z ${CONFLICT_SEEN["$key$SEP$encrel"]:-} ]]; then
+                CONFLICT_SEEN["$key$SEP$encrel"]=1
+                log_tgt WARN DEPLOY_RETRY relpath="$encrel" dst="$(enc "$dst")" \
+                    deployed_hash="${DEPLOY_OLD_HASH:0:8}…" incoming_hash="${h:0:8}…" \
+                    on_conflict="$ON_CONFLICT" \
+                    hint="both sides left untouched; the source file is kept and retried every cycle"
+            elif (( DEBUG_ON )); then
+                log_tgt DEBUG DEPLOY_RETRY relpath="$encrel" repeat="1"
+            fi
+            return 1 ;;
         DEPLOY_CONFLICT)
             (( CYC_CONFLICTS++ )); (( CYC_ERRORS++ )); ANY_DEPLOY_FAILED=1
             log_tgt ERROR DEPLOY_CONFLICT relpath="$encrel" dst="$(enc "$dst")" \
@@ -1041,8 +1118,14 @@ process_file() {
         return 0
     fi
 
+    # Birth time, for the report only: read it while the file is still here, and
+    # accept that most filesystems (CIFS in particular) simply do not have one.
+    local btime=0
+    [[ -n $REPORT_DIR ]] && { btime=$(stat -c '%W' -- "$src" 2>/dev/null) || btime=0; }
+    is_uint "$btime" || btime=0
+
     # 2. Deploy first: the source is still there to retry from if this fails.
-    deploy_file "$src" "$dst" "$h" "$mtime" "$encrel" || { DIR_UNSETTLED=1; return 0; }
+    deploy_file "$src" "$dst" "$h" "$mtime" "$encrel" "$key" || { DIR_UNSETTLED=1; return 0; }
 
     # 3. The source must not have moved under us while we were copying. If it
     #    did, what we just deployed is a snapshot of a half-written file: leave
@@ -1088,21 +1171,29 @@ process_file() {
             audit_write "$DEPLOY_ACTION" "$encrel" "$encarc" "$h" "$size" "$DEPLOY_OLD_HASH"
             log_tgt INFO DEPLOYED_OVERWRITE relpath="$encrel" size="$size" \
                 new_hash="${h:0:8}…" old_hash="${DEPLOY_OLD_HASH:0:8}…" archive="$encarc"
+            report_row DEPLOYED_OVERWRITE "$src" "$DEPLOY_DST" "$ARC_PATH" "$relpath" \
+                "$size" "$h" "$DEPLOY_OLD_HASH" "$mtime" "$btime" "$age" "$pickup"
             (( CYC_OVERWRITTEN++ )) ;;
         DEPLOYED_VERSION)
             audit_write "$DEPLOY_ACTION" "$encrel" "$encarc" "$h" "$size" "$DEPLOY_OLD_HASH"
             log_tgt INFO DEPLOYED_VERSION relpath="$encrel" size="$size" \
                 hash="${h:0:8}…" deployed="$encdep" kept_hash="${DEPLOY_OLD_HASH:0:8}…" \
                 archive="$encarc"
+            report_row DEPLOYED_VERSION "$src" "$DEPLOY_DST" "$ARC_PATH" "$relpath" \
+                "$size" "$h" "$DEPLOY_OLD_HASH" "$mtime" "$btime" "$age" "$pickup"
             (( CYC_DEPLOYED++ )) ;;
         DEPLOY_SKIPPED)
             # deploy_file already reported the collision at WARN; record that the
             # source was still drained.
-            audit_write "$DEPLOY_ACTION" "$encrel" "$encarc" "$h" "$size" "$DEPLOY_OLD_HASH" ;;
+            audit_write "$DEPLOY_ACTION" "$encrel" "$encarc" "$h" "$size" "$DEPLOY_OLD_HASH"
+            report_row DEPLOY_SKIPPED "$src" "" "$ARC_PATH" "$relpath" \
+                "$size" "$h" "$DEPLOY_OLD_HASH" "$mtime" "$btime" "$age" "$pickup" ;;
         *)
             audit_write "$DEPLOY_ACTION" "$encrel" "$encarc" "$h" "$size"
             log_tgt INFO "$DEPLOY_ACTION" relpath="$encrel" size="$size" \
                 hash="${h:0:8}…" archive="$encarc"
+            report_row "$DEPLOY_ACTION" "$src" "$DEPLOY_DST" "$ARC_PATH" "$relpath" \
+                "$size" "$h" "" "$mtime" "$btime" "$age" "$pickup"
             (( CYC_DEPLOYED++ )) ;;
     esac
     (( CYC_BYTES += size ))
@@ -1432,8 +1523,8 @@ load_config() {
     if (( ONCE )); then RUN_DURATION=0; fi
     if (( FORCE_DRY )); then DRY_RUN=true; fi
     case ${ON_CONFLICT,,} in
-        overwrite|version|skip|fail) ON_CONFLICT=${ON_CONFLICT,,} ;;
-        *) printf 'Invalid ON_CONFLICT: %s (expected overwrite, version, skip or fail)\n' \
+        overwrite|version|skip|retry|fail) ON_CONFLICT=${ON_CONFLICT,,} ;;
+        *) printf 'Invalid ON_CONFLICT: %s (expected overwrite, version, skip, retry or fail)\n' \
                "$ON_CONFLICT" >&2
            exit $EX_CONFIG ;;
     esac
@@ -1492,6 +1583,7 @@ main() {
         use_dir_mtime_skip="$USE_DIR_MTIME_SKIP" deep_scan_interval="$DEEP_SCAN_INTERVAL" \
         deploy_marker="$(enc "$DEPLOY_MARKER")" local_archive_dir="$(enc "$LOCAL_ARCHIVE_DIR")" \
         hash_cmd="$HASH_CMD" dry_run="$DRY_RUN" on_conflict="$ON_CONFLICT" \
+        report_dir="$(enc "$REPORT_DIR")" \
         exclude_patterns="$(enc "${EXCLUDE_DIR_PATTERNS[*]:-}")" extra_dirs="${#EXTRA_DIRS[@]}" \
         log_format="$LOG_FORMAT" log_level="$LOG_LEVEL" console="$LOG_CONSOLE"
     [[ $CONFIG_STATUS == missing ]] && log_run WARN CONFIG_NOT_FOUND config="$(enc "$CONFIG_FILE")" \
@@ -1501,6 +1593,12 @@ main() {
     [[ $DRY_RUN == true ]] && log_run WARN DRY_RUN_ACTIVE \
         source="$( (( FORCE_DRY )) && printf -- '--dry-run' || printf 'config' )" \
         hint="nothing will be written or deleted; unset DRY_RUN to deliver"
+
+    if [[ -n $REPORT_DIR ]] && ! mkdir -p -- "$REPORT_DIR" 2>/dev/null; then
+        log_run ERROR REPORT_DIR_UNUSABLE dir="$(enc "$REPORT_DIR")" \
+            hint="cannot create the CSV report directory; reporting is disabled for this run"
+        REPORT_DIR=""
+    fi
 
     if ! load_targets; then
         exit $EX_CONFIG

@@ -72,7 +72,8 @@ The three settings worth deciding before you start:
 | `MIN_STABLE_AGE` | **Safety.** A file is only taken once untouched for this long. `0` is safe only if every producer writes elsewhere and renames into place — most NAS producers do not. See [SPEC.md §8.3](SPEC.md#83-stability-and-in-place-writes). |
 | `LOCAL_ARCHIVE_DIR` | Name of the archive created beside each drained file (default `archive`). It is matched exactly and pruned from every walk, so a directory of that name is never deployed. Rename it if that collides with a real directory in your tree. |
 | `DEPLOY_MARKER` | Sentinel guarding each `deploy_root`. Leave it on: it is what stops an unmounted destination from draining your source into nothing. |
-| `ON_CONFLICT` | What to do when the destination already holds the same path with **different** content: `overwrite` (default, source wins), `version` (keep both), `skip` (destination wins, source still drained), `fail` (keep the source, exit 4). Identical content is never a conflict. Fully documented in [`file-deploy.conf.example`](file-deploy.conf.example). |
+| `ON_CONFLICT` | What to do when the destination already holds the same path with **different** content: `overwrite` (default, source wins), `version` (keep both), `skip` (destination wins, source still drained), `retry` (leave both, try again next cycle), `fail` (keep the source, exit 4). Identical content is never a conflict. Fully documented in [`file-deploy.conf.example`](file-deploy.conf.example). |
+| `REPORT_DIR` | Set it to get one CSV row per file moved, one file per day, ready for a BI tool. See [Reporting](#reporting). |
 
 ## Rehearse, then enable
 
@@ -147,6 +148,26 @@ deserve their own alert.
 
 `--rediscover` drops a marker and exits; the running loop re-walks the source and
 forces a deep pass on its next cycle.
+
+## Reporting
+
+Set `REPORT_DIR` and every file that moves appends a row to
+`<REPORT_DIR>/file-deploy-<YYYY-MM-DD>.csv` — one file per day, every target in
+it. In Power BI: **Get Data → Folder →** point at `REPORT_DIR` → **Combine &
+Transform**, and new days append themselves on refresh.
+
+18 columns, including `archive_path` (where the file actually is now, so you can
+retrieve it), `relpath` (identical on both sides, the natural join key),
+`prev_hash` (what an overwrite replaced) and `age_at_pickup_s` (how long a file
+waited before being taken — a latency KPI). Every column is documented in
+[`file-deploy.conf.example`](file-deploy.conf.example).
+
+Two things to know: `source_created` is a real birth time and is **empty** on
+filesystems that do not record one — CIFS/SMB usually does not, so build on
+`source_modified`. And `REPORT_DELIMITER=";"` if your Excel/Power BI locale
+expects semicolons.
+
+Nothing is written during a rehearsal, so `--dry-run` stays inert.
 
 ## Operating notes
 
